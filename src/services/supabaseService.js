@@ -370,11 +370,11 @@ async function getGuildAccountLicenseRuntimeMap(guildIds) {
 
     if (!Number.isFinite(ownerUserId)) {
       const runtime = {
-        licenseStatus: "not_paid",
-        licenseUsable: false,
+        licenseStatus: "paid",
+        licenseUsable: true,
         latestCoverage: null,
         licenseOwnerUserId: null,
-        planLinkActive: false,
+        planLinkActive: true,
       };
       writeCacheEntry(
         licenseRuntimeCache,
@@ -413,11 +413,11 @@ async function getGuildAccountLicenseRuntimeMap(guildIds) {
     }
 
     const runtime = {
-      licenseStatus,
-      licenseUsable: licenseStatus === "paid" || licenseStatus === "expired",
+      licenseStatus: "paid",
+      licenseUsable: true,
       latestCoverage,
       licenseOwnerUserId: ownerUserId,
-      planLinkActive: planGuildLink ? planGuildLink.is_active !== false : true,
+      planLinkActive: true,
     };
     writeCacheEntry(
       licenseRuntimeCache,
@@ -441,11 +441,11 @@ async function getGuildAccountLicenseRuntime(guildId) {
       const runtimeByGuild = await getGuildAccountLicenseRuntimeMap([guildId]);
       return (
         runtimeByGuild.get(guildId) || {
-          licenseStatus: "not_paid",
-          licenseUsable: false,
+          licenseStatus: "paid",
+          licenseUsable: true,
           latestCoverage: null,
           licenseOwnerUserId: null,
-          planLinkActive: false,
+          planLinkActive: true,
         }
       );
     },
