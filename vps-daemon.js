@@ -364,6 +364,22 @@ app.post('/v1/vps/:vpsCode/actions/:action', async (req, res) => {
 
       // Start
       await pm2StartOrRestart(vpsCode, projectPath);
+
+      // Notify Flowdesk backend to exit provisioning
+      try {
+        if (typeof fetch !== "undefined") {
+          fetch("https://fdesk.flwdesk.com/api/webhooks/vps-provisioned", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              token: "flowdesk-super-secret-token-v1",
+              vpsCode,
+              status: "online"
+            })
+          }).catch(() => {});
+        }
+      } catch(err) {}
+
       return res.json({ ok: true, status: 'online', message: 'Deploy concluído.' });
     }
 
