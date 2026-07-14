@@ -11,6 +11,7 @@ const ANTILINK_SETTINGS_TABLE = "guild_antilink_settings";
 const AUTOROLE_SETTINGS_TABLE = "guild_autorole_settings";
 const AUTOROLE_QUEUE_TABLE = "guild_autorole_queue";
 const SECURITY_LOGS_SETTINGS_TABLE = "guild_security_logs_settings";
+const SECURITY_LOG_QUEUE_TABLE = "guild_security_log_queue";
 const PLAN_GUILDS_TABLE = "auth_user_plan_guilds";
 const USER_PLAN_STATE_TABLE = "auth_user_plan_state";
 const PAYMENT_ORDERS_TABLE = "payment_orders";
@@ -873,6 +874,98 @@ async function rescheduleTicketDirectMessage(queueId, {
   return unwrap(result, "rescheduleTicketDirectMessage");
 }
 
+async function enqueueSecurityLogQueueItem({
+  queueKey,
+  guildId,
+  channelId,
+  eventKey,
+  payload,
+  maxAttempts = 48,
+}) {
+  const result = await supabase
+    .from(SECURITY_LOG_QUEUE_TABLE)
+    .upsert(
+      {
+        queue_key: queueKey,
+        guild_id: guildId,
+        channel_id: channelId,
+        event_key: eventKey,
+        payload,
+        status: "pending",
+        attempt_count: 0,
+        max_attempts: maxAttempts,
+        next_attempt_at: new Date().toISOString(),
+        last_error: null,
+      },
+      { onConflict: "queue_key" },
+    )
+    .select("*")
+    .single();
+
+  return unwrap(result, "enqueueSecurityLogQueueItem");
+}
+
+async function getDueSecurityLogQueueItems(limit = 15) {
+  const result = await supabase
+    .from(SECURITY_LOG_QUEUE_TABLE)
+    .select("*")
+    .eq("status", "pending")
+    .lte("next_attempt_at", new Date().toISOString())
+    .order("next_attempt_at", { ascending: true })
+    .order("created_at", { ascending: true })
+    .limit(limit);
+
+  return unwrap(result, "getDueSecurityLogQueueItems") || [];
+}
+
+async function markSecurityLogQueueItemProcessing(queueId, { attemptCount }) {
+  const result = await supabase
+    .from(SECURITY_LOG_QUEUE_TABLE)
+    .update({
+      status: "processing",
+      attempt_count: attemptCount,
+      last_error: null,
+    })
+    .eq("id", queueId)
+    .eq("status", "pending")
+    .select("*")
+    .maybeSingle();
+
+  return unwrap(result, "markSecurityLogQueueItemProcessing");
+}
+
+async function deleteSecurityLogQueueItem(queueId) {
+  const result = await supabase
+    .from(SECURITY_LOG_QUEUE_TABLE)
+    .delete()
+    .eq("id", queueId)
+    .select("id")
+    .maybeSingle();
+
+  return unwrap(result, "deleteSecurityLogQueueItem");
+}
+
+async function rescheduleSecurityLogQueueItem(queueId, {
+  attemptCount,
+  nextAttemptAt,
+  lastError,
+  finalFailure = false,
+}) {
+  const result = await supabase
+    .from(SECURITY_LOG_QUEUE_TABLE)
+    .update({
+      status: finalFailure ? "failed" : "pending",
+      attempt_count: attemptCount,
+      next_attempt_at: nextAttemptAt,
+      last_error: lastError || null,
+    })
+    .eq("id", queueId)
+    .select("*")
+    .single();
+
+  return unwrap(result, "rescheduleSecurityLogQueueItem");
+}
+
 function normalizeAutoRoleRequestedSource(value) {
   return value === "existing_members_sync" ? "existing_members_sync" : "member_join";
 }
@@ -1669,12 +1762,15 @@ async function updateGuildTicketPanelMessageId(guildId, panelMessageId) {
 }
 
 module.exports = {
+  deleteSecurityLogQueueItem,
+  enqueueSecurityLogQueueItem,
   enqueueGuildAutoRoleQueueItems,
   enqueueTicketDirectMessage,
   closeTicketAsDeleted,
   createTicket,
   deleteTicketAiSuggestionSession,
   getDueGuildAutoRoleQueueItems,
+  getDueSecurityLogQueueItems,
   getDueTicketDirectMessages,
   getConfiguredTicketGuildRuntimes,
   getGuildAntiLinkRuntime,
@@ -1705,6 +1801,7 @@ module.exports = {
   markGuildAutoRoleQueueItemCancelled,
   markGuildAutoRoleQueueItemCompleted,
   markGuildAutoRoleQueueItemProcessing,
+  markSecurityLogQueueItemProcessing,
   markGuildAutoRoleSyncCompleted,
   markGuildAutoRoleSyncFailed,
   markGuildAutoRoleSyncProcessing,
@@ -1713,6 +1810,7 @@ module.exports = {
   postponeGuildAutoRoleQueueItem,
   registerEvent,
   rescheduleGuildAutoRoleQueueItem,
+  rescheduleSecurityLogQueueItem,
   rescheduleTicketDirectMessage,
   upsertTicketAiSession,
   upsertTicketAiSuggestionSession,

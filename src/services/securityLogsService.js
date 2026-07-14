@@ -15,7 +15,14 @@ const {
   ThumbnailBuilder,
 } = require("discord.js");
 const { calculateUserDefaultAvatarIndex } = require("@discordjs/rest");
-const { getGuildSecurityLogsRuntime } = require("./supabaseService");
+const {
+  deleteSecurityLogQueueItem,
+  enqueueSecurityLogQueueItem,
+  getDueSecurityLogQueueItems,
+  getGuildSecurityLogsRuntime,
+  markSecurityLogQueueItemProcessing,
+  rescheduleSecurityLogQueueItem,
+} = require("./supabaseService");
 
 const RUNTIME_CACHE_TTL_MS = 10_000;
 const runtimeCache = new Map();
@@ -23,14 +30,31 @@ const recentEventCache = new Map();
 const globalAvatarSnapshotCache = new Map();
 const guildAvatarSnapshotCache = new Map();
 const voiceStateSnapshotCache = new Map();
+const messageSnapshotCache = new Map();
 
 const DEFAULT_AUDIT_RETRY_DELAYS_MS = [0, 1_200, 1_400, 1_600];
 const KICK_AUDIT_RETRY_DELAYS_MS = [0, 1_000, 1_500, 2_200, 3_200];
 const RECENT_EVENT_TTL_MS = 20_000;
+const MESSAGE_SNAPSHOT_TTL_MS = 6 * 60 * 60 * 1000;
+const MAX_MESSAGE_SNAPSHOTS = 5_000;
 const SECURITY_LOG_DETAILS_PREFIX = "securitylog:details:";
+const SECURITY_LOG_QUEUE_PROCESS_INTERVAL_MS = 12_000;
+const SECURITY_LOG_QUEUE_RETRY_DELAYS_MS = [
+  10 * 1000,
+  30 * 1000,
+  60 * 1000,
+  3 * 60 * 1000,
+  10 * 60 * 1000,
+  30 * 60 * 1000,
+  60 * 60 * 1000,
+];
+const MAX_DIRECT_SECURITY_LOG_SENDS = 4;
 
 let canvasModuleResolved = false;
 let canvasModule = null;
+let activeSecurityLogSends = 0;
+let queueProcessingPromise = null;
+let queueIntervalHandle = null;
 
 const SECURITY_LOG_EVENT_CONFIG = {
   nicknameChange: {
@@ -125,6 +149,236 @@ function toFieldValue(value, maxLength = 1024) {
   return `${normalized.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
+function compactErrorMessage(error, fallback = "Falha ao processar operacao.") {
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : fallback;
+  return toSnippet(message, 450);
+}
+
+function serializeDiscordEmbed(embed) {
+  const fields = Array.from(embed?.fields || [])
+    .map((field) => ({
+      name: trimText(field?.name || ""),
+      value: trimText(field?.value || ""),
+    }))
+    .filter((field) => field.name || field.value)
+    .slice(0, 12);
+
+  return {
+    title: trimText(embed?.title || ""),
+    description: trimText(embed?.description || ""),
+    authorName: trimText(embed?.author?.name || ""),
+    footerText: trimText(embed?.footer?.text || ""),
+    url: trimText(embed?.url || ""),
+    imageUrl: trimText(embed?.image?.url || ""),
+    thumbnailUrl: trimText(embed?.thumbnail?.url || ""),
+    fields,
+  };
+}
+
+function serializeAttachment(attachment) {
+  return {
+    name: trimText(attachment?.name || ""),
+    url: trimText(attachment?.url || attachment?.proxyURL || ""),
+    contentType: trimText(attachment?.contentType || ""),
+    size: Number.isFinite(attachment?.size) ? attachment.size : null,
+  };
+}
+
+function buildMessageSnapshot(message) {
+  if (!message?.id) return null;
+
+  return {
+    messageId: message.id,
+    guildId: message.guildId || message.guild?.id || null,
+    channelId: message.channelId || message.channel?.id || null,
+    author: message.author
+      ? {
+          id: message.author.id,
+          username: message.author.username || "",
+          globalName: message.author.globalName || "",
+          displayName: message.author.displayName || "",
+          bot: Boolean(message.author.bot),
+        }
+      : null,
+    content: trimText(message.content || ""),
+    cleanContent: trimText(message.cleanContent || ""),
+    embeds: Array.from(message.embeds || []).map(serializeDiscordEmbed),
+    attachments: Array.from(message.attachments?.values?.() || []).map(serializeAttachment),
+    stickers: Array.from(message.stickers?.values?.() || []).map((sticker) => ({
+      name: trimText(sticker?.name || ""),
+      id: sticker?.id || null,
+    })),
+    createdTimestamp: Number.isFinite(message.createdTimestamp)
+      ? message.createdTimestamp
+      : null,
+    updatedAt: Date.now(),
+  };
+}
+
+function pruneMessageSnapshots(now = Date.now()) {
+  for (const [messageId, snapshot] of messageSnapshotCache.entries()) {
+    if (!snapshot?.updatedAt || now - snapshot.updatedAt > MESSAGE_SNAPSHOT_TTL_MS) {
+      messageSnapshotCache.delete(messageId);
+    }
+  }
+
+  while (messageSnapshotCache.size > MAX_MESSAGE_SNAPSHOTS) {
+    const oldestKey = messageSnapshotCache.keys().next().value;
+    if (!oldestKey) break;
+    messageSnapshotCache.delete(oldestKey);
+  }
+}
+
+function observeSecurityLogMessageSnapshot(message) {
+  if (!message?.id || message.author?.bot || message.webhookId) return false;
+
+  const snapshot = buildMessageSnapshot(message);
+  if (!snapshot) return false;
+
+  messageSnapshotCache.set(message.id, snapshot);
+  pruneMessageSnapshots();
+  return true;
+}
+
+function readMessageSnapshot(messageId) {
+  const snapshot = messageSnapshotCache.get(messageId);
+  if (!snapshot) return null;
+  if (Date.now() - snapshot.updatedAt > MESSAGE_SNAPSHOT_TTL_MS) {
+    messageSnapshotCache.delete(messageId);
+    return null;
+  }
+  return snapshot;
+}
+
+async function resolveMentionedUserLabel(client, userId) {
+  const user =
+    client?.users?.cache?.get(userId) ||
+    (client?.users?.fetch
+      ? await client.users.fetch(userId).catch(() => null)
+      : null);
+  const name = trimText(user?.globalName || user?.displayName || user?.username || "");
+  return name ? `@${name}` : `@usuario:${userId}`;
+}
+
+async function resolveMessageMentionsText(text, messageOrSnapshot, guild) {
+  let resolved = trimText(text || "");
+  if (!resolved) return "";
+
+  const client = guild?.client || messageOrSnapshot?.client || null;
+  const userIds = [...new Set(Array.from(resolved.matchAll(/<@!?(\d+)>/g)).map((match) => match[1]))];
+  for (const userId of userIds) {
+    const label = await resolveMentionedUserLabel(client, userId);
+    resolved = resolved.replace(new RegExp(`<@!?${userId}>`, "g"), label);
+  }
+
+  resolved = resolved.replace(/<@&(\d+)>/g, (match, roleId) => {
+    const role = guild?.roles?.cache?.get(roleId);
+    return role?.name ? `@${role.name}` : `@cargo:${roleId}`;
+  });
+
+  const channelIds = [...new Set(Array.from(resolved.matchAll(/<#(\d+)>/g)).map((match) => match[1]))];
+  for (const channelId of channelIds) {
+    const channel =
+      guild?.channels?.cache?.get(channelId) ||
+      (guild?.channels?.fetch
+        ? await guild.channels.fetch(channelId).catch(() => null)
+        : null);
+    const label = channel?.name ? `#${channel.name}` : `#canal:${channelId}`;
+    resolved = resolved.replace(new RegExp(`<#${channelId}>`, "g"), label);
+  }
+
+  return resolved.replace(/@everyone/g, "@everyone").replace(/@here/g, "@here");
+}
+
+function buildEmbedTextLines(embeds = []) {
+  const lines = [];
+  for (const embed of embeds || []) {
+    const serialized = embed?.title !== undefined ? embed : serializeDiscordEmbed(embed);
+    if (serialized.title) lines.push(`Titulo: ${serialized.title}`);
+    if (serialized.description) lines.push(`Descricao: ${serialized.description}`);
+    if (serialized.authorName) lines.push(`Autor do embed: ${serialized.authorName}`);
+    for (const field of serialized.fields || []) {
+      const fieldName = trimText(field.name || "Campo");
+      const fieldValue = trimText(field.value || "");
+      if (fieldName || fieldValue) {
+        lines.push(`${fieldName}: ${fieldValue}`);
+      }
+    }
+    if (serialized.footerText) lines.push(`Rodape: ${serialized.footerText}`);
+    if (serialized.url) lines.push(`Link do embed: ${serialized.url}`);
+    if (serialized.imageUrl) lines.push(`Imagem do embed: ${serialized.imageUrl}`);
+    if (serialized.thumbnailUrl) lines.push(`Miniatura do embed: ${serialized.thumbnailUrl}`);
+  }
+  return lines;
+}
+
+function buildAttachmentTextLines(attachments = []) {
+  return (attachments || [])
+    .map((attachment) => {
+      const name = trimText(attachment.name || "arquivo");
+      const url = trimText(attachment.url || "");
+      const contentType = trimText(attachment.contentType || "");
+      return [name, contentType ? `(${contentType})` : "", url].filter(Boolean).join(" ");
+    })
+    .filter(Boolean);
+}
+
+async function resolveDeletedMessageContent(message, snapshot) {
+  const guild = message.guild;
+  const textCandidates = [
+    message.cleanContent,
+    message.content,
+    snapshot?.cleanContent,
+    snapshot?.content,
+  ];
+  let content = "";
+
+  for (const candidate of textCandidates) {
+    const normalized = trimText(candidate || "");
+    if (normalized) {
+      content = normalized;
+      break;
+    }
+  }
+
+  content = await resolveMessageMentionsText(content, message, guild);
+
+  const embedLines = buildEmbedTextLines(
+    message.embeds?.length ? message.embeds : snapshot?.embeds || [],
+  );
+  if (embedLines.length) {
+    content += `${content ? "\n\n" : ""}[Embeds apagados]\n${embedLines.join("\n")}`;
+  }
+
+  const attachmentValues = message.attachments?.size
+    ? Array.from(message.attachments.values()).map(serializeAttachment)
+    : snapshot?.attachments || [];
+  const attachmentLines = buildAttachmentTextLines(attachmentValues);
+  if (attachmentLines.length) {
+    content += `${content ? "\n\n" : ""}[Anexos apagados]\n${attachmentLines.join("\n")}`;
+  }
+
+  const stickers = message.stickers?.size
+    ? Array.from(message.stickers.values()).map((sticker) => ({
+        name: trimText(sticker?.name || ""),
+        id: sticker?.id || null,
+      }))
+    : snapshot?.stickers || [];
+  const stickerLines = stickers
+    .map((sticker) => [sticker.name || "sticker", sticker.id ? `(${sticker.id})` : ""].filter(Boolean).join(" "))
+    .filter(Boolean);
+  if (stickerLines.length) {
+    content += `${content ? "\n\n" : ""}[Stickers apagados]\n${stickerLines.join("\n")}`;
+  }
+
+  return content || "(Mensagem apagada sem texto, embed, anexo ou sticker disponivel no cache do bot)";
+}
+
 function normalizeSecurityLogFields(fields = []) {
   return fields
     .filter((field) => field && typeof field.name === "string")
@@ -186,6 +440,27 @@ function formatMemberLabel(member) {
 function formatUserLabel(user) {
   if (!user?.id) return "Usuario desconhecido";
   return `<@${user.id}> (\`${user.id}\`)`;
+}
+
+function resolveMemberDisplayName(member, fallbackMember = null) {
+  const candidates = [
+    member?.nickname,
+    member?.displayName,
+    member?.user?.globalName,
+    member?.user?.username,
+    fallbackMember?.nickname,
+    fallbackMember?.displayName,
+    fallbackMember?.user?.globalName,
+    fallbackMember?.user?.username,
+  ];
+
+  for (const candidate of candidates) {
+    const normalized = trimText(candidate || "");
+    if (normalized) return normalized;
+  }
+
+  const fallbackId = member?.id || fallbackMember?.id;
+  return fallbackId ? `<@${fallbackId}>` : "Nome nao identificado";
 }
 
 function resolveEventConfig(settings, eventKey) {
@@ -925,6 +1200,137 @@ function formatDurationMs(durationMs) {
   return parts.join(" ") || "Menos de 1 minuto";
 }
 
+function buildSecurityLogQueueKey({ guildId, channelId, eventKey, title, buttonContext }) {
+  const stableContext = [
+    buttonContext?.targetId || "",
+    buttonContext?.actorId || "",
+    buttonContext?.channelId || "",
+    buttonContext?.oldChannelId || "",
+    buttonContext?.newChannelId || "",
+    buttonContext?.scope || "",
+    buttonContext?.state || "",
+    buttonContext?.untilTimestamp || "",
+  ].join(":");
+
+  return [
+    "security-log",
+    guildId,
+    channelId,
+    eventKey,
+    toSnippet(title || "", 80),
+    stableContext,
+    Date.now().toString(36),
+    Math.random().toString(36).slice(2, 10),
+  ].join(":");
+}
+
+function serializeSecurityLogForQueue(input) {
+  return {
+    color: input.color,
+    title: input.title,
+    description: input.description,
+    fields: Array.isArray(input.fields) ? input.fields : [],
+    imageBase64: input.imageBuffer ? input.imageBuffer.toString("base64") : null,
+    imageName: input.imageName || "security-log.png",
+    thumbnailUrl: input.thumbnailUrl || null,
+    buttonContext: input.buttonContext || null,
+  };
+}
+
+function deserializeSecurityLogFromQueue(payload = {}) {
+  return {
+    color: Number(payload.color) || 0x5ca9ff,
+    title: payload.title,
+    description: payload.description,
+    fields: Array.isArray(payload.fields) ? payload.fields : [],
+    imageBuffer: payload.imageBase64
+      ? Buffer.from(String(payload.imageBase64), "base64")
+      : null,
+    imageName: payload.imageName || "security-log.png",
+    thumbnailUrl: payload.thumbnailUrl || null,
+    buttonContext: payload.buttonContext || null,
+  };
+}
+
+async function sendSecurityLogPayloadToChannel({
+  guild,
+  channel,
+  eventKey,
+  color,
+  title,
+  description,
+  fields,
+  imageBuffer,
+  imageName,
+  thumbnailUrl,
+  buttonContext,
+}) {
+  const payload = buildSecurityLogPayload({
+    color,
+    title,
+    description,
+    fields,
+    imageBuffer,
+    imageName,
+    thumbnailUrl,
+    buttonRows: buildSecurityLogActionRows(guild.id, eventKey, buttonContext),
+  });
+
+  return channel.send(payload);
+}
+
+async function enqueueSecurityLogForRetry({
+  guild,
+  channelId,
+  eventKey,
+  color,
+  title,
+  description,
+  fields,
+  imageBuffer,
+  imageName,
+  thumbnailUrl,
+  buttonContext,
+}) {
+  if (!guild?.id || !channelId) return false;
+
+  const queueKey = buildSecurityLogQueueKey({
+    guildId: guild.id,
+    channelId,
+    eventKey,
+    title,
+    buttonContext,
+  });
+
+  await enqueueSecurityLogQueueItem({
+    queueKey,
+    guildId: guild.id,
+    channelId,
+    eventKey,
+    payload: serializeSecurityLogForQueue({
+      color,
+      title,
+      description,
+      fields,
+      imageBuffer,
+      imageName,
+      thumbnailUrl,
+      buttonContext,
+    }),
+  });
+
+  return true;
+}
+
+function resolveNextSecurityLogRetryTimestamp(attemptCount) {
+  const delay =
+    SECURITY_LOG_QUEUE_RETRY_DELAYS_MS[
+      Math.min(attemptCount - 1, SECURITY_LOG_QUEUE_RETRY_DELAYS_MS.length - 1)
+    ] || SECURITY_LOG_QUEUE_RETRY_DELAYS_MS[SECURITY_LOG_QUEUE_RETRY_DELAYS_MS.length - 1];
+
+  return new Date(Date.now() + delay).toISOString();
+}
+
 async function sendSecurityLog({
   guild,
   settings,
@@ -944,26 +1350,156 @@ async function sendSecurityLog({
   const channel = await resolveTextChannel(guild, config.channelId);
   if (!channel) return false;
 
-  const payload = buildSecurityLogPayload({
+  const finalTitle = title || config.label;
+  const logInput = {
+    guild,
+    channelId: config.channelId,
+    eventKey,
     color,
-    title: title || config.label,
+    title: finalTitle,
     description,
     fields,
     imageBuffer,
     imageName,
     thumbnailUrl,
-    buttonRows: buildSecurityLogActionRows(guild.id, eventKey, buttonContext),
-  });
+    buttonContext,
+  };
 
-  const sent = await channel.send(payload).catch((error) => {
-    const detail = error instanceof Error ? error.message : "falha ao enviar log";
+  if (activeSecurityLogSends >= MAX_DIRECT_SECURITY_LOG_SENDS) {
+    try {
+      return await enqueueSecurityLogForRetry(logInput);
+    } catch (error) {
+      console.warn(
+        `[security-logs] fila indisponivel para ${eventKey} em guild ${guild.id}: ${compactErrorMessage(error)}`,
+      );
+    }
+  }
+
+  activeSecurityLogSends += 1;
+  try {
+    await sendSecurityLogPayloadToChannel({
+      guild,
+      channel,
+      eventKey,
+      color,
+      title: finalTitle,
+      description,
+      fields,
+      imageBuffer,
+      imageName,
+      thumbnailUrl,
+      buttonContext,
+    });
+    return true;
+  } catch (error) {
+    const detail = compactErrorMessage(error, "falha ao enviar log");
     console.warn(
       `[security-logs] falha ao enviar log ${eventKey} em guild ${guild.id} canal ${config.channelId}: ${detail}`,
     );
-    return null;
+
+    try {
+      return await enqueueSecurityLogForRetry(logInput);
+    } catch (queueError) {
+      console.warn(
+        `[security-logs] falha ao enfileirar log ${eventKey} em guild ${guild.id}: ${compactErrorMessage(queueError)}`,
+      );
+      return false;
+    }
+  } finally {
+    activeSecurityLogSends = Math.max(0, activeSecurityLogSends - 1);
+  }
+}
+
+async function processSecurityLogQueue(client, options = {}) {
+  const { limit = 15 } = options;
+
+  if (queueProcessingPromise) {
+    return queueProcessingPromise;
+  }
+
+  queueProcessingPromise = (async () => {
+    const queueItems = await getDueSecurityLogQueueItems(limit);
+    const results = [];
+
+    for (const queueItem of queueItems) {
+      const nextAttemptCount = Number(queueItem.attempt_count || 0) + 1;
+      const lockedItem = await markSecurityLogQueueItemProcessing(queueItem.id, {
+        attemptCount: nextAttemptCount,
+      });
+
+      if (!lockedItem) {
+        continue;
+      }
+
+      try {
+        const guild =
+          client.guilds.cache.get(queueItem.guild_id) ||
+          (await client.guilds.fetch(queueItem.guild_id).catch(() => null));
+        if (!guild) {
+          throw new Error("Servidor nao localizado para entrega do security log.");
+        }
+
+        const channel = await resolveTextChannel(guild, queueItem.channel_id);
+        if (!channel) {
+          throw new Error("Canal de security log nao localizado ou sem suporte a texto.");
+        }
+
+        const payload = deserializeSecurityLogFromQueue(queueItem.payload || {});
+        await sendSecurityLogPayloadToChannel({
+          guild,
+          channel,
+          eventKey: queueItem.event_key,
+          ...payload,
+        });
+
+        await deleteSecurityLogQueueItem(queueItem.id);
+        results.push({ id: queueItem.id, status: "sent" });
+      } catch (error) {
+        const reachedMaxAttempts =
+          nextAttemptCount >= Number(queueItem.max_attempts || 48);
+        const lastError = compactErrorMessage(error, "Falha ao entregar security log.");
+
+        await rescheduleSecurityLogQueueItem(queueItem.id, {
+          attemptCount: nextAttemptCount,
+          nextAttemptAt: resolveNextSecurityLogRetryTimestamp(nextAttemptCount),
+          lastError,
+          finalFailure: reachedMaxAttempts,
+        });
+
+        results.push({
+          id: queueItem.id,
+          status: reachedMaxAttempts ? "failed" : "queued",
+          lastError,
+        });
+      }
+    }
+
+    return results;
+  })();
+
+  try {
+    return await queueProcessingPromise;
+  } finally {
+    queueProcessingPromise = null;
+  }
+}
+
+function startSecurityLogQueueWorker(client) {
+  if (queueIntervalHandle) {
+    return queueIntervalHandle;
+  }
+
+  void processSecurityLogQueue(client).catch((error) => {
+    console.error("[security-log-queue]", error);
   });
 
-  return Boolean(sent);
+  queueIntervalHandle = setInterval(() => {
+    void processSecurityLogQueue(client).catch((error) => {
+      console.error("[security-log-queue]", error);
+    });
+  }, SECURITY_LOG_QUEUE_PROCESS_INTERVAL_MS);
+
+  return queueIntervalHandle;
 }
 
 function isSecurityLogButtonInteraction(interaction) {
@@ -1157,6 +1693,78 @@ function drawCoverImage(context, image, x, y, width, height) {
   context.drawImage(image, offsetX, offsetY, drawWidth, drawHeight);
 }
 
+async function fetchImageBufferWithRetry(url, attempts = 3) {
+  if (typeof fetch !== "function") return null;
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const response = await fetch(url, {
+        headers: {
+          "user-agent": "FlowdeskSecurityLogs/1.0",
+          accept: "image/png,image/jpeg,image/webp,image/gif,image/*;q=0.8",
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const arrayBuffer = await response.arrayBuffer();
+      const buffer = Buffer.from(arrayBuffer);
+      if (buffer.length > 0) return buffer;
+    } catch {
+      if (attempt < attempts) {
+        await sleep(250 * attempt);
+      }
+    }
+  }
+
+  return null;
+}
+
+async function loadAvatarImage(canvasApi, url) {
+  const normalizedUrl = trimText(url);
+  if (!canvasApi?.loadImage || !normalizedUrl) return null;
+
+  const candidates = [
+    normalizedUrl,
+    normalizedUrl.replace(/([?&])format=(?:webp|gif|jpg|jpeg|png)/i, "$1format=png"),
+    normalizedUrl.replace(/\.(?:webp|gif|jpg|jpeg)(?=\?|$)/i, ".png"),
+  ].filter((candidate, index, values) => candidate && values.indexOf(candidate) === index);
+
+  for (const candidate of candidates) {
+    const directImage = await canvasApi.loadImage(candidate).catch(() => null);
+    if (directImage) return directImage;
+
+    const buffer = await fetchImageBufferWithRetry(candidate);
+    if (!buffer) continue;
+
+    const bufferedImage = await canvasApi.loadImage(buffer).catch(() => null);
+    if (bufferedImage) return bufferedImage;
+  }
+
+  return null;
+}
+
+function drawAvatarFallback(context, label, x, y, width, height) {
+  const gradient = context.createLinearGradient(x, y, x + width, y + height);
+  gradient.addColorStop(0, "#151b29");
+  gradient.addColorStop(1, "#27334a");
+  context.fillStyle = gradient;
+  context.fillRect(x, y, width, height);
+
+  context.fillStyle = "rgba(255,255,255,0.1)";
+  context.beginPath();
+  context.arc(x + width / 2, y + height / 2 - 30, 92, 0, Math.PI * 2);
+  context.fill();
+
+  context.fillStyle = "rgba(255,255,255,0.82)";
+  context.font = "700 38px Arial";
+  context.textAlign = "center";
+  context.textBaseline = "middle";
+  context.fillText(label, x + width / 2, y + height / 2 + 92);
+}
+
 async function buildAvatarComparisonImage(oldAvatarUrl, newAvatarUrl) {
   const oldUrl = trimText(oldAvatarUrl);
   const newUrl = trimText(newAvatarUrl);
@@ -1167,18 +1775,16 @@ async function buildAvatarComparisonImage(oldAvatarUrl, newAvatarUrl) {
     return null;
   }
 
-  const { createCanvas, loadImage } = canvasApi;
+  const { createCanvas } = canvasApi;
   const width = 1200;
   const height = 620;
   const canvas = createCanvas(width, height);
   const context = canvas.getContext("2d");
 
   const [oldImage, newImage] = await Promise.all([
-    loadImage(oldUrl).catch(() => null),
-    loadImage(newUrl).catch(() => null),
+    loadAvatarImage(canvasApi, oldUrl),
+    loadAvatarImage(canvasApi, newUrl),
   ]);
-
-  if (!oldImage || !newImage) return null;
 
   context.fillStyle = "#0a0d14";
   context.fillRect(0, 0, width, height);
@@ -1198,8 +1804,17 @@ async function buildAvatarComparisonImage(oldAvatarUrl, newAvatarUrl) {
   drawRoundedRect(context, frameX, frameY, frameWidth, frameHeight, 28);
   context.clip();
 
-  drawCoverImage(context, oldImage, frameX, frameY, frameWidth / 2, frameHeight);
-  drawCoverImage(context, newImage, splitX, frameY, frameWidth / 2, frameHeight);
+  if (oldImage) {
+    drawCoverImage(context, oldImage, frameX, frameY, frameWidth / 2, frameHeight);
+  } else {
+    drawAvatarFallback(context, "Antes indisponivel", frameX, frameY, frameWidth / 2, frameHeight);
+  }
+
+  if (newImage) {
+    drawCoverImage(context, newImage, splitX, frameY, frameWidth / 2, frameHeight);
+  } else {
+    drawAvatarFallback(context, "Depois indisponivel", splitX, frameY, frameWidth / 2, frameHeight);
+  }
 
   const topFade = context.createLinearGradient(0, frameY, 0, frameY + 150);
   topFade.addColorStop(0, "rgba(0,0,0,0.28)");
@@ -1404,6 +2019,14 @@ async function handleNicknameOrAvatarUpdate(oldMember, newMember) {
   const settings = runtime.settings;
   const beforeNick = trimText(oldMember?.nickname || "");
   const afterNick = trimText(newMember.nickname || "");
+  const freshMember =
+    (await newMember.guild.members
+      .fetch({ user: newMember.id, force: true })
+      .catch(() => null)) ||
+    newMember.guild.members.cache.get(newMember.id) ||
+    newMember;
+  const beforeNickLabel = resolveMemberDisplayName(oldMember, newMember);
+  const afterNickLabel = resolveMemberDisplayName(freshMember, newMember);
   const beforeMemberAvatar = oldMember?.avatar || null;
   const afterMemberAvatar = newMember?.avatar || null;
   let handled = false;
@@ -1421,16 +2044,16 @@ async function handleNicknameOrAvatarUpdate(oldMember, newMember) {
         eventKey: "nicknameChange",
         color: 0x6a9cff,
         title: "Nickname alterado",
-        description: `Usuario: ${formatMemberLabel(newMember)}`,
-        thumbnailUrl: resolveStaticMemberAvatarUrl(newMember),
-      fields: [
-        {
-          name: "Nickname antigo",
-          value: beforeNick || "(sem nickname)",
+        description: `Usuario: ${formatMemberLabel(freshMember || newMember)}`,
+        thumbnailUrl: resolveStaticMemberAvatarUrl(freshMember || newMember),
+        fields: [
+          {
+            name: "Nickname antigo",
+            value: beforeNickLabel,
           },
           {
             name: "Nickname novo",
-            value: afterNick || "(sem nickname)",
+            value: afterNickLabel,
           },
         ],
         buttonContext: {
@@ -1512,10 +2135,14 @@ async function handleNicknameOrAvatarUpdate(oldMember, newMember) {
               value: executor ? formatUserLabel(executor) : "Nao identificado",
               inline: true,
             },
-            {
-              name: "Motivo",
-              value: reason || "Nao informado",
-            },
+            ...(reason
+              ? [
+                  {
+                    name: "Motivo",
+                    value: reason,
+                  },
+                ]
+              : []),
           ],
           thumbnailUrl: resolveStaticMemberAvatarUrl(newMember),
           buttonContext: {
@@ -1739,7 +2366,6 @@ async function handleVoiceStateSecurityLog(oldState, newState) {
         newServerMute,
       );
       const executor = muteAuditEntry?.executor || null;
-      const reason = trimText(muteAuditEntry?.reason || "");
       const currentChannel = newChannel || oldChannel;
       const changedByModerator = executor?.id && executor.id !== newState.id;
       const dedupeKey = [
@@ -1751,6 +2377,21 @@ async function handleVoiceStateSecurityLog(oldState, newState) {
       ].join(":");
 
       if (!registerRecentEvent(dedupeKey)) {
+        const voiceMuteFields = [
+          {
+            name: "Canal",
+            value: currentChannel ? `<#${currentChannel.id}>` : "Nao identificado",
+            inline: true,
+          },
+          {
+            name: changedByModerator ? "Executado por" : "Origem da alteracao",
+            value: changedByModerator
+              ? formatUserLabel(executor)
+              : "Alteracao direta do usuario ou auditoria indisponivel",
+            inline: true,
+          },
+        ];
+
         await sendSecurityLog({
           guild,
           settings,
@@ -1761,24 +2402,7 @@ async function handleVoiceStateSecurityLog(oldState, newState) {
             : "Membro desmutado na call",
           description: `Usuario: ${memberLabel}`,
           thumbnailUrl: resolveStaticMemberAvatarUrl(newState.member || oldState.member),
-          fields: [
-            {
-              name: "Canal",
-              value: currentChannel ? `<#${currentChannel.id}>` : "Nao identificado",
-              inline: true,
-            },
-            {
-              name: changedByModerator ? "Executado por" : "Origem da alteracao",
-              value: changedByModerator
-                ? formatUserLabel(executor)
-                : "Alteracao direta do usuario ou auditoria indisponivel",
-              inline: true,
-            },
-            {
-              name: "Motivo",
-              value: reason || "Nao informado",
-            },
-          ],
+          fields: voiceMuteFields,
           buttonContext: {
             targetId: newState.id,
             actorId: executor?.id || null,
@@ -1808,10 +2432,18 @@ async function handleMessageDeleteSecurityLog(message) {
   const runtime = await resolveRuntime(message.guildId);
   if (!runtime?.settings) return false;
 
+  const snapshot = readMessageSnapshot(message.id);
+  const snapshotAuthor = snapshot?.author || null;
+  if (snapshotAuthor?.bot) return false;
+
   const authorLabel = message.author
     ? formatUserLabel(message.author)
-    : "Nao identificado";
-  const channelLabel = message.channelId ? `<#${message.channelId}>` : "Nao identificado";
+    : snapshotAuthor?.id
+      ? formatUserLabel(snapshotAuthor)
+      : "Nao identificado";
+  const resolvedChannelId = message.channelId || snapshot?.channelId || null;
+  const resolvedAuthorId = message.author?.id || snapshotAuthor?.id || null;
+  const channelLabel = resolvedChannelId ? `<#${resolvedChannelId}>` : "Nao identificado";
 
   let content = trimText(message.content || "");
 
@@ -1875,8 +2507,10 @@ async function handleMessageDeleteSecurityLog(message) {
   }
 
   if (!content) {
-    content = "(Mensagem sem conteudo textual rastreavel ou apenas arquivo nao legivel)";
+    content = "(Mensagem apagada sem dados disponiveis no evento direto)";
   }
+
+  content = await resolveDeletedMessageContent(message, snapshot);
 
   await sendSecurityLog({
     guild: message.guild,
@@ -1898,8 +2532,8 @@ async function handleMessageDeleteSecurityLog(message) {
       },
     ],
     buttonContext: {
-      targetId: message.author?.id || null,
-      channelId: message.channelId || null,
+      targetId: resolvedAuthorId,
+      channelId: resolvedChannelId,
     },
   });
 
@@ -1914,8 +2548,15 @@ async function handleMessageEditSecurityLog(oldMessage, newMessage) {
   const author = newMessage?.author || oldMessage?.author;
   if (author?.bot) return false;
 
-  let oldContent = trimText(oldMessage?.content || "");
-  let newContent = trimText(newMessage?.content || "");
+  const oldSnapshot = readMessageSnapshot(oldMessage?.id || newMessage?.id);
+  let oldContent = trimText(
+    oldMessage?.cleanContent ||
+      oldMessage?.content ||
+      oldSnapshot?.cleanContent ||
+      oldSnapshot?.content ||
+      "",
+  );
+  let newContent = trimText(newMessage?.cleanContent || newMessage?.content || "");
   if (oldContent === newContent) return false;
 
   // Helper para resolver menções em qualquer conteúdo de mensagem
@@ -2137,5 +2778,8 @@ module.exports = {
   handleUserAvatarUpdate,
   handleVoiceStateSecurityLog,
   isSecurityLogButtonInteraction,
+  observeSecurityLogMessageSnapshot,
+  processSecurityLogQueue,
   primeVoiceStateSnapshots,
+  startSecurityLogQueueWorker,
 };

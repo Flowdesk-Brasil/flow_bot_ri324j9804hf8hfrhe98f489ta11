@@ -12,8 +12,25 @@ begin
     create index if not exists idx_auth_user_team_members_user_status
     on public.auth_user_team_members (invited_auth_user_id, status, team_id);
 
-    create index if not exists idx_auth_user_team_members_discord_status
-    on public.auth_user_team_members (discord_user_id, status, team_id);
+    if exists (
+      select 1
+        from information_schema.columns
+       where table_schema = 'public'
+         and table_name = 'auth_user_team_members'
+         and column_name = 'invited_discord_user_id'
+    ) then
+      create index if not exists idx_auth_user_team_members_discord_status
+      on public.auth_user_team_members (invited_discord_user_id, status, team_id);
+    elsif exists (
+      select 1
+        from information_schema.columns
+       where table_schema = 'public'
+         and table_name = 'auth_user_team_members'
+         and column_name = 'discord_user_id'
+    ) then
+      create index if not exists idx_auth_user_team_members_discord_status
+      on public.auth_user_team_members (discord_user_id, status, team_id);
+    end if;
 
     create index if not exists idx_auth_user_team_members_team_status
     on public.auth_user_team_members (team_id, status, created_at desc);

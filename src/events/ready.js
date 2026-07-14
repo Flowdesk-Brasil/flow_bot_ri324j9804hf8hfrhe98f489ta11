@@ -3,7 +3,10 @@ const {
   syncAllTicketPanels,
   syncOpenTicketControlMessages,
 } = require("../services/ticketService");
-const { primeVoiceStateSnapshots } = require("../services/securityLogsService");
+const {
+  primeVoiceStateSnapshots,
+  startSecurityLogQueueWorker,
+} = require("../services/securityLogsService");
 const { startDirectMessageQueueWorker } = require("../services/directMessageQueueService");
 const { startAutoRoleWorker } = require("../services/autoRoleService");
 const { primeInviteCacheForClient } = require("../utils/inviteTracker");
@@ -23,8 +26,16 @@ module.exports = {
 
     const supabaseReady = await verifySupabaseAdminConnection();
 
-    if (supabaseReady) {
+    if (
+      supabaseReady &&
+      String(process.env.SUPABASE_REALTIME_ENABLED || "true").toLowerCase() !== "false"
+    ) {
       initRealtimeListeners(client);
+    } else if (supabaseReady) {
+      console.log("[realtimeService] listeners desativados por SUPABASE_REALTIME_ENABLED=false");
+    }
+
+    if (supabaseReady) {
       startStatusHeartbeat(client);
     } else {
       console.warn(
@@ -85,6 +96,7 @@ module.exports = {
       }
 
       startDirectMessageQueueWorker(client);
+      startSecurityLogQueueWorker(client);
       startAutoRoleWorker(client);
     }
 
