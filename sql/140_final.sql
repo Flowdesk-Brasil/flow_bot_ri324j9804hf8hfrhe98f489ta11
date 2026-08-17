@@ -8610,7 +8610,7 @@ execute function public.set_updated_at();
 
 create table if not exists public.auth_email_otp_challenges (
   id uuid primary key default gen_random_uuid(),
-  user_id bigint not null references public.auth_users(id) on delete cascade,
+  user_id bigint references public.auth_users(id) on delete cascade,
   email text not null,
   email_normalized text not null,
   purpose text not null default 'login',
@@ -8633,6 +8633,9 @@ create table if not exists public.auth_email_otp_challenges (
   constraint auth_email_otp_challenges_resend_count_check
     check (resend_count >= 0 and resend_count <= 20)
 );
+
+alter table public.auth_email_otp_challenges
+  alter column user_id drop not null;
 
 drop trigger if exists tr_auth_email_otp_challenges_updated_at on public.auth_email_otp_challenges;
 create trigger tr_auth_email_otp_challenges_updated_at
@@ -8883,7 +8886,7 @@ execute function public.set_updated_at();
 
 create table if not exists public.auth_email_otp_challenges (
   id uuid primary key default gen_random_uuid(),
-  user_id bigint not null references public.auth_users(id) on delete cascade,
+  user_id bigint references public.auth_users(id) on delete cascade,
   email text not null,
   email_normalized text not null,
   purpose text not null default 'login',
@@ -8909,6 +8912,9 @@ create table if not exists public.auth_email_otp_challenges (
 
 alter table public.auth_email_otp_challenges
   add column if not exists metadata jsonb not null default '{}'::jsonb;
+
+alter table public.auth_email_otp_challenges
+  alter column user_id drop not null;
 
 drop trigger if exists tr_auth_email_otp_challenges_updated_at on public.auth_email_otp_challenges;
 create trigger tr_auth_email_otp_challenges_updated_at
@@ -14002,7 +14008,7 @@ for each row execute function public.set_updated_at();
 
 create table if not exists public.auth_email_otp_challenges (
   id uuid primary key default gen_random_uuid(),
-  user_id bigint not null references public.auth_users(id) on delete cascade,
+  user_id bigint references public.auth_users(id) on delete cascade,
   email text not null,
   email_normalized text not null,
   purpose text not null default 'login',
@@ -14026,6 +14032,9 @@ create table if not exists public.auth_email_otp_challenges (
 
 alter table public.auth_email_otp_challenges
   add column if not exists metadata jsonb not null default '{}'::jsonb;
+
+alter table public.auth_email_otp_challenges
+  alter column user_id drop not null;
 
 alter table public.auth_email_otp_challenges
   drop constraint if exists auth_email_otp_challenges_purpose_check;
