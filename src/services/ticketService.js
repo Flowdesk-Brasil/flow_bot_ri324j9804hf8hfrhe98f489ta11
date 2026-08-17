@@ -61,6 +61,7 @@ const {
 } = require("./directMessageQueueService");
 const {
   isTicketAiEnabledForRuntime,
+  markTicketAiClosed,
   markTicketAiHandoff,
   sendInitialTicketAiMessage,
   generateAiSuggestion,

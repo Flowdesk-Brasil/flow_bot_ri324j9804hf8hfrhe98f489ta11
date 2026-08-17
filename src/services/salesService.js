@@ -40,6 +40,7 @@ const COMPONENT_TYPE = {
   CONTAINER: 17,
 };
 const COMPONENTS_V2_FLAG = MessageFlags.IsComponentsV2 || 32768;
+const cartQuantityUpdateQueues = new Map();
 
 function unwrap(result, operation) {
   if (result.error) {
@@ -126,6 +127,57 @@ function buildProductUnavailableReply(productCode) {
       },
     ],
   };
+}
+
+function enqueueCartQuantityUpdate(key, task) {
+  const previous = cartQuantityUpdateQueues.get(key) || Promise.resolve();
+  const next = previous.catch(() => null).then(task);
+  const cleanup = next.catch(() => null).finally(() => {
+    if (cartQuantityUpdateQueues.get(key) === cleanup) {
+      cartQuantityUpdateQueues.delete(key);
+    }
+  });
+  cartQuantityUpdateQueues.set(key, cleanup);
+  return next;
+}
+
+async function acknowledgeEphemeralInteraction(interaction, context) {
+  if (interaction.deferred || interaction.replied) return true;
+  try {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+    return true;
+  } catch (error) {
+    console.warn("[salesService] Falha ao reconhecer interacao efemera.", {
+      context,
+      interactionId: interaction.id,
+      customId: interaction.customId,
+      ageMs: Date.now() - interaction.createdTimestamp,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
+async function respondEphemeralInteraction(interaction, content) {
+  try {
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply({ content });
+      return;
+    }
+    await interaction.reply({ flags: MessageFlags.Ephemeral, content });
+  } catch (error) {
+    console.warn("[salesService] Falha ao responder interacao efemera.", {
+      interactionId: interaction.id,
+      customId: interaction.customId,
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+function formatStockLimitMessage(quantity) {
+  const stock = Math.max(0, Math.floor(Number(quantity || 0)));
+  if (stock <= 0) return "Este produto esta sem estoque disponivel.";
+  return `Este produto so possui ${stock} ${stock === 1 ? "unidade" : "unidades"} em estoque.`;
 }
 
 function separator() {
@@ -1006,61 +1058,104 @@ async function handleLinkedButton(interaction, cartId) {
 }
 
 async function handleQuantityButton(interaction, cartId, direction, itemId = null) {
-  const cart = await getCart(cartId);
-  if (!cart || cart.discord_user_id !== interaction.user.id) {
-    await interaction.reply({ flags: MessageFlags.Ephemeral, content: "Carrinho nao encontrado." });
-    return;
-  }
-  if (!cart.auth_user_id) {
-    await interaction.reply({ flags: MessageFlags.Ephemeral, content: "Vincule a compra antes de alterar quantidade." });
-    return;
-  }
-  if (cart.status === "payment_pending") {
-    await interaction.reply({ flags: MessageFlags.Ephemeral, content: "Pagamento ja foi gerado para este carrinho." });
-    return;
-  }
+  const acknowledged = await acknowledgeEphemeralInteraction(
+    interaction,
+    "sales.cart.quantity",
+  );
+  if (!acknowledged) return;
 
-  const items = await getCartItems(cartId);
-  const item = itemId
-    ? items.find((entry) => entry.id === itemId)
-    : items[0];
-  if (!item) {
-    await interaction.reply({ flags: MessageFlags.Ephemeral, content: "Carrinho vazio." });
-    return;
-  }
-  const productResult = await supabase
-    .from("guild_sales_products")
-    .select(PRODUCT_SELECT)
-    .eq("id", item.product_id)
-    .maybeSingle();
-  const product = unwrap(productResult, "handleQuantityButton.product");
-  const availableStock = product?.inventory_tracked === false
-    ? { quantity: 999, reliable: true }
-    : await getAvailableStockQuantity(cart.guild_id, item.product_id, product?.stock_quantity || 1);
-  const stock = product?.inventory_tracked === false
-    ? 999
-    : Math.max(1, availableStock.quantity);
-  const current = Math.max(1, Number(item.quantity || 1));
-  const nextQuantity =
-    direction === "inc" ? Math.min(stock, current + 1) : Math.max(1, current - 1);
-  if (direction === "inc" && !(await productHasEffectiveStock(product, nextQuantity))) {
-    await interaction.reply({ flags: MessageFlags.Ephemeral, content: "Estoque maximo atingido para este produto." });
-    return;
-  }
-  const unit = Number(item.unit_price_amount || 0);
+  const queueKey = `${cartId}:${itemId || "first"}`;
+  try {
+    const message = await enqueueCartQuantityUpdate(queueKey, async () => {
+      const cart = await getCart(cartId);
+      if (!cart || cart.discord_user_id !== interaction.user.id) {
+        return "Carrinho nao encontrado.";
+      }
+      if (!cart.auth_user_id) {
+        return "Vincule a compra antes de alterar quantidade.";
+      }
+      if (cart.status === "payment_pending") {
+        return "Pagamento ja foi gerado para este carrinho.";
+      }
 
-  await supabase
-    .from("guild_sales_cart_items")
-    .update({
-      quantity: nextQuantity,
-      total_amount: Number((nextQuantity * unit).toFixed(2)),
-    })
-    .eq("id", item.id);
-  const updatedItems = await getCartItems(cartId);
-  await updateCartTotals(cartId, updatedItems);
+      const items = await getCartItems(cartId);
+      const item = itemId
+        ? items.find((entry) => entry.id === itemId)
+        : items[0];
+      if (!item) {
+        return "Carrinho vazio.";
+      }
+      const productResult = await supabase
+        .from("guild_sales_products")
+        .select(PRODUCT_SELECT)
+        .eq("id", item.product_id)
+        .maybeSingle();
+      const product = unwrap(productResult, "handleQuantityButton.product");
+      if (!product) {
+        return "Produto do carrinho nao foi encontrado.";
+      }
 
-  await interaction.deferUpdate();
-  await refreshCartMessage(interaction.message, cartId);
+      const current = Math.max(1, Math.floor(Number(item.quantity || 1)));
+      let nextQuantity = direction === "inc" ? current + 1 : current - 1;
+      if (direction !== "inc" && current <= 1) {
+        return "A quantidade minima e 1 unidade.";
+      }
+
+      if (product.inventory_tracked !== false && direction === "inc") {
+        const availableStock = await getCanonicalAvailableStockQuantity(product);
+        const stock = Math.max(0, Math.floor(Number(availableStock.quantity || 0)));
+        if (nextQuantity > stock) {
+          return formatStockLimitMessage(stock);
+        }
+      }
+
+      nextQuantity = Math.max(1, nextQuantity);
+      if (
+        direction === "inc" &&
+        product.inventory_tracked !== false &&
+        !(await productHasEffectiveStock(product, nextQuantity))
+      ) {
+        const availableStock = await getCanonicalAvailableStockQuantity(product);
+        return formatStockLimitMessage(availableStock.quantity);
+      }
+
+      const unit = Number(item.unit_price_amount || 0);
+      const updateResult = await supabase
+        .from("guild_sales_cart_items")
+        .update({
+          quantity: nextQuantity,
+          total_amount: Number((nextQuantity * unit).toFixed(2)),
+        })
+        .eq("id", item.id);
+      unwrap(updateResult, "handleQuantityButton.updateItem");
+
+      const updatedItems = await getCartItems(cartId);
+      await updateCartTotals(cartId, updatedItems);
+      await refreshCartMessage(interaction.message, cartId).catch((error) => {
+        console.warn("[salesService] Falha ao atualizar mensagem do carrinho.", {
+          cartId,
+          itemId: item.id,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
+
+      return `Quantidade atualizada para ${nextQuantity}.`;
+    });
+
+    await respondEphemeralInteraction(interaction, message);
+  } catch (error) {
+    console.warn("[salesService] Falha ao atualizar quantidade do carrinho.", {
+      cartId,
+      itemId,
+      direction,
+      userId: interaction.user.id,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    await respondEphemeralInteraction(
+      interaction,
+      "Nao consegui atualizar a quantidade agora. Tente novamente em instantes.",
+    );
+  }
 }
 
 async function handleCheckoutButton(interaction, cartId) {
