@@ -28,7 +28,9 @@ function requireEnv(key) {
   const value = process.env[key];
 
   if (!value) {
-    throw new Error(`Variavel obrigatoria ausente no .env: ${key}`);
+    throw new Error(
+      `Variavel obrigatoria ausente no ambiente ou .env local: ${key}`,
+    );
   }
 
   return value;
@@ -42,7 +44,9 @@ function requireAnyEnv(...keys) {
     }
   }
 
-  throw new Error(`Variavel obrigatoria ausente no .env: ${keys.join(" ou ")}`);
+  throw new Error(
+    `Variavel obrigatoria ausente no ambiente ou .env local: ${keys.join(" ou ")}`,
+  );
 }
 
 function optionalEnv(key) {

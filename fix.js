@@ -1,16 +1,34 @@
-const fs = require('fs');
-const content = fs.readFileSync('site/.env');
-const lines = content.toString('utf8').split('\n');
-const cleanLines = [];
-for (const line of lines) {
-  if (line.includes('FLOWDESK_DOMAIN_REGISTRANT_DOCUMENT_NUMBER')) {
-    cleanLines.push('FLOWDESK_DOMAIN_REGISTRANT_DOCUMENT_NUMBER=51601711000152');
-    break;
-  }
-  cleanLines.push(line);
+"use strict";
+
+const REQUIRED_ENV_GROUPS = [
+  ["DISCORD_TOKEN", "DISCORD_BOT_TOKEN"],
+  ["DISCORD_CLIENT_ID"],
+  ["SUPABASE_URL"],
+  ["SUPABASE_SERVICE_ROLE_KEY"],
+];
+
+function hasEnvironmentValue(key) {
+  const value = process.env[key];
+  return typeof value === "string" && value.trim().length > 0;
 }
-cleanLines.push('');
-cleanLines.push('HOSTING_AGENT_BASE_URL="http://2.25.183.234:5001"');
-cleanLines.push('HOSTING_AGENT_TOKEN="flowdesk-super-secret-token-v1"');
-fs.writeFileSync('site/.env', cleanLines.join('\n'));
-console.log("Fixed!");
+
+const missingGroups = REQUIRED_ENV_GROUPS.filter(
+  (keys) => !keys.some(hasEnvironmentValue),
+);
+
+if (missingGroups.length > 0) {
+  console.error(
+    "[squarecloud-env] Variaveis obrigatorias ausentes: " +
+      missingGroups.map((keys) => keys.join(" ou ")).join(", "),
+  );
+  console.error(
+    "[squarecloud-env] Configure esses valores em Environment Variables na Square Cloud. Nenhum arquivo local do site sera lido.",
+  );
+  process.exit(1);
+}
+
+console.log(
+  "[squarecloud-env] Usando variaveis do ambiente da Square Cloud. Nenhum arquivo local do site sera lido.",
+);
+
+require("./src/main");
