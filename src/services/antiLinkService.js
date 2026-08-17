@@ -10,6 +10,20 @@ const { getGuildAntiLinkRuntime, getGuildTicketSettings } = require("./supabaseS
 
 const RUNTIME_CACHE_TTL_MS = 10_000;
 const runtimeCache = new Map();
+const DELETE_RETRY_DELAYS_MS = [0, 350, 1_200, 3_000];
+const DELETE_QUEUE_GAP_MS = 90;
+const DELETE_DEDUP_TTL_MS = 45_000;
+const BURST_WINDOW_MS = 10_000;
+const BURST_SWEEP_THRESHOLD = 3;
+const BURST_SWEEP_COOLDOWN_MS = 2_500;
+const NOTICE_COOLDOWN_MS = 7_500;
+const MEMBER_ACTION_COOLDOWN_MS = 15_000;
+const deleteQueuesByChannel = new Map();
+const queuedDeleteIds = new Map();
+const burstState = new Map();
+const burstSweepCooldowns = new Map();
+const noticeCooldowns = new Map();
+const memberActionCooldowns = new Map();
 
 const HTTP_LINK_REGEX = /\b(?:https?:\/\/|www\.)[^\s<>()]+/i;
 const DISCORD_INVITE_REGEX =
@@ -144,6 +158,167 @@ function normalizeTimeoutMinutes(value) {
       : Number.NaN;
   if (!Number.isFinite(parsed)) return 10;
   return Math.min(10080, Math.max(1, parsed));
+}
+
+function wait(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function isDiscordUnknownMessageError(error) {
+  return (
+    Number(error?.code) === 10008 ||
+    String(error?.message || "").toLowerCase().includes("unknown message")
+  );
+}
+
+function compactExpiringMap(map, now = Date.now()) {
+  if (map.size < 1_000) return;
+  for (const [key, expiresAt] of map.entries()) {
+    if (expiresAt <= now) {
+      map.delete(key);
+    }
+  }
+}
+
+function markExpiringKey(map, key, ttlMs) {
+  const now = Date.now();
+  compactExpiringMap(map, now);
+  map.set(key, now + ttlMs);
+}
+
+function hasFreshKey(map, key) {
+  const expiresAt = map.get(key);
+  if (!expiresAt) return false;
+  if (expiresAt <= Date.now()) {
+    map.delete(key);
+    return false;
+  }
+  return true;
+}
+
+function enqueueMessageDelete(message, reason) {
+  const messageId = message?.id;
+  const channelId = message?.channelId;
+  if (!messageId || !channelId || typeof message.delete !== "function") {
+    return Promise.resolve({
+      deleted: false,
+      status: "warn",
+      detail: "mensagem sem canal ou metodo de exclusao",
+    });
+  }
+
+  if (hasFreshKey(queuedDeleteIds, messageId)) {
+    return Promise.resolve({
+      deleted: true,
+      status: "ok",
+      detail: "exclusao ja enfileirada",
+    });
+  }
+
+  markExpiringKey(queuedDeleteIds, messageId, DELETE_DEDUP_TTL_MS);
+  const previous = deleteQueuesByChannel.get(channelId) || Promise.resolve();
+  const task = previous
+    .catch(() => null)
+    .then(async () => {
+      for (let attempt = 0; attempt < DELETE_RETRY_DELAYS_MS.length; attempt += 1) {
+        const delayMs = DELETE_RETRY_DELAYS_MS[attempt];
+        if (delayMs > 0) {
+          await wait(delayMs);
+        }
+
+        try {
+          await message.delete();
+          return { deleted: true, status: "ok", detail: null };
+        } catch (error) {
+          if (isDiscordUnknownMessageError(error)) {
+            return { deleted: true, status: "ok", detail: "mensagem ja removida" };
+          }
+
+          const isLastAttempt = attempt + 1 >= DELETE_RETRY_DELAYS_MS.length;
+          if (isLastAttempt) {
+            return {
+              deleted: false,
+              status: "warn",
+              detail: error instanceof Error ? error.message : "falha ao apagar mensagem",
+            };
+          }
+        }
+      }
+
+      return { deleted: false, status: "warn", detail: "falha ao apagar mensagem" };
+    })
+    .finally(async () => {
+      await wait(DELETE_QUEUE_GAP_MS);
+      if (deleteQueuesByChannel.get(channelId) === task) {
+        deleteQueuesByChannel.delete(channelId);
+      }
+    });
+
+  deleteQueuesByChannel.set(channelId, task);
+
+  return task.then((result) => {
+    if (!result.deleted) {
+      console.warn(
+        `[AntiLink] falha ao apagar mensagem em guild ${message.guildId} canal ${channelId}: ${result.detail || reason}`,
+      );
+    }
+    return result;
+  });
+}
+
+function shouldApplyMemberAction(message, action) {
+  if (action === "delete_only") return false;
+  const key = `${message.guildId}:${message.author?.id}:${action}`;
+  if (hasFreshKey(memberActionCooldowns, key)) return false;
+  markExpiringKey(memberActionCooldowns, key, MEMBER_ACTION_COOLDOWN_MS);
+  return true;
+}
+
+function shouldSendNotice(message) {
+  const key = `${message.guildId}:${message.channelId}:${message.author?.id}`;
+  if (hasFreshKey(noticeCooldowns, key)) return false;
+  markExpiringKey(noticeCooldowns, key, NOTICE_COOLDOWN_MS);
+  return true;
+}
+
+function observeViolationBurst(message) {
+  const key = `${message.guildId}:${message.channelId}:${message.author?.id}`;
+  const now = Date.now();
+  const state = burstState.get(key) || [];
+  const recent = state.filter((timestamp) => now - timestamp <= BURST_WINDOW_MS);
+  recent.push(now);
+  burstState.set(key, recent);
+  return recent.length;
+}
+
+function scheduleBurstSweep({ message, settings }) {
+  const key = `${message.guildId}:${message.channelId}:${message.author?.id}`;
+  if (hasFreshKey(burstSweepCooldowns, key)) return;
+  markExpiringKey(burstSweepCooldowns, key, BURST_SWEEP_COOLDOWN_MS);
+
+  setTimeout(async () => {
+    const channel = message.channel;
+    if (!channel || typeof channel.messages?.fetch !== "function") return;
+
+    const fetched = await channel.messages.fetch({ limit: 100 }).catch((error) => {
+      const detail = error instanceof Error ? error.message : "falha ao buscar mensagens";
+      console.warn(
+        `[AntiLink] falha na varredura anti-flood em ${message.guildId}/${message.channelId}: ${detail}`,
+      );
+      return null;
+    });
+    if (!fetched) return;
+
+    for (const candidate of fetched.values()) {
+      if (candidate.author?.id !== message.author?.id) continue;
+      if (candidate.author?.bot || candidate.webhookId) continue;
+      const detection = detectViolation(resolveMessageTextForDetection(candidate), settings);
+      if (!detection) continue;
+      void enqueueMessageDelete(candidate, `[AntiLink sweep] ${detection.reason}`);
+    }
+  }, 250);
 }
 
 function hasLikelyDomainWithKnownTld(value) {
@@ -352,19 +527,19 @@ async function applyModerationAction({
     moderationDetail: null,
   };
 
-  try {
-    await message.delete();
-    result.deleted = true;
-  } catch (error) {
+  const deleteResult = await enqueueMessageDelete(message, reason);
+  result.deleted = deleteResult.deleted;
+  if (!deleteResult.deleted) {
     result.moderationStatus = "warn";
-    result.moderationDetail =
-      error instanceof Error ? error.message : "falha ao apagar mensagem";
-    console.warn(
-      `[AntiLink] falha ao apagar mensagem em guild ${message.guildId} canal ${message.channelId}: ${result.moderationDetail}`,
-    );
+    result.moderationDetail = deleteResult.detail;
   }
 
   if (action === "delete_only") {
+    return result;
+  }
+
+  if (!shouldApplyMemberAction(message, action)) {
+    result.actionApplied = action;
     return result;
   }
 
@@ -606,6 +781,11 @@ async function handleAntiLinkMessage(message) {
   const detection = detectViolation(textForDetection, settings);
   if (!detection) return false;
 
+  const burstCount = observeViolationBurst(message);
+  if (burstCount >= BURST_SWEEP_THRESHOLD) {
+    scheduleBurstSweep({ message, settings });
+  }
+
   const action = normalizeAction(settings.enforcement_action);
   const timeoutMinutes = normalizeTimeoutMinutes(settings.timeout_minutes);
   const reason = `[AntiLink] ${detection.reason}`;
@@ -617,25 +797,28 @@ async function handleAntiLinkMessage(message) {
     reason,
   });
 
-  await sendAntiLinkNotice({
-    message,
-    detection,
-    action,
-    timeoutMinutes,
-  });
+  if (shouldSendNotice(message)) {
+    void sendAntiLinkNotice({
+      message,
+      detection,
+      action,
+      timeoutMinutes,
+    }).catch(() => null);
+  }
 
-  await sendAntiLinkLog({
+  void sendAntiLinkLog({
     message,
     settings,
     action,
     timeoutMinutes,
     detection,
     moderation,
-  });
+  }).catch(() => null);
 
   return true;
 }
 
 module.exports = {
+  detectViolation,
   handleAntiLinkMessage,
 };
