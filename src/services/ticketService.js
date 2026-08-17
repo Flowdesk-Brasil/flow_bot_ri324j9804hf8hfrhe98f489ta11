@@ -1,5 +1,6 @@
 const {
   ActionRowBuilder,
+  AttachmentBuilder,
   ChannelType,
   MessageFlags,
   ModalBuilder,
@@ -76,9 +77,31 @@ const pendingTicketReasons = new Map();
 const AI_SUGGESTION_SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 const OPEN_TICKET_LOCK_TTL_MS = 15 * 1000;
 const MINIMUM_MESSAGES_FOR_TRANSCRIPT = 6;
+const TICKET_PAYMENT_SYNC_INTERVAL_MS = 7_500;
+const TICKET_PAYMENT_SYNC_MAX_MS = 30 * 60_000;
 const openTicketLocks = new Map();
 let warnedAboutMissingIntroMessageColumn = false;
 let warnedAboutMissingAiSuggestionSessionTable = false;
+
+const COMPONENT_TYPE = {
+  ACTION_ROW: 1,
+  BUTTON: 2,
+  STRING_SELECT: 3,
+  CONTAINER: 17,
+  TEXT_DISPLAY: 10,
+  SEPARATOR: 14,
+  MEDIA_GALLERY: 12,
+};
+
+const BUTTON_STYLE = {
+  PRIMARY: 1,
+  SECONDARY: 2,
+  SUCCESS: 3,
+  DANGER: 4,
+  LINK: 5,
+};
+
+const PANEL_SELECT_PLACEHOLDER = "Escolha uma acao";
 
 function buildOpenTicketLockKey(guildId, userId) {
   return `${guildId}:${userId}`;
@@ -430,6 +453,299 @@ function resolveTicketOwnerSummary(ticket) {
   return `<@${ticket.claimed_by}>`;
 }
 
+function formatMoney(value) {
+  return new Intl.NumberFormat("pt-BR", {
+    style: "currency",
+    currency: "BRL",
+  }).format(Number(value || 0));
+}
+
+function normalizeSnowflake(value) {
+  const normalized = String(value || "").trim();
+  return /^\d{10,25}$/.test(normalized) ? normalized : "";
+}
+
+function parseMoneyInput(value) {
+  const normalized = String(value || "")
+    .trim()
+    .replace(/\s+/g, "")
+    .replace(/^R\$/i, "")
+    .replace(/\./g, "")
+    .replace(",", ".");
+  const amount = Number(normalized);
+  if (!Number.isFinite(amount)) return null;
+  const rounded = Math.round(amount * 100) / 100;
+  return rounded >= 1 ? rounded : null;
+}
+
+function textDisplay(content) {
+  return {
+    type: COMPONENT_TYPE.TEXT_DISPLAY,
+    content: String(content || "").slice(0, 3900),
+  };
+}
+
+function separator() {
+  return {
+    type: COMPONENT_TYPE.SEPARATOR,
+    divider: true,
+    spacing: 1,
+  };
+}
+
+function actionRow(components) {
+  return {
+    type: COMPONENT_TYPE.ACTION_ROW,
+    components,
+  };
+}
+
+function buildTicketActionPanelPayload({ title, ticket, options, tone = "neutral" }) {
+  const lines = [
+    `### ${title}`,
+    "",
+    `Protocolo: \`${ticket.protocol}\``,
+    `Solicitante: <@${ticket.user_id}>`,
+    `Staff: ${resolveTicketOwnerSummary(ticket)}`,
+    `Canal: <#${ticket.channel_id}>`,
+  ];
+
+  return {
+    flags: MessageFlags.IsComponentsV2,
+    components: [
+      {
+        type: COMPONENT_TYPE.CONTAINER,
+        accent_color:
+          tone === "warning"
+            ? 0xf1c40f
+            : tone === "success"
+              ? 0x2ecc71
+              : 0x2b2d31,
+        components: [
+          textDisplay(lines.join("\n")),
+          separator(),
+          actionRow([
+            {
+              type: COMPONENT_TYPE.STRING_SELECT,
+              custom_id: options.customId,
+              placeholder: PANEL_SELECT_PLACEHOLDER,
+              min_values: 1,
+              max_values: 1,
+              options: options.items.slice(0, 25).map((item) => ({
+                label: item.label,
+                description: item.description,
+                value: item.value,
+              })),
+            },
+          ]),
+        ],
+      },
+    ],
+    allowedMentions: { parse: [] },
+  };
+}
+
+function buildAdminPanelPayload(ticket) {
+  return buildTicketActionPanelPayload({
+    title: "Painel Admin",
+    ticket,
+    tone: "warning",
+    options: {
+      customId: CUSTOM_IDS.ticketAdminSelect,
+      items: [
+        {
+          label: "Assumir ticket",
+          description: "Define voce como staff responsavel e atualiza o embed.",
+          value: "claim",
+        },
+        {
+          label: "Adicionar membro",
+          description: "Libera um usuario extra neste ticket.",
+          value: "add_member",
+        },
+        {
+          label: "Remover membro",
+          description: "Remove a permissao de um usuario extra.",
+          value: "remove_member",
+        },
+        {
+          label: "Criar call",
+          description: "Cria uma sala de voz privada para os membros do ticket.",
+          value: "create_call",
+        },
+        {
+          label: "Criar pagamento",
+          description: "Gera PIX pelo Mercado Pago configurado em Vendas.",
+          value: "create_payment",
+        },
+        {
+          label: "Encerrar ticket",
+          description: "Fecha o atendimento com transcript e logs.",
+          value: "close",
+        },
+      ],
+    },
+  });
+}
+
+function buildStaffPanelPayload(ticket) {
+  return buildTicketActionPanelPayload({
+    title: "Painel Staff",
+    ticket,
+    tone: "warning",
+    options: {
+      customId: CUSTOM_IDS.ticketStaffSelect,
+      items: [
+        {
+          label: "Assumir atendimento",
+          description: "Atualiza responsavel, FlowAI e logs.",
+          value: "claim",
+        },
+        {
+          label: "Solicitar detalhes",
+          description: "Envia um checklist objetivo para o membro responder.",
+          value: "request_details",
+        },
+        {
+          label: "Registrar nota interna",
+          description: "Salva uma observacao operacional no historico.",
+          value: "internal_note",
+        },
+        {
+          label: "Escalar equipe",
+          description: "Notifica cargos configurados para priorizar o ticket.",
+          value: "escalate",
+        },
+        {
+          label: "Preparar encerramento",
+          description: "Confirma pendencias antes do fechamento.",
+          value: "prepare_close",
+        },
+        {
+          label: "Criar call",
+          description: "Cria uma call privada para alinhamento.",
+          value: "create_call",
+        },
+      ],
+    },
+  });
+}
+
+function buildMemberPanelPayload(ticket) {
+  return buildTicketActionPanelPayload({
+    title: "Painel do membro",
+    ticket,
+    options: {
+      customId: CUSTOM_IDS.ticketMemberSelect,
+      items: [
+        {
+          label: "Enviar atualizacao",
+          description: "Envia um resumo formatado para a equipe.",
+          value: "send_update",
+        },
+        {
+          label: "Chamar staff",
+          description: "Sinaliza que voce precisa de retorno da equipe.",
+          value: "request_staff",
+        },
+        {
+          label: "Checklist de evidencias",
+          description: "Mostra o que anexar para acelerar a analise.",
+          value: "evidence_checklist",
+        },
+        {
+          label: "Marcar como resolvido",
+          description: "Avisa que sua solicitacao pode ser encerrada.",
+          value: "mark_ready",
+        },
+      ],
+    },
+  });
+}
+
+async function loadTicketForInteraction(interaction) {
+  const ticket = await getOpenTicketByChannel(
+    interaction.guild.id,
+    interaction.channel.id,
+  );
+
+  if (!ticket) {
+    await replyWithTicketMessage(interaction, {
+      title: "Ticket nao encontrado",
+      message: "Este canal nao possui ticket aberto vinculado.",
+      tone: "error",
+    });
+    return null;
+  }
+
+  return ticket;
+}
+
+function canUseStaffPanel(member, runtime) {
+  return (
+    canClaimTicket(member, runtime.staffSettings) ||
+    canCloseTicket(member, runtime.staffSettings)
+  );
+}
+
+async function ensureTicketAccess(interaction, mode) {
+  const runtime = await ensureGuildRuntimeOrReply(interaction);
+  if (!runtime) return null;
+
+  const ticket = await loadTicketForInteraction(interaction);
+  if (!ticket) return null;
+
+  if (mode === "member") {
+    if (ticket.user_id !== interaction.user.id && !canUseStaffPanel(interaction.member, runtime)) {
+      await replyWithTicketMessage(interaction, {
+        title: "Acesso negado",
+        message: "Apenas o solicitante e a equipe podem usar este painel.",
+        tone: "error",
+      });
+      return null;
+    }
+    return { runtime, ticket };
+  }
+
+  if (mode === "staff" && !canUseStaffPanel(interaction.member, runtime)) {
+    await replyWithTicketMessage(interaction, {
+      title: "Acesso negado",
+      message: "Apenas a equipe configurada pode usar o painel staff deste ticket.",
+      tone: "error",
+    });
+    return null;
+  }
+
+  if (mode === "admin" && !canCloseTicket(interaction.member, runtime.staffSettings)) {
+    await replyWithTicketMessage(interaction, {
+      title: "Acesso negado",
+      message: "Apenas administradores e a equipe com permissao de fechamento podem usar o painel admin.",
+      tone: "error",
+    });
+    return null;
+  }
+
+  return { runtime, ticket };
+}
+
+async function editTicketIntroMessage(channel, ticket, metadata = {}) {
+  try {
+    const existingMessage = await fetchExistingTicketIntroMessage(
+      channel,
+      ticket.intro_message_id || null,
+    );
+    if (!existingMessage) return null;
+    const edited = await existingMessage.edit(buildTicketIntroPayload({ ticket }));
+    if (ticket.intro_message_id !== edited.id) {
+      await persistTicketIntroMessageId(ticket, edited.id, metadata);
+    }
+    return edited;
+  } catch (error) {
+    logTicketFlowFailure("edit-ticket-intro-message", error, metadata);
+    return null;
+  }
+}
+
 async function replyWithTicketContextPanel(interaction, options) {
   const ticket = await getOpenTicketByChannel(
     interaction.guild.id,
@@ -449,68 +765,30 @@ async function replyWithTicketContextPanel(interaction, options) {
 }
 
 async function showMemberTicketPanelFromInteraction(interaction) {
-  await replyWithTicketContextPanel(interaction, (ticket) => ({
-    title: "Painel do membro",
-    message: [
-      `Protocolo: \`${ticket.protocol}\``,
-      `Responsavel: ${resolveTicketOwnerSummary(ticket)}`,
-      "Use este canal para enviar detalhes, arquivos e tudo o que a equipe precisa para continuar o atendimento.",
-    ].join("\n"),
-    tone: "neutral",
-  }));
+  const context = await ensureTicketAccess(interaction, "member");
+  if (!context) return;
+  await replyWithTicketPayload(
+    interaction,
+    buildMemberPanelPayload(context.ticket),
+  );
 }
 
 async function showStaffTicketPanelFromInteraction(interaction) {
-  const runtime = await ensureGuildRuntimeOrReply(interaction);
-  if (!runtime) return;
-
-  if (
-    !canClaimTicket(interaction.member, runtime.staffSettings) &&
-    !canCloseTicket(interaction.member, runtime.staffSettings)
-  ) {
-    await replyWithTicketMessage(interaction, {
-      title: "Acesso negado",
-      message: "Apenas a equipe configurada pode usar o painel staff deste ticket.",
-      tone: "error",
-    });
-    return;
-  }
-
-  await replyWithTicketContextPanel(interaction, (ticket) => ({
-    title: "Painel staff",
-    message: [
-      `Protocolo: \`${ticket.protocol}\``,
-      `Solicitante: <@${ticket.user_id}>`,
-      `Responsavel atual: ${resolveTicketOwnerSummary(ticket)}`,
-      "Voce pode assumir o atendimento e acompanhar este canal com as permissoes da equipe.",
-    ].join("\n"),
-    tone: "warning",
-  }));
+  const context = await ensureTicketAccess(interaction, "staff");
+  if (!context) return;
+  await replyWithTicketPayload(
+    interaction,
+    buildStaffPanelPayload(context.ticket),
+  );
 }
 
 async function showAdminTicketPanelFromInteraction(interaction) {
-  const runtime = await ensureGuildRuntimeOrReply(interaction);
-  if (!runtime) return;
-
-  if (!canCloseTicket(interaction.member, runtime.staffSettings)) {
-    await replyWithTicketMessage(interaction, {
-      title: "Acesso negado",
-      message: "Apenas administradores e a equipe com permissao de fechamento podem usar o painel admin.",
-      tone: "error",
-    });
-    return;
-  }
-
-  await replyWithTicketContextPanel(interaction, (ticket) => ({
-    title: "Painel admin",
-    message: [
-      `Protocolo: \`${ticket.protocol}\``,
-      `Solicitante: <@${ticket.user_id}>`,
-      `Responsavel atual: ${resolveTicketOwnerSummary(ticket)}`,
-      "Voce pode revisar o atendimento, orientar a equipe e encerrar o ticket quando necessario.",
-    ].join("\n"),
-    tone: "warning",
-  }));
+  const context = await ensureTicketAccess(interaction, "admin");
+  if (!context) return;
+  await replyWithTicketPayload(
+    interaction,
+    buildAdminPanelPayload(context.ticket),
+  );
 }
 
 async function syncOpenTicketControlMessages(client) {
@@ -1140,6 +1418,755 @@ async function openTicketFromModalSubmit(interaction) {
   }
 }
 
+function createMemberIdModal(customId, title) {
+  const modal = new ModalBuilder()
+    .setCustomId(customId)
+    .setTitle(title);
+  const input = new TextInputBuilder()
+    .setCustomId(CUSTOM_IDS.ticketMemberIdInput)
+    .setLabel("ID do membro")
+    .setPlaceholder("Ex.: 123456789012345678")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setMinLength(10)
+    .setMaxLength(25);
+  modal.addComponents(new ActionRowBuilder().addComponents(input));
+  return modal;
+}
+
+function createTicketPaymentModal(ticket) {
+  const modal = new ModalBuilder()
+    .setCustomId(CUSTOM_IDS.ticketPaymentModal)
+    .setTitle("Criar pagamento PIX");
+  const amountInput = new TextInputBuilder()
+    .setCustomId(CUSTOM_IDS.ticketPaymentAmountInput)
+    .setLabel("Valor")
+    .setPlaceholder("Ex.: 1,00")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setMinLength(1)
+    .setMaxLength(16);
+  const noteInput = new TextInputBuilder()
+    .setCustomId(CUSTOM_IDS.ticketPaymentNoteInput)
+    .setLabel("Descricao curta")
+    .setPlaceholder(`Pagamento do ticket ${ticket.protocol}`)
+    .setStyle(TextInputStyle.Short)
+    .setRequired(false)
+    .setMaxLength(120);
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(amountInput),
+    new ActionRowBuilder().addComponents(noteInput),
+  );
+  return modal;
+}
+
+function createTextModal(customId, inputId, title, label, placeholder) {
+  const modal = new ModalBuilder().setCustomId(customId).setTitle(title);
+  const input = new TextInputBuilder()
+    .setCustomId(inputId)
+    .setLabel(label)
+    .setPlaceholder(placeholder)
+    .setStyle(TextInputStyle.Paragraph)
+    .setRequired(true)
+    .setMinLength(4)
+    .setMaxLength(900);
+  modal.addComponents(new ActionRowBuilder().addComponents(input));
+  return modal;
+}
+
+async function addMemberToTicket(interaction, memberId) {
+  const context = await ensureTicketAccess(interaction, "admin");
+  if (!context) return;
+  const member = await interaction.guild.members.fetch(memberId).catch(() => null);
+  if (!member) {
+    await replyWithTicketMessage(interaction, {
+      title: "Membro nao encontrado",
+      message: "Nao encontrei esse ID dentro do servidor.",
+      tone: "error",
+    });
+    return;
+  }
+
+  await interaction.channel.permissionOverwrites.edit(member.id, {
+    ViewChannel: true,
+    SendMessages: true,
+    ReadMessageHistory: true,
+    AttachFiles: true,
+    EmbedLinks: true,
+  });
+
+  await registerEvent({
+    ticketId: context.ticket.id,
+    protocol: context.ticket.protocol,
+    guildId: interaction.guild.id,
+    channelId: interaction.channel.id,
+    actorId: interaction.user.id,
+    eventType: "claimed",
+    metadata: {
+      action: "member_added",
+      member_id: member.id,
+    },
+  }).catch((error) => logTicketFlowFailure("register-member-added", error));
+
+  await interaction.channel.send(buildTicketSimpleMessagePayload({
+    title: "Membro adicionado",
+    message: `<@${member.id}> agora pode acompanhar este ticket.`,
+    tone: "success",
+  }));
+
+  await replyWithTicketMessage(interaction, {
+    title: "Permissao aplicada",
+    message: `Adicionei <@${member.id}> ao ticket.`,
+    tone: "success",
+  });
+}
+
+async function removeMemberFromTicket(interaction, memberId) {
+  const context = await ensureTicketAccess(interaction, "admin");
+  if (!context) return;
+  if (memberId === context.ticket.user_id) {
+    await replyWithTicketMessage(interaction, {
+      title: "Acao bloqueada",
+      message: "O solicitante principal nao pode ser removido do proprio ticket.",
+      tone: "warning",
+    });
+    return;
+  }
+
+  await interaction.channel.permissionOverwrites.delete(memberId).catch(async () => {
+    await interaction.channel.permissionOverwrites.edit(memberId, {
+      ViewChannel: false,
+      SendMessages: false,
+      ReadMessageHistory: false,
+    });
+  });
+
+  await registerEvent({
+    ticketId: context.ticket.id,
+    protocol: context.ticket.protocol,
+    guildId: interaction.guild.id,
+    channelId: interaction.channel.id,
+    actorId: interaction.user.id,
+    eventType: "claimed",
+    metadata: {
+      action: "member_removed",
+      member_id: memberId,
+    },
+  }).catch((error) => logTicketFlowFailure("register-member-removed", error));
+
+  await interaction.channel.send(buildTicketSimpleMessagePayload({
+    title: "Membro removido",
+    message: `<@${memberId}> nao tem mais permissao direta neste ticket.`,
+    tone: "warning",
+  }));
+
+  await replyWithTicketMessage(interaction, {
+    title: "Permissao removida",
+    message: `Removi <@${memberId}> do ticket.`,
+    tone: "success",
+  });
+}
+
+async function createPrivateTicketCall(interaction, mode = "staff") {
+  const context = await ensureTicketAccess(interaction, mode === "admin" ? "admin" : mode === "member" ? "member" : "staff");
+  if (!context) return;
+  const guild = interaction.guild;
+  const botMember = guild.members.me || (await guild.members.fetchMe());
+  const userIds = new Set([
+    context.ticket.user_id,
+    context.ticket.claimed_by,
+    interaction.user.id,
+  ].filter(Boolean));
+
+  for (const overwrite of interaction.channel.permissionOverwrites.cache.values()) {
+    const id = overwrite.id;
+    if (id === guild.roles.everyone.id || id === botMember.id) continue;
+    if (guild.members.cache.has(id)) {
+      userIds.add(id);
+    }
+  }
+
+  const permissionOverwrites = [
+    {
+      id: guild.roles.everyone.id,
+      deny: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect],
+    },
+    {
+      id: botMember.id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.Connect,
+        PermissionFlagsBits.Speak,
+        PermissionFlagsBits.ManageChannels,
+      ],
+    },
+    ...[...userIds].map((id) => ({
+      id,
+      allow: [
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.Connect,
+        PermissionFlagsBits.Speak,
+        PermissionFlagsBits.Stream,
+      ],
+    })),
+  ];
+
+  const suffix = String(context.ticket.protocol || context.ticket.id)
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .slice(-32);
+  const call = await guild.channels.create({
+    name: `call-${suffix}`,
+    type: ChannelType.GuildVoice,
+    parent: interaction.channel.parentId || undefined,
+    permissionOverwrites,
+    reason: `Call privada do ticket ${context.ticket.protocol}`,
+  });
+
+  await registerEvent({
+    ticketId: context.ticket.id,
+    protocol: context.ticket.protocol,
+    guildId: guild.id,
+    channelId: interaction.channel.id,
+    actorId: interaction.user.id,
+    eventType: "claimed",
+    metadata: {
+      action: "private_call_created",
+      voice_channel_id: call.id,
+    },
+  }).catch((error) => logTicketFlowFailure("register-call-created", error));
+
+  await interaction.channel.send(buildTicketSimpleMessagePayload({
+    title: "Call criada",
+    message: `Criei a call privada <#${call.id}> para os membros deste ticket.`,
+    tone: "success",
+  }));
+
+  await replyWithTicketMessage(interaction, {
+    title: "Call pronta",
+    message: `Sala criada: <#${call.id}>.`,
+    tone: "success",
+  });
+}
+
+async function callTicketPaymentInternalApi(action, body) {
+  if (!env.salesInternalApiToken) {
+    throw new Error("SALES_INTERNAL_API_TOKEN/CRON_SECRET nao configurado para o bot.");
+  }
+
+  const response = await fetch(env.salesInternalApiUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${env.salesInternalApiToken}`,
+    },
+    body: JSON.stringify({ action, ...body }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.message || "Falha ao comunicar com checkout interno.");
+  }
+  return payload;
+}
+
+function buildTicketPixPaymentPayload(ticket, payment, note) {
+  const files = [];
+  const body = [
+    "## Pagamento PIX",
+    note ? `**Descricao:** ${note}` : `**Ticket:** \`${ticket.protocol}\``,
+    `**Valor:** ${formatMoney(payment.amount)}`,
+    `**Status:** ${payment.status || "pending"}`,
+    "",
+    "Pague pelo QR Code ou copia e cola. Assim que o Mercado Pago aprovar, esta mensagem sera atualizada automaticamente.",
+  ];
+  if (payment.qrBase64) {
+    const raw = String(payment.qrBase64).replace(/^data:image\/png;base64,/i, "");
+    files.push(new AttachmentBuilder(Buffer.from(raw, "base64"), { name: "ticket-pix.png" }));
+  }
+  if (payment.qrCode) {
+    body.push("", "**PIX copia e cola**", `\`\`\`${String(payment.qrCode).slice(0, 990)}\`\`\``);
+  }
+
+  const components = [
+    {
+      type: COMPONENT_TYPE.CONTAINER,
+      accent_color: 0x8fdbff,
+      components: [
+        textDisplay(body.join("\n")),
+        ...(payment.qrBase64
+          ? [{
+              type: COMPONENT_TYPE.MEDIA_GALLERY,
+              items: [{ media: { url: "attachment://ticket-pix.png" } }],
+            }]
+          : []),
+      ],
+    },
+  ];
+  if (payment.ticketUrl) {
+    components.push(actionRow([
+      {
+        type: COMPONENT_TYPE.BUTTON,
+        style: BUTTON_STYLE.LINK,
+        label: "Abrir Mercado Pago",
+        url: payment.ticketUrl,
+      },
+    ]));
+  }
+
+  return {
+    flags: MessageFlags.IsComponentsV2,
+    components,
+    files,
+    allowedMentions: { users: [ticket.user_id] },
+  };
+}
+
+function buildTicketPaymentFinalPayload(ticket, payment, status) {
+  const approved = status === "approved";
+  return {
+    flags: MessageFlags.IsComponentsV2,
+    components: [
+      {
+        type: COMPONENT_TYPE.CONTAINER,
+        accent_color: approved ? 0x2ecc71 : 0xffb86b,
+        components: [
+          textDisplay([
+            approved ? "## Pagamento aprovado" : "## Pagamento indisponivel",
+            `**Ticket:** \`${ticket.protocol}\``,
+            `**Valor:** ${formatMoney(payment.amount)}`,
+            `**Status:** ${status}`,
+            approved
+              ? "O Mercado Pago confirmou o pagamento deste ticket."
+              : "Esse PIX nao esta mais disponivel para pagamento.",
+          ].join("\n")),
+        ],
+      },
+    ],
+    files: [],
+    attachments: [],
+    allowedMentions: { parse: [] },
+  };
+}
+
+async function sendTicketPaymentLog(guild, channelId, payload) {
+  if (!channelId) return;
+  const channel =
+    guild.channels.cache.get(channelId) ||
+    (await guild.channels.fetch(channelId).catch(() => null));
+  if (!channel?.isTextBased()) return;
+  await channel.send(payload).catch(() => null);
+}
+
+async function sendTicketPaymentLogForStatus(interaction, ticket, payment, logs, status) {
+  const isApproved = status === "approved";
+  const isPending = status === "pending";
+  const channelId = isApproved
+    ? logs?.approvedLogChannelId
+    : isPending
+      ? logs?.pendingLogChannelId
+      : logs?.rejectedLogChannelId;
+  await sendTicketPaymentLog(
+    interaction.guild,
+    channelId,
+    buildLogPayload({
+      accentColor: isApproved ? 0x2ecc71 : isPending ? 0x8fdbff : 0xffb86b,
+      title: isApproved
+        ? "Pagamento de ticket aprovado"
+        : isPending
+          ? "Pagamento de ticket pendente"
+          : "Pagamento de ticket recusado",
+      lines: [
+        `**Protocolo:** \`${ticket.protocol}\``,
+        `**Canal:** <#${ticket.channel_id}>`,
+        `**Cliente:** <@${ticket.user_id}>`,
+        `**Valor:** ${formatMoney(payment.amount)}`,
+        `**Status:** ${status}`,
+        payment.providerPaymentId ? `**Mercado Pago:** \`${payment.providerPaymentId}\`` : "",
+      ].filter(Boolean),
+    }),
+  );
+}
+
+function isFinalTicketPaymentStatus(status) {
+  return ["approved", "rejected", "cancelled", "expired", "refunded", "charged_back"].includes(
+    String(status || "").toLowerCase(),
+  );
+}
+
+function startTicketPaymentAutoSync(interaction, ticket, paymentMessage, payment, logs) {
+  const startedAt = Date.now();
+  const tick = async () => {
+    if (Date.now() - startedAt > TICKET_PAYMENT_SYNC_MAX_MS) return;
+    let payload;
+    try {
+      payload = await callTicketPaymentInternalApi("sync_ticket_payment", {
+        guildId: interaction.guild.id,
+        paymentId: payment.providerPaymentId,
+      });
+    } catch (error) {
+      logTicketFlowFailure("ticket-payment-sync", error, {
+        guildId: interaction.guild.id,
+        ticketId: ticket.id,
+        protocol: ticket.protocol,
+      });
+      setTimeout(tick, TICKET_PAYMENT_SYNC_INTERVAL_MS);
+      return;
+    }
+
+    const nextPayment = payload.payment || payment;
+    const status = nextPayment.status || "pending";
+    if (isFinalTicketPaymentStatus(status)) {
+      await paymentMessage.edit(buildTicketPaymentFinalPayload(ticket, nextPayment, status)).catch(() => null);
+      await sendTicketPaymentLogForStatus(interaction, ticket, nextPayment, payload.logs || logs, status);
+      if (status === "approved") {
+        await interaction.channel.send(buildTicketSimpleMessagePayload({
+          title: "Pagamento aprovado",
+          message: `Pagamento de ${formatMoney(nextPayment.amount)} confirmado para este ticket.`,
+          tone: "success",
+        })).catch(() => null);
+      }
+      return;
+    }
+
+    setTimeout(tick, TICKET_PAYMENT_SYNC_INTERVAL_MS);
+  };
+
+  setTimeout(tick, TICKET_PAYMENT_SYNC_INTERVAL_MS);
+}
+
+async function createTicketPaymentFromModal(interaction) {
+  const context = await ensureTicketAccess(interaction, "admin");
+  if (!context) return;
+  const rawAmount = interaction.fields.getTextInputValue(CUSTOM_IDS.ticketPaymentAmountInput);
+  const note = String(
+    interaction.fields.getTextInputValue(CUSTOM_IDS.ticketPaymentNoteInput) || "",
+  ).trim().slice(0, 120);
+  const amount = parseMoneyInput(rawAmount);
+  if (!amount) {
+    await replyWithTicketMessage(interaction, {
+      title: "Valor invalido",
+      message: "Informe um valor de R$ 1,00 ou maior.",
+      tone: "error",
+    });
+    return;
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  let payload;
+  try {
+    payload = await callTicketPaymentInternalApi("create_ticket_pix_payment", {
+      guildId: interaction.guild.id,
+      ticketId: String(context.ticket.id),
+      protocol: context.ticket.protocol,
+      discordUserId: context.ticket.user_id,
+      requestedBy: interaction.user.id,
+      payerName: interaction.user.displayName || interaction.user.username,
+      amount,
+    });
+  } catch (error) {
+    await interaction.editReply(
+      error instanceof Error ? error.message : "Nao foi possivel gerar o pagamento.",
+    );
+    return;
+  }
+
+  const payment = payload.payment;
+  const paymentMessage = await interaction.channel.send(
+    buildTicketPixPaymentPayload(context.ticket, payment, note),
+  );
+  await sendTicketPaymentLogForStatus(
+    interaction,
+    context.ticket,
+    payment,
+    payload.logs,
+    "pending",
+  );
+  startTicketPaymentAutoSync(
+    interaction,
+    context.ticket,
+    paymentMessage,
+    payment,
+    payload.logs,
+  );
+  await interaction.editReply(`Pagamento PIX criado: ${formatMoney(payment.amount)}.`);
+}
+
+async function handleStaffAction(interaction, action) {
+  const context = await ensureTicketAccess(interaction, "staff");
+  if (!context) return;
+  const { ticket, runtime } = context;
+
+  if (action === "claim") {
+    await claimTicketFromInteraction(interaction);
+    return;
+  }
+
+  if (action === "create_call") {
+    await createPrivateTicketCall(interaction, "staff");
+    return;
+  }
+
+  if (action === "internal_note") {
+    await interaction.showModal(createTextModal(
+      CUSTOM_IDS.ticketStaffNoteModal,
+      CUSTOM_IDS.ticketStaffNoteInput,
+      "Registrar nota interna",
+      "Nota operacional",
+      "Ex.: Cliente aguardando comprovante; retorno combinado para hoje.",
+    ));
+    return;
+  }
+
+  if (action === "request_details") {
+    await interaction.channel.send(buildTicketSimpleMessagePayload({
+      title: "Precisamos de alguns detalhes",
+      message: [
+        `<@${ticket.user_id}>, envie por favor:`,
+        "1. O que aconteceu ou o que voce quer solicitar.",
+        "2. Prints, comprovantes, IDs ou links relacionados.",
+        "3. O resultado esperado para considerarmos o caso resolvido.",
+      ].join("\n"),
+      tone: "warning",
+    }));
+    await replyWithTicketMessage(interaction, {
+      title: "Checklist enviado",
+      message: "Solicitei os detalhes essenciais ao membro.",
+      tone: "success",
+    });
+    return;
+  }
+
+  if (action === "escalate") {
+    const roleIds = resolveStaffVisibilityRoleIds(runtime.staffSettings);
+    const mentions = roleIds.map((roleId) => `<@&${roleId}>`).join(" ");
+    await interaction.channel.send({
+      ...buildTicketSimpleMessagePayload({
+        title: "Ticket escalado",
+        message: [
+          mentions || "Equipe configurada",
+          `O ticket \`${ticket.protocol}\` precisa de prioridade/revisao.`,
+        ].join("\n"),
+        tone: "warning",
+      }),
+      allowedMentions: { roles: roleIds },
+    });
+    await replyWithTicketMessage(interaction, {
+      title: "Equipe notificada",
+      message: "Enviei a escalacao no canal do ticket.",
+      tone: "success",
+    });
+    return;
+  }
+
+  if (action === "prepare_close") {
+    await interaction.channel.send(buildTicketSimpleMessagePayload({
+      title: "Preparando encerramento",
+      message: [
+        `<@${ticket.user_id}>, a equipe marcou este atendimento como pronto para encerramento.`,
+        "Se ainda houver pendencia, responda neste canal antes do fechamento.",
+      ].join("\n"),
+      tone: "warning",
+    }));
+    await replyWithTicketMessage(interaction, {
+      title: "Aviso enviado",
+      message: "O membro foi avisado antes do encerramento.",
+      tone: "success",
+    });
+  }
+}
+
+async function handleMemberAction(interaction, action) {
+  const context = await ensureTicketAccess(interaction, "member");
+  if (!context) return;
+  const { ticket, runtime } = context;
+
+  if (action === "send_update") {
+    await interaction.showModal(createTextModal(
+      CUSTOM_IDS.ticketMemberUpdateModal,
+      CUSTOM_IDS.ticketMemberUpdateInput,
+      "Enviar atualizacao",
+      "Resumo para a equipe",
+      "Explique o que mudou, anexe IDs/links e diga o que ainda precisa.",
+    ));
+    return;
+  }
+
+  if (action === "request_staff") {
+    const roleIds = resolveStaffVisibilityRoleIds(runtime.staffSettings);
+    await interaction.channel.send({
+      ...buildTicketSimpleMessagePayload({
+        title: "Membro solicitou retorno",
+        message: [
+          roleIds.map((roleId) => `<@&${roleId}>`).join(" ") || "Equipe configurada",
+          `<@${ticket.user_id}> pediu retorno da equipe neste ticket.`,
+        ].join("\n"),
+        tone: "warning",
+      }),
+      allowedMentions: { roles: roleIds, users: [ticket.user_id] },
+    });
+    await replyWithTicketMessage(interaction, {
+      title: "Equipe chamada",
+      message: "Avisei a equipe configurada neste canal.",
+      tone: "success",
+    });
+    return;
+  }
+
+  if (action === "evidence_checklist") {
+    await replyWithTicketMessage(interaction, {
+      title: "Checklist de evidencias",
+      message: [
+        "Envie prints completos, comprovantes, IDs de pedido/transacao, horario aproximado e qualquer link relevante.",
+        "Evite senhas, tokens, chaves privadas ou dados sensiveis desnecessarios.",
+      ].join("\n"),
+      tone: "neutral",
+    });
+    return;
+  }
+
+  if (action === "mark_ready") {
+    await interaction.channel.send(buildTicketSimpleMessagePayload({
+      title: "Membro marcou como resolvido",
+      message: `<@${ticket.user_id}> informou que o atendimento pode ser encerrado.`,
+      tone: "success",
+    }));
+    await replyWithTicketMessage(interaction, {
+      title: "Aviso enviado",
+      message: "A equipe foi avisada que o ticket pode ser encerrado.",
+      tone: "success",
+    });
+  }
+}
+
+async function handleAdminAction(interaction, action) {
+  const context = await ensureTicketAccess(interaction, "admin");
+  if (!context) return;
+
+  if (action === "claim") {
+    await claimTicketFromInteraction(interaction);
+    return;
+  }
+  if (action === "add_member") {
+    await interaction.showModal(createMemberIdModal(CUSTOM_IDS.ticketAddMemberModal, "Adicionar membro"));
+    return;
+  }
+  if (action === "remove_member") {
+    await interaction.showModal(createMemberIdModal(CUSTOM_IDS.ticketRemoveMemberModal, "Remover membro"));
+    return;
+  }
+  if (action === "create_call") {
+    await createPrivateTicketCall(interaction, "admin");
+    return;
+  }
+  if (action === "create_payment") {
+    await interaction.showModal(createTicketPaymentModal(context.ticket));
+    return;
+  }
+  if (action === "close") {
+    await closeTicketFromInteraction(interaction);
+  }
+}
+
+async function handleTicketSelectInteraction(interaction) {
+  const action = interaction.values?.[0];
+  if (!action) return;
+
+  if (interaction.customId === CUSTOM_IDS.ticketAdminSelect) {
+    await handleAdminAction(interaction, action);
+    return;
+  }
+  if (interaction.customId === CUSTOM_IDS.ticketStaffSelect) {
+    await handleStaffAction(interaction, action);
+    return;
+  }
+  if (interaction.customId === CUSTOM_IDS.ticketMemberSelect) {
+    await handleMemberAction(interaction, action);
+  }
+}
+
+async function handleTicketModalSubmit(interaction) {
+  if (interaction.customId === CUSTOM_IDS.ticketAddMemberModal) {
+    const memberId = normalizeSnowflake(
+      interaction.fields.getTextInputValue(CUSTOM_IDS.ticketMemberIdInput),
+    );
+    if (!memberId) {
+      await replyWithTicketMessage(interaction, {
+        title: "ID invalido",
+        message: "Informe um ID Discord valido.",
+        tone: "error",
+      });
+      return;
+    }
+    await addMemberToTicket(interaction, memberId);
+    return;
+  }
+
+  if (interaction.customId === CUSTOM_IDS.ticketRemoveMemberModal) {
+    const memberId = normalizeSnowflake(
+      interaction.fields.getTextInputValue(CUSTOM_IDS.ticketMemberIdInput),
+    );
+    if (!memberId) {
+      await replyWithTicketMessage(interaction, {
+        title: "ID invalido",
+        message: "Informe um ID Discord valido.",
+        tone: "error",
+      });
+      return;
+    }
+    await removeMemberFromTicket(interaction, memberId);
+    return;
+  }
+
+  if (interaction.customId === CUSTOM_IDS.ticketPaymentModal) {
+    await createTicketPaymentFromModal(interaction);
+    return;
+  }
+
+  if (interaction.customId === CUSTOM_IDS.ticketMemberUpdateModal) {
+    const context = await ensureTicketAccess(interaction, "member");
+    if (!context) return;
+    const update = String(
+      interaction.fields.getTextInputValue(CUSTOM_IDS.ticketMemberUpdateInput) || "",
+    ).trim().replace(/```/g, "'''").slice(0, 900);
+    await interaction.channel.send(buildTicketSimpleMessagePayload({
+      title: "Atualizacao do membro",
+      message: [`<@${interaction.user.id}> enviou uma atualizacao:`, `> \`\`\`${update}\`\`\``].join("\n"),
+      tone: "neutral",
+    }));
+    await replyWithTicketMessage(interaction, {
+      title: "Atualizacao enviada",
+      message: "Sua atualizacao foi publicada para a equipe.",
+      tone: "success",
+    });
+    return;
+  }
+
+  if (interaction.customId === CUSTOM_IDS.ticketStaffNoteModal) {
+    const context = await ensureTicketAccess(interaction, "staff");
+    if (!context) return;
+    const note = String(
+      interaction.fields.getTextInputValue(CUSTOM_IDS.ticketStaffNoteInput) || "",
+    ).trim().replace(/```/g, "'''").slice(0, 900);
+    await registerEvent({
+      ticketId: context.ticket.id,
+      protocol: context.ticket.protocol,
+      guildId: interaction.guild.id,
+      channelId: interaction.channel.id,
+      actorId: interaction.user.id,
+      eventType: "claimed",
+      metadata: {
+        action: "staff_note",
+        note,
+      },
+    }).catch((error) => logTicketFlowFailure("register-staff-note", error));
+    await replyWithTicketMessage(interaction, {
+      title: "Nota registrada",
+      message: "A observacao foi registrada no historico operacional do ticket.",
+      tone: "success",
+    });
+  }
+}
+
 async function handleAiSuggestionHelped(interaction) {
   await ensureAiSuggestionInteractionAcknowledged(interaction);
   const cached = await loadPendingTicketReason(interaction.guild.id, interaction.user.id);
@@ -1319,6 +2346,12 @@ async function claimTicketFromInteraction(interaction) {
   }
 
   const updated = await claimTicket(ticket.id, interaction.user.id);
+  await editTicketIntroMessage(channel, updated, {
+    guildId: guild.id,
+    channelId: channel.id,
+    protocol: updated.protocol,
+    actorId: interaction.user.id,
+  });
 
   await registerEvent({
     ticketId: updated.id,
@@ -1637,6 +2670,8 @@ module.exports = {
   showAdminTicketPanelFromInteraction,
   showStaffTicketPanelFromInteraction,
   showMemberTicketPanelFromInteraction,
+  handleTicketSelectInteraction,
+  handleTicketModalSubmit,
   syncOpenTicketControlMessages,
   syncAllTicketPanels,
   closeOpenTicketChannel,

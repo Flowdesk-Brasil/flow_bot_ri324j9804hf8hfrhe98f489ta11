@@ -12,6 +12,8 @@ const {
   showAdminTicketPanelFromInteraction,
   showMemberTicketPanelFromInteraction,
   showStaffTicketPanelFromInteraction,
+  handleTicketModalSubmit,
+  handleTicketSelectInteraction,
   handleAiSuggestionHelped,
   handleAiSuggestionContinue,
 } = require("../services/ticketService");
@@ -40,6 +42,30 @@ function isTicketButtonInteraction(interaction) {
       CUSTOM_IDS.ticketAdminPanel,
       CUSTOM_IDS.ticketStaffPanel,
       CUSTOM_IDS.ticketMemberPanel,
+    ].includes(interaction.customId)
+  );
+}
+
+function isTicketSelectInteraction(interaction) {
+  return (
+    interaction.isStringSelectMenu?.() &&
+    [
+      CUSTOM_IDS.ticketAdminSelect,
+      CUSTOM_IDS.ticketStaffSelect,
+      CUSTOM_IDS.ticketMemberSelect,
+    ].includes(interaction.customId)
+  );
+}
+
+function isTicketModalSubmit(interaction) {
+  return (
+    interaction.isModalSubmit?.() &&
+    [
+      CUSTOM_IDS.ticketAddMemberModal,
+      CUSTOM_IDS.ticketRemoveMemberModal,
+      CUSTOM_IDS.ticketPaymentModal,
+      CUSTOM_IDS.ticketMemberUpdateModal,
+      CUSTOM_IDS.ticketStaffNoteModal,
     ].includes(interaction.customId)
   );
 }
@@ -92,6 +118,10 @@ module.exports = {
       }
 
       if (interaction.isModalSubmit()) {
+        if (isTicketModalSubmit(interaction)) {
+          await handleTicketModalSubmit(interaction);
+          return;
+        }
         if (isSalesComponentInteraction(interaction)) {
           await handleSalesInteraction(interaction, client);
           return;
@@ -109,6 +139,11 @@ module.exports = {
 
       if (isTicketRefundInteraction(interaction)) {
         await handleTicketRefundInteraction(interaction, client, getGuildTicketRuntime);
+        return;
+      }
+
+      if (isTicketSelectInteraction(interaction)) {
+        await handleTicketSelectInteraction(interaction);
         return;
       }
 

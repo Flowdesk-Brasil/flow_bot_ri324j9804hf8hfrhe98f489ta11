@@ -35,6 +35,15 @@ const BUTTON_STYLE = {
 
 const MESSAGE_FLAG_IS_COMPONENTS_V2 = 32768;
 const WELCOME_TOKEN_REGEX = /\{(user\.id|user\.tag|user\.avatar|user|inviter|server\.id|server|memberCount)\}/g;
+const USER_THUMBNAIL_ACCESSORY_TYPES = new Set([
+  "user_thumbnail",
+  "user-thumbnail",
+  "user_avatar",
+  "user-avatar",
+  "userthumbnail",
+  "useravatar",
+  "avatar",
+]);
 
 function trimText(value, fallback = "") {
   return typeof value === "string" ? value.trim() : fallback;
@@ -57,6 +66,10 @@ function getCandidateString(candidate, key, fallback, maxLength) {
   }
 
   return clampText(fallback, maxLength);
+}
+
+function normalizeAccessoryType(value) {
+  return trimText(value).toLowerCase();
 }
 
 function sanitizeButtonStyle(value) {
@@ -137,16 +150,24 @@ function normalizeSelectOptions(value) {
 
 function normalizeContentAccessory(value) {
   if (!value || typeof value !== "object") return null;
+  const accessoryType = normalizeAccessoryType(value.type);
 
-  if (value.type === "thumbnail") {
+  if (accessoryType === "thumbnail") {
     return {
       type: "thumbnail",
       imageUrl: getCandidateString(value, "imageUrl", "", 1000),
-      alt: "",
+      alt: getCandidateString(value, "alt", "", 120),
     };
   }
 
-  if (value.type === "link_button") {
+  if (USER_THUMBNAIL_ACCESSORY_TYPES.has(accessoryType)) {
+    return {
+      type: "user_thumbnail",
+      alt: getCandidateString(value, "alt", "Foto do usuario", 120),
+    };
+  }
+
+  if (accessoryType === "link_button") {
     return {
       type: "link_button",
       label: getCandidateString(value, "label", "Abrir link", 80),
@@ -154,7 +175,7 @@ function normalizeContentAccessory(value) {
     };
   }
 
-  if (value.type === "button") {
+  if (accessoryType === "button") {
     return {
       type: "button",
       label: getCandidateString(value, "label", "Acao", 80),
@@ -306,11 +327,15 @@ function resolveUserTag(user) {
 
 function resolveMemberAvatarUrl(member) {
   if (!member) return "";
+  const avatarOptions = { size: 256, extension: "png", forceStatic: false };
   if (typeof member.displayAvatarURL === "function") {
-    return member.displayAvatarURL({ size: 256, extension: "png" });
+    return member.displayAvatarURL(avatarOptions);
   }
   if (member.user && typeof member.user.displayAvatarURL === "function") {
-    return member.user.displayAvatarURL({ size: 256, extension: "png" });
+    return member.user.displayAvatarURL(avatarOptions);
+  }
+  if (member.user && typeof member.user.avatarURL === "function") {
+    return member.user.avatarURL(avatarOptions) || "";
   }
   return "";
 }
@@ -351,6 +376,10 @@ function replaceWelcomeTokens(value, tokenMap) {
   });
 }
 
+function resolveWelcomeUserAvatarUrl(tokenMap, thumbnailOverrideUrl) {
+  return trimText(thumbnailOverrideUrl) || trimText(tokenMap?.["user.avatar"]);
+}
+
 function replaceWelcomeAccessory(accessory, tokenMap, thumbnailOverrideUrl) {
   if (!accessory || typeof accessory !== "object") return accessory;
 
@@ -358,6 +387,14 @@ function replaceWelcomeAccessory(accessory, tokenMap, thumbnailOverrideUrl) {
     return {
       ...accessory,
       imageUrl: thumbnailOverrideUrl || replaceWelcomeTokens(accessory.imageUrl, tokenMap),
+    };
+  }
+
+  if (accessory.type === "user_thumbnail") {
+    return {
+      type: "thumbnail",
+      imageUrl: resolveWelcomeUserAvatarUrl(tokenMap, thumbnailOverrideUrl),
+      alt: replaceWelcomeTokens(accessory.alt || "Foto do usuario", tokenMap),
     };
   }
 
@@ -1017,6 +1054,7 @@ function buildTicketIntroPayload({ ticket } = {}) {
   const ticketNumber = ticket?.id ? formatTicketNumber(ticket.id) : "#0000";
   const protocol = String(ticket?.protocol || "").trim();
   const userId = String(ticket?.user_id || "").trim();
+  const claimedBy = String(ticket?.claimed_by || "").trim();
   const openedReason = sanitizeTicketReasonBlock(ticket?.opened_reason);
   const openedAt = ticket?.opened_at
     ? new Date(ticket.opened_at).toLocaleString("pt-BR", {
@@ -1030,6 +1068,7 @@ function buildTicketIntroPayload({ ticket } = {}) {
     "",
     protocol ? `-# Protocolo: \`${protocol}\`` : "",
     userId ? `-# Solicitante: <@${userId}>` : "",
+    claimedBy ? `-# Staff: <@${claimedBy}>` : `-# Staff: \`nao assumido\``,
     userId ? `-# ID do usuario: \`${userId}\`` : "",
     openedAt ? `-# Aberto em: \`${openedAt}\`` : "",
     openedReason ? `> \`\`\`${openedReason}\`\`\`` : "",
