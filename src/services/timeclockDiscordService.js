@@ -1,6 +1,10 @@
 const { MessageFlags } = require("discord.js");
 const { env } = require("../config/env");
 
+const COMPONENTS_V2_FLAG = 32768;
+const ACTION_ROW_COMPONENT_TYPE = 1;
+const TEXT_DISPLAY_COMPONENT_TYPE = 10;
+
 function buildDiagnosticMessage(response, payload, bodyText) {
   if (response.status === 401 || response.status === 403) {
     return "Bate Ponto sem autorizacao interna. Configure o TIMECLOCK_INTERNAL_API_TOKEN igual no site e no bot.";
@@ -36,10 +40,83 @@ function normalizeDiscordPayload(payload) {
     next.allowedMentions = next.allowed_mentions;
     delete next.allowed_mentions;
   }
+
+  if (Array.isArray(next.components)) {
+    const extractedText = extractTextDisplayContent(next.components);
+    const actionRows = next.components
+      .filter((component) => component?.type === ACTION_ROW_COMPONENT_TYPE)
+      .slice(0, 5);
+    const hadComponentsV2 = actionRows.length !== next.components.length;
+
+    if (hadComponentsV2) {
+      if (!next.content && extractedText) {
+        next.content = extractedText.slice(0, 1900);
+      }
+      if (typeof next.flags === "number") {
+        next.flags &= ~COMPONENTS_V2_FLAG;
+      }
+    }
+
+    if (actionRows.length) {
+      next.components = actionRows;
+    } else {
+      delete next.components;
+    }
+  }
+
   if (!next.flags) {
     next.flags = MessageFlags.Ephemeral;
   }
   return next;
+}
+
+function extractTextDisplayContent(components) {
+  const parts = [];
+  const visit = (items) => {
+    for (const component of items || []) {
+      if (!component || typeof component !== "object") continue;
+      if (component.type === TEXT_DISPLAY_COMPONENT_TYPE && typeof component.content === "string") {
+        parts.push(component.content);
+      }
+      if (Array.isArray(component.components)) {
+        visit(component.components);
+      }
+    }
+  };
+  visit(components);
+  return parts.join("\n\n").trim();
+}
+
+function buildContentOnlyFallback(payload, error) {
+  const embedDescription = Array.isArray(payload?.embeds)
+    ? payload.embeds.find((embed) => typeof embed?.description === "string")?.description
+    : null;
+  const content =
+    (typeof payload?.content === "string" && payload.content.trim()) ||
+    embedDescription ||
+    "Nao foi possivel renderizar o painel do Bate Ponto. Tente novamente em alguns segundos.";
+
+  return {
+    content: String(content).slice(0, 1900),
+    flags: MessageFlags.Ephemeral,
+    allowedMentions: { parse: [] },
+  };
+}
+
+async function sendInteractionPayload(interaction, sender, payload, context) {
+  try {
+    await sender(payload);
+  } catch (error) {
+    console.error("[timeclock] Discord rejeitou payload; tentando fallback texto:", {
+      context,
+      guildId: interaction.guild?.id,
+      userId: interaction.user?.id,
+      code: error?.code,
+      status: error?.status,
+      message: error?.message,
+    });
+    await sender(buildContentOnlyFallback(payload, error));
+  }
 }
 
 function getMemberRoleIds(interaction) {
@@ -127,7 +204,12 @@ async function replyToInteraction(interaction, payload, mode = "reply") {
 
   if (mode === "update" && interaction.isButton?.()) {
     if (!interaction.deferred && !interaction.replied) {
-      await interaction.update(normalized);
+      await sendInteractionPayload(
+        interaction,
+        (payloadToSend) => interaction.update(payloadToSend),
+        normalized,
+        "button_update",
+      );
       return;
     }
     await interaction.editReply(normalized).catch(async () => {
@@ -143,7 +225,12 @@ async function replyToInteraction(interaction, payload, mode = "reply") {
     return;
   }
 
-  await interaction.reply(normalized);
+  await sendInteractionPayload(
+    interaction,
+    (payloadToSend) => interaction.reply(payloadToSend),
+    normalized,
+    "reply",
+  );
 }
 
 async function showTimeclockStatus(interaction) {

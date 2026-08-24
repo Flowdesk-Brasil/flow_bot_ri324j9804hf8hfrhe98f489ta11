@@ -178,7 +178,7 @@ function remoteBranchExists(targetDir, branch) {
   if (!branch) return false;
   const result = execute(
     "git",
-    ["rev-parse", "--verify", `origin/${branch}`],
+    ["ls-remote", "--exit-code", "--heads", "origin", branch],
     targetDir,
     {
       printCommand: false,
@@ -329,7 +329,7 @@ async function syncRepo(targetDir, repoName, rl, options = {}) {
 
   console.log(`\nVerificando atualizacoes no GitHub para [${repoName}]...`);
   try {
-    run("git", ["fetch", "origin"], targetDir);
+    run("git", ["fetch", "--prune", "origin"], targetDir);
   } catch {
     console.warn(`\nAviso: nao foi possivel conectar ao GitHub para [${repoName}]. Tentando continuar...`);
   }
