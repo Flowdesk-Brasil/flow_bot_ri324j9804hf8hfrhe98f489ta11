@@ -176,6 +176,9 @@ create index if not exists idx_timeclock_sessions_guild_user_workday
 create index if not exists idx_timeclock_sessions_guild_ended
   on timeclock_sessions(guild_id, ended_at desc);
 
+create index if not exists idx_timeclock_sessions_guild_workday_status_started
+  on timeclock_sessions(guild_id, workday desc, status, started_at desc);
+
 create table if not exists timeclock_intervals (
   id uuid primary key default gen_random_uuid(),
   session_id uuid not null references timeclock_sessions(id) on delete cascade,
@@ -227,6 +230,9 @@ create index if not exists idx_timeclock_events_guild_type_timestamp
 create index if not exists idx_timeclock_events_session_timestamp
   on timeclock_events(session_id, timestamp);
 
+create index if not exists idx_timeclock_events_guild_timestamp
+  on timeclock_events(guild_id, timestamp desc);
+
 create table if not exists timeclock_adjustments (
   id uuid primary key default gen_random_uuid(),
   guild_id text not null,
@@ -258,6 +264,9 @@ create table if not exists timeclock_hour_bank (
 
 create index if not exists idx_timeclock_hour_bank_guild_user_workday
   on timeclock_hour_bank(guild_id, user_id, workday desc);
+
+create index if not exists idx_timeclock_hour_bank_guild_workday
+  on timeclock_hour_bank(guild_id, workday desc);
 
 create table if not exists timeclock_approvals (
   id uuid primary key default gen_random_uuid(),
@@ -322,19 +331,19 @@ language sql
 stable
 as $$
   with sessions as (
-    select *
-    from timeclock_sessions
-    where guild_id = p_guild_id
-      and workday >= p_from
-      and workday <= p_to
-      and status in ('FINISHED', 'ADJUSTED', 'INCOMPLETE')
+    select ts.*
+    from timeclock_sessions ts
+    where ts.guild_id = p_guild_id
+      and ts.workday >= p_from
+      and ts.workday <= p_to
+      and ts.status in ('FINISHED', 'ADJUSTED', 'INCOMPLETE')
   ),
   bank as (
-    select user_id, coalesce(sum(delta_seconds), 0)::bigint as bank_seconds
-    from timeclock_hour_bank
-    where guild_id = p_guild_id
-      and workday <= p_to
-    group by user_id
+    select hb.user_id, coalesce(sum(hb.delta_seconds), 0)::bigint as bank_seconds
+    from timeclock_hour_bank hb
+    where hb.guild_id = p_guild_id
+      and hb.workday <= p_to
+    group by hb.user_id
   )
   select
     s.user_id,
@@ -346,7 +355,7 @@ as $$
   from sessions s
   left join bank b on b.user_id = s.user_id
   group by s.user_id
-  order by total_worked_seconds desc, session_count desc, s.user_id asc
+  order by coalesce(sum(s.total_worked_seconds), 0) desc, count(*) desc, s.user_id asc
   limit greatest(1, least(coalesce(p_limit, 25), 100))
   offset greatest(0, coalesce(p_offset, 0));
 $$;
@@ -368,20 +377,20 @@ language sql
 stable
 as $$
   select
-    count(*) filter (where status = 'WORKING')::bigint as working_count,
-    count(*) filter (where status = 'PAUSED')::bigint as paused_count,
-    count(*) filter (where status in ('FINISHED', 'ADJUSTED'))::bigint as finished_count,
-    coalesce(sum(total_worked_seconds), 0)::bigint as worked_seconds,
-    coalesce(sum(total_paused_seconds), 0)::bigint as paused_seconds,
-    coalesce(sum(overtime_seconds), 0)::bigint as overtime_seconds,
+    count(*) filter (where ts.status = 'WORKING')::bigint as working_count,
+    count(*) filter (where ts.status = 'PAUSED')::bigint as paused_count,
+    count(*) filter (where ts.status in ('FINISHED', 'ADJUSTED'))::bigint as finished_count,
+    coalesce(sum(ts.total_worked_seconds), 0)::bigint as worked_seconds,
+    coalesce(sum(ts.total_paused_seconds), 0)::bigint as paused_seconds,
+    coalesce(sum(ts.overtime_seconds), 0)::bigint as overtime_seconds,
     coalesce((
-      select sum(delta_seconds)
-      from timeclock_hour_bank
-      where guild_id = p_guild_id
+      select sum(hb.delta_seconds)
+      from timeclock_hour_bank hb
+      where hb.guild_id = p_guild_id
     ), 0)::bigint as bank_seconds
-  from timeclock_sessions
-  where guild_id = p_guild_id
-    and workday = p_workday;
+  from timeclock_sessions ts
+  where ts.guild_id = p_guild_id
+    and ts.workday = p_workday;
 $$;
 
 alter table guild_timeclock_settings enable row level security;
