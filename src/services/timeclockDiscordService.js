@@ -1,6 +1,28 @@
 const { MessageFlags } = require("discord.js");
 const { env } = require("../config/env");
 
+function buildDiagnosticMessage(response, payload, bodyText) {
+  if (response.status === 401 || response.status === 403) {
+    return "Bate Ponto sem autorizacao interna. Configure o TIMECLOCK_INTERNAL_API_TOKEN igual no site e no bot.";
+  }
+
+  if (response.status === 404) {
+    return `Rota interna do Bate Ponto nao encontrada em ${env.timeclockInternalApiUrl}. Publique o site atualizado ou ajuste TIMECLOCK_INTERNAL_API_URL.`;
+  }
+
+  if (payload?.message) return payload.message;
+
+  if (response.status >= 500) {
+    return "A API do Bate Ponto retornou erro interno. Verifique se a migration 142_timeclock_enterprise.sql foi aplicada e se o site esta atualizado.";
+  }
+
+  if (bodyText && bodyText.trim().startsWith("<")) {
+    return `A URL interna do Bate Ponto respondeu HTML em vez de JSON. Confira TIMECLOCK_INTERNAL_API_URL: ${env.timeclockInternalApiUrl}`;
+  }
+
+  return `Falha ao processar Bate Ponto. HTTP ${response.status || "sem resposta"}.`;
+}
+
 function normalizeDiscordPayload(payload) {
   if (!payload || typeof payload !== "object") {
     return {
@@ -36,31 +58,65 @@ async function callTimeclockInternalApi(interaction, action) {
     throw new Error("O Bate Ponto so pode ser usado dentro de um servidor.");
   }
 
-  const response = await fetch(env.timeclockInternalApiUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(env.timeclockInternalApiToken
-        ? { Authorization: `Bearer ${env.timeclockInternalApiToken}` }
-        : {}),
-    },
-    body: JSON.stringify({
+  let response;
+  try {
+    response = await fetch(env.timeclockInternalApiUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(env.timeclockInternalApiToken
+          ? { Authorization: `Bearer ${env.timeclockInternalApiToken}` }
+          : {}),
+      },
+      body: JSON.stringify({
+        action,
+        guildId: interaction.guild.id,
+        userId: interaction.user.id,
+        actorId: interaction.user.id,
+        source: interaction.isButton?.() ? "discord_button" : "discord_command",
+        interactionId: interaction.id,
+        memberRoleIds: getMemberRoleIds(interaction),
+      }),
+    });
+  } catch (error) {
+    console.error("[timeclock] falha ao chamar API interna:", {
       action,
       guildId: interaction.guild.id,
       userId: interaction.user.id,
-      actorId: interaction.user.id,
-      source: interaction.isButton?.() ? "discord_button" : "discord_command",
-      interactionId: interaction.id,
-      memberRoleIds: getMemberRoleIds(interaction),
-    }),
-  });
-  const payload = await response.json().catch(() => ({}));
+      url: env.timeclockInternalApiUrl,
+      error,
+    });
+    throw new Error("Nao consegui conectar o bot ao site do Bate Ponto. Verifique TIMECLOCK_INTERNAL_API_URL e se o site esta online.");
+  }
+
+  const bodyText = await response.text().catch(() => "");
+  let payload = {};
+  if (bodyText) {
+    try {
+      payload = JSON.parse(bodyText);
+    } catch {
+      payload = {};
+    }
+  }
   if (!response.ok || !payload.ok) {
+    const error = new Error(buildDiagnosticMessage(response, payload, bodyText));
     const discordPayload = payload.discordPayload
       ? normalizeDiscordPayload(payload.discordPayload)
       : null;
-    const error = new Error(payload.message || "Falha ao processar Bate Ponto.");
-    error.discordPayload = discordPayload;
+    error.discordPayload = {
+      ...(discordPayload || {}),
+      content: error.message,
+      flags: MessageFlags.Ephemeral,
+    };
+    console.error("[timeclock] API interna recusou a acao:", {
+      action,
+      guildId: interaction.guild.id,
+      userId: interaction.user.id,
+      status: response.status,
+      url: env.timeclockInternalApiUrl,
+      message: error.message,
+      bodyPreview: bodyText.slice(0, 240),
+    });
     throw error;
   }
   return payload;
