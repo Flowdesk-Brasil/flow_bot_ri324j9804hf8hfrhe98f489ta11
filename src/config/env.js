@@ -120,7 +120,10 @@ const env = {
   discordToken: requireAnyEnv("DISCORD_TOKEN", "DISCORD_BOT_TOKEN"),
   discordClientId: requireEnv("DISCORD_CLIENT_ID"),
   discordGuildId: process.env.DISCORD_GUILD_ID || null,
-  officialSupportGuildId: optionalEnv("OFFICIAL_SUPPORT_GUILD_ID"),
+  officialSupportGuildId:
+    optionalEnv("OFFICIAL_SUPPORT_GUILD_ID") || "1353259338759671838",
+  officialClientRoleId:
+    optionalEnv("OFFICIAL_CLIENT_ROLE_ID") || "1355322248344633525",
   officialLinkChannelId: optionalEnv("OFFICIAL_LINK_CHANNEL_ID"),
   officialLinkedRoleId: optionalEnv("OFFICIAL_LINKED_ROLE_ID"),
   officialViolationRoleLevel1Id: optionalEnv("OFFICIAL_VIOLATION_ROLE_LEVEL_1_ID"),
@@ -204,15 +207,6 @@ const env = {
         DEFAULT_PUBLIC_APP_URL,
       "/api/internal/sales/discord",
     ),
-  timeclockInternalApiUrl:
-    optionalEnv("TIMECLOCK_INTERNAL_API_URL") ||
-    buildUrl(
-      process.env.NEXT_PUBLIC_APP_URL ||
-        process.env.APP_URL ||
-        process.env.SITE_URL ||
-        DEFAULT_PUBLIC_APP_URL,
-      "/api/internal/timeclock/discord",
-    ),
   salesInternalRefundApiUrl:
     optionalEnv("SALES_INTERNAL_REFUND_API_URL") ||
     buildUrl(
@@ -233,12 +227,6 @@ const env = {
     ),
   salesInternalApiToken:
     optionalEnv("PAYMENTS_INTERNAL_API_TOKEN") ||
-    optionalEnv("SALES_INTERNAL_API_TOKEN") ||
-    optionalEnv("FLOWAI_INTERNAL_API_TOKEN") ||
-    optionalEnv("CRON_SECRET") ||
-    null,
-  timeclockInternalApiToken:
-    optionalEnv("TIMECLOCK_INTERNAL_API_TOKEN") ||
     optionalEnv("SALES_INTERNAL_API_TOKEN") ||
     optionalEnv("FLOWAI_INTERNAL_API_TOKEN") ||
     optionalEnv("CRON_SECRET") ||
@@ -264,6 +252,24 @@ const env = {
   violationSyncConcurrency: Math.max(
     1,
     parseNumber(process.env.VIOLATION_SYNC_CONCURRENCY, 4),
+  ),
+  clientRoleStartupSyncMode: parseEnum(
+    process.env.CLIENT_ROLE_STARTUP_SYNC_MODE,
+    ["full", "off"],
+    "full",
+  ),
+  clientRolePeriodicSyncMode: parseEnum(
+    process.env.CLIENT_ROLE_PERIODIC_SYNC_MODE,
+    ["full", "off"],
+    "full",
+  ),
+  clientRolePeriodicSyncIntervalMs: parseNumber(
+    process.env.CLIENT_ROLE_PERIODIC_SYNC_INTERVAL_MS,
+    60 * 60 * 1000,
+  ),
+  clientRoleSyncConcurrency: Math.max(
+    1,
+    parseNumber(process.env.CLIENT_ROLE_SYNC_CONCURRENCY, 4),
   ),
   realtimeReconnectBaseMs: parseNumber(
     process.env.REALTIME_RECONNECT_BASE_MS,

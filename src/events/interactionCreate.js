@@ -30,9 +30,8 @@ const {
   isTicketRefundInteraction,
 } = require("../services/ticketRefundService");
 const {
-  handleTimeclockButtonInteraction,
-} = require("../services/timeclockDiscordService");
-const { getGuildTicketRuntime } = require("../services/supabaseService");
+  getGuildTicketRuntime,
+} = require("../services/supabaseService");
 const { isDiscordUserSuspended, isDiscordUserAtRisk } = require("../services/violationService");
 
 function isTicketButtonInteraction(interaction) {
@@ -151,11 +150,6 @@ module.exports = {
       }
 
       if (!interaction.isButton()) return;
-
-      if (String(interaction.customId || "").startsWith("timeclock:")) {
-        await handleTimeclockButtonInteraction(interaction);
-        return;
-      }
 
       if (isSecurityLogButtonInteraction(interaction)) {
         await handleSecurityLogButtonInteraction(interaction);

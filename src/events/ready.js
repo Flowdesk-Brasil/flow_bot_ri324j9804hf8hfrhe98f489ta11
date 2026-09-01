@@ -14,6 +14,7 @@ const { syncSlashCommandsForClient } = require("../services/slashCommandSyncServ
 const { startVoicePresence } = require("../services/voicePresenceService");
 const { startStatusHeartbeat } = require("../services/statusMonitoringService");
 const { syncAllViolationRoles } = require("../services/violationService");
+const { syncAllClientRoles } = require("../services/clientRoleService");
 const { initRealtimeListeners } = require("../services/realtimeService");
 const { verifySupabaseAdminConnection } = require("../services/supabaseConnectivityService");
 const { env } = require("../config/env");
@@ -98,6 +99,34 @@ module.exports = {
       startDirectMessageQueueWorker(client);
       startSecurityLogQueueWorker(client);
       startAutoRoleWorker(client);
+
+      if (env.clientRoleStartupSyncMode !== "off") {
+        try {
+          const result = await syncAllClientRoles(client);
+          console.log(
+            `[client-role] Startup sync completo (${result.synced}/${result.candidateCount}).`,
+          );
+        } catch (error) {
+          console.error("[client-role] Erro no startup sync:", error);
+        }
+      } else {
+        console.log("[client-role] Startup sync desativado por configuracao.");
+      }
+
+      if (env.clientRolePeriodicSyncMode !== "off") {
+        setInterval(async () => {
+          try {
+            const result = await syncAllClientRoles(client);
+            console.log(
+              `[client-role] Sync periodico completo (${result.synced}/${result.candidateCount}).`,
+            );
+          } catch (error) {
+            console.error("[client-role] Erro no sync periodico:", error);
+          }
+        }, env.clientRolePeriodicSyncIntervalMs);
+      } else {
+        console.log("[client-role] Sync periodico desativado por configuracao.");
+      }
     }
 
     try {

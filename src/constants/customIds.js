@@ -22,10 +22,6 @@ const CUSTOM_IDS = {
   openTicketReasonInput: "ticket:open_reason",
   aiSuggestionHelped: "ticket:ai_helped",
   aiSuggestionContinue: "ticket:ai_continue",
-  timeclockOpen: "timeclock:open",
-  timeclockStart: "timeclock:start",
-  timeclockPause: "timeclock:pause",
-  timeclockFinish: "timeclock:finish",
 };
 
 module.exports = { CUSTOM_IDS };

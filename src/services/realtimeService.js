@@ -1,6 +1,10 @@
 const { createClient } = require("@supabase/supabase-js");
 const { env } = require("../config/env");
 const { syncViolationRolesForDiscordUser } = require("./violationService");
+const {
+  clearClientRoleEligibilityCache,
+  syncClientRoleForDiscordUser,
+} = require("./clientRoleService");
 
 const USER_LOOKUP_CACHE_TTL_MS = 60 * 1000;
 const USER_SYNC_DEBOUNCE_MS = 350;
@@ -8,8 +12,10 @@ const RECONNECTABLE_STATUSES = new Set(["CHANNEL_ERROR", "TIMED_OUT", "CLOSED"])
 
 const discordUserIdCache = new Map();
 const pendingViolationSyncs = new Map();
+const pendingClientRoleSyncs = new Map();
 
 let violationChangesChannel = null;
+let clientRoleChangesChannel = null;
 let reconnectTimer = null;
 let reconnectAttempt = 0;
 let activeDiscordClient = null;
@@ -81,6 +87,18 @@ async function closeViolationChangesChannel(channel = violationChangesChannel) {
 
   if (channel === violationChangesChannel) {
     violationChangesChannel = null;
+  }
+
+  await removeChannelSafely(channel);
+}
+
+async function closeClientRoleChangesChannel(channel = clientRoleChangesChannel) {
+  if (!channel) {
+    return;
+  }
+
+  if (channel === clientRoleChangesChannel) {
+    clientRoleChangesChannel = null;
   }
 
   await removeChannelSafely(channel);
@@ -185,6 +203,81 @@ function queueViolationSync(client, userId, eventType) {
   pendingViolationSyncs.set(normalizedUserId, timeout);
 }
 
+async function resolveAndSyncClientRole(client, userId, eventType) {
+  const normalizedUserId = Number(userId);
+  if (!Number.isFinite(normalizedUserId)) {
+    return;
+  }
+
+  const discordUserId = await resolveDiscordUserId(normalizedUserId);
+  if (!discordUserId) {
+    console.warn(
+      `[realtimeService] Could not resolve Discord ID for client role user ${normalizedUserId}`,
+    );
+    return;
+  }
+
+  clearClientRoleEligibilityCache(discordUserId);
+  await syncClientRoleForDiscordUser(client, discordUserId);
+  console.log(
+    `[realtimeService] Synced client role after ${eventType} for ${discordUserId}`,
+  );
+}
+
+function queueClientRoleSync(client, userId, eventType) {
+  const normalizedUserId = Number(userId);
+  if (!Number.isFinite(normalizedUserId)) {
+    return;
+  }
+
+  const existingTimeout = pendingClientRoleSyncs.get(normalizedUserId);
+  if (existingTimeout) {
+    clearTimeout(existingTimeout);
+  }
+
+  const timeout = setTimeout(async () => {
+    pendingClientRoleSyncs.delete(normalizedUserId);
+
+    try {
+      await resolveAndSyncClientRole(
+        client,
+        normalizedUserId,
+        eventType || "unknown",
+      );
+    } catch (error) {
+      console.error(
+        "[realtimeService] Client role sync error:",
+        error instanceof Error ? error.message : error,
+      );
+    }
+  }, USER_SYNC_DEBOUNCE_MS);
+
+  pendingClientRoleSyncs.set(normalizedUserId, timeout);
+}
+
+function queueClientRoleSyncByDiscordUserId(client, discordUserId, eventType) {
+  const normalizedDiscordUserId =
+    typeof discordUserId === "string" ? discordUserId.trim() : "";
+  if (!normalizedDiscordUserId) {
+    return;
+  }
+
+  clearClientRoleEligibilityCache(normalizedDiscordUserId);
+  setTimeout(async () => {
+    try {
+      await syncClientRoleForDiscordUser(client, normalizedDiscordUserId);
+      console.log(
+        `[realtimeService] Synced client role after ${eventType} for ${normalizedDiscordUserId}`,
+      );
+    } catch (error) {
+      console.error(
+        "[realtimeService] Client role sync error:",
+        error instanceof Error ? error.message : error,
+      );
+    }
+  }, USER_SYNC_DEBOUNCE_MS);
+}
+
 function scheduleRealtimeReconnect(reason) {
   if (!activeDiscordClient || reconnectTimer) {
     return;
@@ -261,10 +354,90 @@ async function subscribeViolationChanges(client) {
   });
 }
 
+async function subscribeClientRoleChanges(client) {
+  activeDiscordClient = client;
+
+  await closeClientRoleChangesChannel();
+
+  const channel = supabase
+    .channel("client_role_realtime")
+    .on(
+      "postgres_changes",
+      {
+        event: "*",
+        schema: "public",
+        table: "payment_orders",
+      },
+      async (payload) => {
+        const userId = payload.new?.user_id || payload.old?.user_id;
+        if (userId) {
+          queueClientRoleSync(activeDiscordClient, userId, payload.eventType);
+        }
+      },
+    )
+    .on(
+      "postgres_changes",
+      {
+        event: "*",
+        schema: "public",
+        table: "auth_user_plan_state",
+      },
+      async (payload) => {
+        const userId = payload.new?.user_id || payload.old?.user_id;
+        if (userId) {
+          queueClientRoleSync(activeDiscordClient, userId, payload.eventType);
+        }
+      },
+    )
+    .on(
+      "postgres_changes",
+      {
+        event: "UPDATE",
+        schema: "public",
+        table: "auth_users",
+      },
+      async (payload) => {
+        queueClientRoleSyncByDiscordUserId(
+          activeDiscordClient,
+          payload.old?.discord_user_id,
+          "auth_users:update",
+        );
+        queueClientRoleSyncByDiscordUserId(
+          activeDiscordClient,
+          payload.new?.discord_user_id,
+          "auth_users:update",
+        );
+      },
+    );
+
+  clientRoleChangesChannel = channel;
+
+  channel.subscribe((status) => {
+    if (channel !== clientRoleChangesChannel) {
+      return;
+    }
+
+    if (status === "SUBSCRIBED") {
+      console.log("[realtimeService] Client role subscription ready");
+      return;
+    }
+
+    if (RECONNECTABLE_STATUSES.has(status)) {
+      void closeClientRoleChangesChannel(channel);
+      setTimeout(() => {
+        if (activeDiscordClient) {
+          void subscribeClientRoleChanges(activeDiscordClient);
+        }
+      }, Math.max(500, Number(env.realtimeReconnectBaseMs) || 2_000));
+    }
+  });
+}
+
 function initRealtimeListeners(client) {
   console.log("[realtimeService] Initializing Realtime listeners...");
   activeDiscordClient = client;
   void subscribeViolationChanges(client);
+  void subscribeClientRoleChanges(client);
 }
 
 module.exports = { initRealtimeListeners };
