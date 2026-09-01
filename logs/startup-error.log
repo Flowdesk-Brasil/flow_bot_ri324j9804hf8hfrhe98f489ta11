@@ -1,0 +1,30 @@
+[2026-09-01T13:26:56.718Z] [bootstrap-error] C:\Users\Administrador\Desktop\Fl0wD3sk_845983_wjcwf0328roifldvn_934320fn02rg0g89-main\src\utils\componentFactory.js:138
+}
+^
+
+SyntaxError: Unexpected token '}'
+    at wrapSafe (node:internal/modules/cjs/loader:1763:18)
+    at Module._compile (node:internal/modules/cjs/loader:1804:20)
+    at Object..js (node:internal/modules/cjs/loader:1961:10)
+    at Module.load (node:internal/modules/cjs/loader:1553:32)
+    at Module._load (node:internal/modules/cjs/loader:1355:12)
+    at wrapModuleLoad (node:internal/modules/cjs/loader:255:19)
+    at Module.require (node:internal/modules/cjs/loader:1576:12)
+    at require (node:internal/modules/helpers:153:16)
+    at Object.<anonymous> (C:\Users\Administrador\Desktop\Fl0wD3sk_845983_wjcwf0328roifldvn_934320fn02rg0g89-main\src\services\logService.js:1:29)
+    at Module._compile (node:internal/modules/cjs/loader:1830:14)
+[2026-09-01T13:26:57.414Z] [bootstrap-error] C:\Users\Administrador\Desktop\Fl0wD3sk_845983_wjcwf0328roifldvn_934320fn02rg0g89-main\src\utils\componentFactory.js:138
+}
+^
+
+SyntaxError: Unexpected token '}'
+    at wrapSafe (node:internal/modules/cjs/loader:1763:18)
+    at Module._compile (node:internal/modules/cjs/loader:1804:20)
+    at Object..js (node:internal/modules/cjs/loader:1961:10)
+    at Module.load (node:internal/modules/cjs/loader:1553:32)
+    at Module._load (node:internal/modules/cjs/loader:1355:12)
+    at wrapModuleLoad (node:internal/modules/cjs/loader:255:19)
+    at Module.require (node:internal/modules/cjs/loader:1576:12)
+    at require (node:internal/modules/helpers:153:16)
+    at Object.<anonymous> (C:\Users\Administrador\Desktop\Fl0wD3sk_845983_wjcwf0328roifldvn_934320fn02rg0g89-main\src\services\logService.js:1:29)
+    at Module._compile (node:internal/modules/cjs/loader:1830:14)
