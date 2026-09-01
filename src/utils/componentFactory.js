@@ -917,6 +917,36 @@ function buildCaptchaPanelPayload({ settings, title, description, buttonLabel })
   };
 }
 
+function withEphemeralComponentsV2(payload = {}) {
+  return {
+    ...payload,
+    flags: (payload.flags ?? MESSAGE_FLAG_IS_COMPONENTS_V2) | MessageFlags.Ephemeral,
+    allowedMentions: { parse: [] },
+  };
+}
+
+function buildCaptchaResultPayload({ title, message, tone = "neutral" }) {
+  const safeTitle = trimText(title) || "Verificacao";
+  const safeMessage =
+    trimText(message) ||
+    "Atualizacao da verificacao concluida. Clique em Iniciar novamente se precisar.";
+
+  return withEphemeralComponentsV2({
+    components: [
+      {
+        type: COMPONENT_TYPE.CONTAINER,
+        accent_color: resolveTicketMessageToneColor(tone),
+        components: [
+          {
+            type: COMPONENT_TYPE.TEXT_DISPLAY,
+            content: [`### ${safeTitle}`, safeMessage].join("\n\n"),
+          },
+        ],
+      },
+    ],
+  });
+}
+
 function buildCaptchaChallengePayload({
   title,
   description,
@@ -928,49 +958,55 @@ function buildCaptchaChallengePayload({
     trimText(description) ||
     "Selecione o codigo que aparece na imagem acima.";
   const safeOptions = Array.isArray(options) ? options.slice(0, 5) : [];
+  const selectOptions = safeOptions
+    .map((code) => String(code || "").trim())
+    .filter(Boolean)
+    .slice(0, 5)
+    .map((code) => ({
+      label: code,
+      value: code,
+    }));
 
-  return {
-    flags: MESSAGE_FLAG_IS_COMPONENTS_V2 | MessageFlags.Ephemeral,
-    components: [
-      {
-        type: COMPONENT_TYPE.CONTAINER,
-        accent_color: 0x0062ff,
-        components: [
-          {
-            type: COMPONENT_TYPE.TEXT_DISPLAY,
-            content: [`### ${safeTitle}`, safeDescription].join("\n\n"),
-          },
-          {
-            type: COMPONENT_TYPE.MEDIA_GALLERY,
-            items: [
-              {
-                media: {
-                  url: `attachment://${trimText(attachmentName) || "captcha.png"}`,
-                },
+  const components = [
+    {
+      type: COMPONENT_TYPE.CONTAINER,
+      accent_color: 0x5865f2,
+      components: [
+        {
+          type: COMPONENT_TYPE.TEXT_DISPLAY,
+          content: [`### ${safeTitle}`, safeDescription].join("\n\n"),
+        },
+        {
+          type: COMPONENT_TYPE.MEDIA_GALLERY,
+          items: [
+            {
+              media: {
+                url: `attachment://${trimText(attachmentName) || "captcha.png"}`,
               },
-            ],
-          },
-        ],
-      },
-      {
-        type: COMPONENT_TYPE.ACTION_ROW,
-        components: [
-          {
-            type: COMPONENT_TYPE.STRING_SELECT,
-            custom_id: CUSTOM_IDS.verifyCaptcha,
-            placeholder: "Escolha o codigo correto",
-            min_values: 1,
-            max_values: 1,
-            options: safeOptions.map((code) => ({
-              label: String(code),
-              value: String(code),
-            })),
-          },
-        ],
-      },
-    ],
-    allowedMentions: { parse: [] },
-  };
+            },
+          ],
+        },
+      ],
+    },
+  ];
+
+  if (selectOptions.length) {
+    components.push({
+      type: COMPONENT_TYPE.ACTION_ROW,
+      components: [
+        {
+          type: COMPONENT_TYPE.STRING_SELECT,
+          custom_id: CUSTOM_IDS.verifyCaptcha,
+          placeholder: "Escolha o codigo correto",
+          min_values: 1,
+          max_values: 1,
+          options: selectOptions,
+        },
+      ],
+    });
+  }
+
+  return withEphemeralComponentsV2({ components });
 }
 
 function buildWelcomeMessagePayload({
@@ -1481,6 +1517,8 @@ module.exports = {
   buildTicketPanelPayload,
   buildCaptchaPanelPayload,
   buildCaptchaChallengePayload,
+  buildCaptchaResultPayload,
+  withEphemeralComponentsV2,
   buildWelcomeMessagePayload,
   buildTicketSimpleMessagePayload,
   buildTicketSystemDisabledPayload,

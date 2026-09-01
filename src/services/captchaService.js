@@ -5,7 +5,8 @@ const {
 const { CUSTOM_IDS } = require("../constants/customIds");
 const {
   buildCaptchaChallengePayload,
-  buildTicketSimpleMessagePayload,
+  buildCaptchaResultPayload,
+  withEphemeralComponentsV2,
 } = require("../utils/componentFactory");
 const {
   generateCaptchaCode,
@@ -20,6 +21,10 @@ const {
 } = require("./supabaseService");
 
 const CAPTCHA_ATTACHMENT_NAME = "captcha-code.png";
+const DEFAULT_CHALLENGE_DESCRIPTION =
+  "Selecione o codigo que aparece na imagem acima.";
+const DEFAULT_SUCCESS_MESSAGE =
+  "Verificacao concluida com sucesso. Bem-vindo ao servidor!";
 
 function memberHasAnyRole(member, roleIds = []) {
   if (!member?.roles?.cache || !Array.isArray(roleIds) || !roleIds.length) {
@@ -28,23 +33,107 @@ function memberHasAnyRole(member, roleIds = []) {
   return roleIds.some((roleId) => member.roles.cache.has(roleId));
 }
 
-function buildCaptchaFailurePayload(message) {
-  return buildTicketSimpleMessagePayload({
+function buildCaptchaFailureResult(message) {
+  return buildCaptchaResultPayload({
     title: "Verificacao nao concluida",
     message,
     tone: "error",
   });
 }
 
-function buildCaptchaSuccessPayload(message) {
-  return buildTicketSimpleMessagePayload({
+function buildCaptchaSuccessResult(message) {
+  return buildCaptchaResultPayload({
     title: "Verificacao concluida",
     message,
     tone: "success",
   });
 }
 
-async function sendCaptchaVerificationLog({ guild, member, settings, client }) {
+function normalizeChallengeDescription(settings, extraLine = "") {
+  const base =
+    String(settings?.challenge_description || "").trim() ||
+    DEFAULT_CHALLENGE_DESCRIPTION;
+  const extra = String(extraLine || "").trim();
+  return extra ? `${base}\n\n${extra}` : base;
+}
+
+function extractPayloadFallbackText(payload, fallback = "") {
+  const components = Array.isArray(payload?.components) ? payload.components : [];
+
+  for (const component of components) {
+    if (component?.type === 10 && component.content) {
+      return String(component.content).replace(/^#+\s*/gm, "").trim();
+    }
+
+    if (Array.isArray(component?.components)) {
+      const nested = extractPayloadFallbackText(
+        { components: component.components },
+        "",
+      );
+      if (nested) return nested;
+    }
+  }
+
+  return fallback;
+}
+
+async function replyCaptchaMessage(interaction, payload) {
+  await interaction.reply(withEphemeralComponentsV2(payload));
+}
+
+async function acknowledgeCaptchaVerifyInteraction(interaction) {
+  if (interaction.deferred || interaction.replied) return;
+  await interaction.deferUpdate();
+}
+
+async function replaceCaptchaVerifyMessage(interaction, payload, files = []) {
+  const normalizedPayload = withEphemeralComponentsV2(payload);
+  const requestPayload = {
+    ...normalizedPayload,
+    files,
+  };
+
+  try {
+    await interaction.editReply(requestPayload);
+    return;
+  } catch (editError) {
+    console.warn("[captcha-verify-edit]", editError?.message || editError);
+  }
+
+  if (!interaction.deferred && !interaction.replied) {
+    try {
+      await interaction.update(requestPayload);
+      return;
+    } catch (updateError) {
+      console.warn("[captcha-verify-update]", updateError?.message || updateError);
+    }
+  }
+
+  const fallbackText = extractPayloadFallbackText(
+    normalizedPayload,
+    "Nao foi possivel atualizar a verificacao. Clique em Iniciar novamente.",
+  );
+
+  await interaction
+    .editReply({
+      content: fallbackText,
+      embeds: [],
+      components: [],
+      files: [],
+    })
+    .catch(async () => {
+      if (interaction.replied || interaction.deferred) {
+        await interaction
+          .followUp({
+            content: fallbackText,
+            flags: MessageFlags.Ephemeral,
+          })
+          .catch(() => null);
+      }
+    });
+}
+
+async function sendCaptchaVerificationLog({ guild, member, settings }) {
   const channelId = settings?.logs_channel_id;
   if (!channelId) return;
 
@@ -98,12 +187,12 @@ async function handleCaptchaStartInteraction(interaction) {
   const settings = runtime?.settings;
 
   if (!runtime?.licenseUsable || !settings?.enabled) {
-    await interaction.reply({
-      ...buildCaptchaFailurePayload(
+    await replyCaptchaMessage(
+      interaction,
+      buildCaptchaFailureResult(
         "O modulo de captcha esta indisponivel neste servidor no momento.",
       ),
-      flags: MessageFlags.Ephemeral,
-    });
+    );
     return;
   }
 
@@ -116,23 +205,21 @@ async function handleCaptchaStartInteraction(interaction) {
     : [];
 
   if (memberHasAnyRole(member, verifiedRoleIds)) {
-    await interaction.reply({
-      ...buildCaptchaSuccessPayload(
-        "Voce ja esta verificado neste servidor.",
-      ),
-      flags: MessageFlags.Ephemeral,
-    });
+    await replyCaptchaMessage(
+      interaction,
+      buildCaptchaSuccessResult("Voce ja esta verificado neste servidor."),
+    );
     return;
   }
 
   if (memberHasAnyRole(member, bypassRoleIds)) {
     await assignVerifiedRoles(member, verifiedRoleIds);
-    await interaction.reply({
-      ...buildCaptchaSuccessPayload(
+    await replyCaptchaMessage(
+      interaction,
+      buildCaptchaSuccessResult(
         "Seu cargo permite pular a verificacao. Acesso liberado.",
       ),
-      flags: MessageFlags.Ephemeral,
-    });
+    );
     return;
   }
 
@@ -159,7 +246,7 @@ async function handleCaptchaStartInteraction(interaction) {
   await interaction.reply({
     ...buildCaptchaChallengePayload({
       title: settings.challenge_title,
-      description: settings.challenge_description,
+      description: normalizeChallengeDescription(settings),
       attachmentName: CAPTCHA_ATTACHMENT_NAME,
       options: optionCodes,
     }),
@@ -171,118 +258,131 @@ async function handleCaptchaVerifyInteraction(interaction) {
   const guildId = interaction.guildId;
   if (!guildId) return;
 
-  const runtime = await getGuildCaptchaRuntime(guildId);
-  const settings = runtime?.settings;
+  try {
+    await acknowledgeCaptchaVerifyInteraction(interaction);
 
-  if (!runtime?.licenseUsable || !settings?.enabled) {
-    await interaction.reply({
-      ...buildCaptchaFailurePayload(
-        "O modulo de captcha esta indisponivel neste servidor no momento.",
-      ),
-      flags: MessageFlags.Ephemeral,
-    });
-    return;
-  }
+    const runtime = await getGuildCaptchaRuntime(guildId);
+    const settings = runtime?.settings;
 
-  const selectedCode = interaction.values?.[0] || "";
-  const session = await getGuildCaptchaSession(guildId, interaction.user.id);
-
-  if (!session) {
-    await interaction.reply({
-      ...buildCaptchaFailurePayload(
-        "Nenhuma verificacao ativa foi encontrada. Clique em Iniciar novamente.",
-      ),
-      flags: MessageFlags.Ephemeral,
-    });
-    return;
-  }
-
-  if (new Date(session.expires_at).getTime() <= Date.now()) {
-    await deleteGuildCaptchaSession(guildId, interaction.user.id);
-    await interaction.reply({
-      ...buildCaptchaFailurePayload(
-        "O tempo da verificacao expirou. Clique em Iniciar novamente.",
-      ),
-      flags: MessageFlags.Ephemeral,
-    });
-    return;
-  }
-
-  if (selectedCode === session.correct_code) {
-    await deleteGuildCaptchaSession(guildId, interaction.user.id);
-    await assignVerifiedRoles(interaction.member, settings.verified_role_ids);
-    await sendCaptchaVerificationLog({
-      guild: interaction.guild,
-      member: interaction.member,
-      settings,
-      client: interaction.client,
-    });
-
-    const successPayload = buildCaptchaSuccessPayload(
-      String(settings.success_message || "").trim() ||
-        "Verificacao concluida com sucesso. Bem-vindo ao servidor!",
-    );
-
-    await interaction.update({
-      ...successPayload,
-      flags: successPayload.flags | MessageFlags.Ephemeral,
-      files: [],
-    });
-    return;
-  }
-
-  const attemptsRemaining = Math.max(0, Number(session.attempts_remaining || 0) - 1);
-
-  if (attemptsRemaining <= 0) {
-    await deleteGuildCaptchaSession(guildId, interaction.user.id);
-
-    if (settings.kick_on_fail && interaction.member?.kickable) {
-      await interaction.member
-        .kick("Falhou na verificacao de captcha.")
-        .catch(() => null);
+    if (!runtime?.licenseUsable || !settings?.enabled) {
+      await replaceCaptchaVerifyMessage(
+        interaction,
+        buildCaptchaFailureResult(
+          "O modulo de captcha esta indisponivel neste servidor no momento.",
+        ),
+      );
+      return;
     }
 
-    const exhaustedPayload = buildCaptchaFailurePayload(
-      "Voce esgotou as tentativas de verificacao. Tente novamente mais tarde.",
+    const selectedCode = String(interaction.values?.[0] || "").trim();
+    const session = await getGuildCaptchaSession(guildId, interaction.user.id);
+
+    if (!session) {
+      await replaceCaptchaVerifyMessage(
+        interaction,
+        buildCaptchaFailureResult(
+          "Nenhuma verificacao ativa foi encontrada. Clique em Iniciar novamente.",
+        ),
+      );
+      return;
+    }
+
+    if (new Date(session.expires_at).getTime() <= Date.now()) {
+      await deleteGuildCaptchaSession(guildId, interaction.user.id);
+      await replaceCaptchaVerifyMessage(
+        interaction,
+        buildCaptchaFailureResult(
+          "O tempo da verificacao expirou. Clique em Iniciar novamente.",
+        ),
+      );
+      return;
+    }
+
+    const correctCode = String(session.correct_code || "").trim();
+
+    if (selectedCode && selectedCode === correctCode) {
+      await deleteGuildCaptchaSession(guildId, interaction.user.id);
+      await assignVerifiedRoles(interaction.member, settings.verified_role_ids);
+      await sendCaptchaVerificationLog({
+        guild: interaction.guild,
+        member: interaction.member,
+        settings,
+      });
+
+      await replaceCaptchaVerifyMessage(
+        interaction,
+        buildCaptchaSuccessResult(
+          String(settings.success_message || "").trim() || DEFAULT_SUCCESS_MESSAGE,
+        ),
+      );
+      return;
+    }
+
+    const attemptsRemaining = Math.max(
+      0,
+      Number(session.attempts_remaining || 0) - 1,
     );
 
-    await interaction.update({
-      ...exhaustedPayload,
-      flags: exhaustedPayload.flags | MessageFlags.Ephemeral,
-      files: [],
+    if (attemptsRemaining <= 0) {
+      await deleteGuildCaptchaSession(guildId, interaction.user.id);
+
+      if (settings.kick_on_fail && interaction.member?.kickable) {
+        await interaction.member
+          .kick("Falhou na verificacao de captcha.")
+          .catch(() => null);
+      }
+
+      await replaceCaptchaVerifyMessage(
+        interaction,
+        buildCaptchaFailureResult(
+          "Voce esgotou as tentativas de verificacao. Tente novamente mais tarde.",
+        ),
+      );
+      return;
+    }
+
+    const nextCorrectCode = generateCaptchaCode(6);
+    const nextOptionCodes = generateCaptchaOptions(nextCorrectCode, 5);
+    const expiresAt = new Date(
+      Date.now() + Math.max(30, Number(settings.timeout_seconds || 120)) * 1000,
+    ).toISOString();
+
+    await createGuildCaptchaSession({
+      guildId,
+      userId: interaction.user.id,
+      correctCode: nextCorrectCode,
+      optionCodes: nextOptionCodes,
+      attemptsRemaining,
+      expiresAt,
     });
-    return;
+
+    const imageBuffer = renderCaptchaImage(nextCorrectCode);
+    const attachment = new AttachmentBuilder(imageBuffer, {
+      name: CAPTCHA_ATTACHMENT_NAME,
+    });
+
+    await replaceCaptchaVerifyMessage(
+      interaction,
+      buildCaptchaChallengePayload({
+        title: settings.challenge_title,
+        description: normalizeChallengeDescription(
+          settings,
+          `Codigo incorreto. Tentativas restantes: **${attemptsRemaining}**.`,
+        ),
+        attachmentName: CAPTCHA_ATTACHMENT_NAME,
+        options: nextOptionCodes,
+      }),
+      [attachment],
+    );
+  } catch (error) {
+    console.error("[captcha-verify]", error);
+    await replaceCaptchaVerifyMessage(
+      interaction,
+      buildCaptchaFailureResult(
+        "Nao foi possivel concluir a verificacao. Clique em Iniciar novamente.",
+      ),
+    );
   }
-
-  const nextCorrectCode = generateCaptchaCode(6);
-  const nextOptionCodes = generateCaptchaOptions(nextCorrectCode, 5);
-  const expiresAt = new Date(
-    Date.now() + Math.max(30, Number(settings.timeout_seconds || 120)) * 1000,
-  ).toISOString();
-
-  await createGuildCaptchaSession({
-    guildId,
-    userId: interaction.user.id,
-    correctCode: nextCorrectCode,
-    optionCodes: nextOptionCodes,
-    attemptsRemaining,
-    expiresAt,
-  });
-
-  const imageBuffer = renderCaptchaImage(nextCorrectCode);
-  const attachment = new AttachmentBuilder(imageBuffer, {
-    name: CAPTCHA_ATTACHMENT_NAME,
-  });
-
-  await interaction.update({
-    ...buildCaptchaChallengePayload({
-      title: settings.challenge_title,
-      description: `${settings.challenge_description}\n\nCodigo incorreto. Tentativas restantes: **${attemptsRemaining}**.`,
-      attachmentName: CAPTCHA_ATTACHMENT_NAME,
-      options: nextOptionCodes,
-    }),
-    files: [attachment],
-  });
 }
 
 function isCaptchaButtonInteraction(interaction) {
