@@ -30,6 +30,12 @@ const {
   isTicketRefundInteraction,
 } = require("../services/ticketRefundService");
 const {
+  handleCaptchaStartInteraction,
+  handleCaptchaVerifyInteraction,
+  isCaptchaButtonInteraction,
+  isCaptchaSelectInteraction,
+} = require("../services/captchaService");
+const {
   getGuildTicketRuntime,
 } = require("../services/supabaseService");
 const { isDiscordUserSuspended, isDiscordUserAtRisk } = require("../services/violationService");
@@ -149,7 +155,17 @@ module.exports = {
         return;
       }
 
+      if (isCaptchaSelectInteraction(interaction)) {
+        await handleCaptchaVerifyInteraction(interaction);
+        return;
+      }
+
       if (!interaction.isButton()) return;
+
+      if (isCaptchaButtonInteraction(interaction)) {
+        await handleCaptchaStartInteraction(interaction);
+        return;
+      }
 
       if (isSecurityLogButtonInteraction(interaction)) {
         await handleSecurityLogButtonInteraction(interaction);

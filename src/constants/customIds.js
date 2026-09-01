@@ -22,6 +22,8 @@ const CUSTOM_IDS = {
   openTicketReasonInput: "ticket:open_reason",
   aiSuggestionHelped: "ticket:ai_helped",
   aiSuggestionContinue: "ticket:ai_continue",
+  startCaptcha: "captcha:start",
+  verifyCaptcha: "captcha:verify",
 };
 
 module.exports = { CUSTOM_IDS };

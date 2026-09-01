@@ -7,6 +7,8 @@ const EVENTS_TABLE = "ticket_events";
 const TICKET_SETTINGS_TABLE = "guild_ticket_settings";
 const TICKET_STAFF_SETTINGS_TABLE = "guild_ticket_staff_settings";
 const WELCOME_SETTINGS_TABLE = "guild_welcome_settings";
+const CAPTCHA_SETTINGS_TABLE = "guild_captcha_settings";
+const CAPTCHA_SESSIONS_TABLE = "guild_captcha_sessions";
 const ANTILINK_SETTINGS_TABLE = "guild_antilink_settings";
 const AUTOROLE_SETTINGS_TABLE = "guild_autorole_settings";
 const AUTOROLE_QUEUE_TABLE = "guild_autorole_queue";
@@ -31,6 +33,7 @@ const licenseRuntimeInflight = new Map();
 const moduleRuntimeCache = {
   ticket: new Map(),
   welcome: new Map(),
+  captcha: new Map(),
   antiLink: new Map(),
   autoRole: new Map(),
   securityLogs: new Map(),
@@ -38,6 +41,7 @@ const moduleRuntimeCache = {
 const moduleRuntimeInflight = {
   ticket: new Map(),
   welcome: new Map(),
+  captcha: new Map(),
   antiLink: new Map(),
   autoRole: new Map(),
   securityLogs: new Map(),
@@ -1236,6 +1240,90 @@ async function getGuildWelcomeSettings(guildId) {
   return unwrap(result, "getGuildWelcomeSettings");
 }
 
+async function getGuildCaptchaSettings(guildId) {
+  const result = await supabase
+    .from(CAPTCHA_SETTINGS_TABLE)
+    .select(
+      "guild_id, enabled, panel_channel_id, logs_channel_id, verified_role_ids, bypass_role_ids, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, challenge_title, challenge_description, max_attempts, timeout_seconds, kick_on_fail, success_message, updated_at",
+    )
+    .eq("guild_id", guildId)
+    .maybeSingle();
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(CAPTCHA_SETTINGS_TABLE)) {
+      return null;
+    }
+    return unwrap(result, "getGuildCaptchaSettings");
+  }
+
+  return result.data;
+}
+
+async function createGuildCaptchaSession(input) {
+  const result = await supabase
+    .from(CAPTCHA_SESSIONS_TABLE)
+    .upsert(
+      {
+        guild_id: input.guildId,
+        user_id: input.userId,
+        correct_code: input.correctCode,
+        option_codes: input.optionCodes,
+        attempts_remaining: input.attemptsRemaining,
+        expires_at: input.expiresAt,
+      },
+      { onConflict: "guild_id,user_id" },
+    )
+    .select(
+      "guild_id, user_id, correct_code, option_codes, attempts_remaining, expires_at",
+    )
+    .single();
+
+  return unwrap(result, "createGuildCaptchaSession");
+}
+
+async function getGuildCaptchaSession(guildId, userId) {
+  const result = await supabase
+    .from(CAPTCHA_SESSIONS_TABLE)
+    .select(
+      "guild_id, user_id, correct_code, option_codes, attempts_remaining, expires_at",
+    )
+    .eq("guild_id", guildId)
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(CAPTCHA_SESSIONS_TABLE)) {
+      return null;
+    }
+    return unwrap(result, "getGuildCaptchaSession");
+  }
+
+  return result.data;
+}
+
+async function deleteGuildCaptchaSession(guildId, userId) {
+  const result = await supabase
+    .from(CAPTCHA_SESSIONS_TABLE)
+    .delete()
+    .eq("guild_id", guildId)
+    .eq("user_id", userId);
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(CAPTCHA_SESSIONS_TABLE)) {
+      return null;
+    }
+    return unwrap(result, "deleteGuildCaptchaSession");
+  }
+
+  return result.data;
+}
+
 async function getGuildAntiLinkSettings(guildId) {
   const result = await supabase
     .from(ANTILINK_SETTINGS_TABLE)
@@ -1600,6 +1688,37 @@ async function getGuildWelcomeRuntime(guildId) {
   );
 }
 
+async function loadGuildCaptchaRuntime(guildId) {
+  const [settings, accountLicenseRuntime] = await Promise.all([
+    getGuildCaptchaSettings(guildId),
+    getGuildAccountLicenseRuntime(guildId),
+  ]);
+
+  return {
+    guildId,
+    settings: settings || null,
+    licenseStatus: accountLicenseRuntime.licenseStatus,
+    licenseUsable: accountLicenseRuntime.licenseUsable,
+    latestCoverage: accountLicenseRuntime.latestCoverage,
+    isConfigured: Boolean(
+      settings?.enabled &&
+        settings?.panel_channel_id &&
+        Array.isArray(settings?.verified_role_ids) &&
+        settings.verified_role_ids.length,
+    ),
+  };
+}
+
+async function getGuildCaptchaRuntime(guildId) {
+  return await withCachedResult(
+    moduleRuntimeCache.captcha,
+    moduleRuntimeInflight.captcha,
+    guildId,
+    MODULE_RUNTIME_CACHE_TTL_MS,
+    () => loadGuildCaptchaRuntime(guildId),
+  );
+}
+
 async function loadGuildAntiLinkRuntime(guildId) {
   const [settings, accountLicenseRuntime] = await Promise.all([
     getGuildAntiLinkSettings(guildId),
@@ -1761,6 +1880,79 @@ async function updateGuildTicketPanelMessageId(guildId, panelMessageId) {
   return unwrap(result, "updateGuildTicketPanelMessageId");
 }
 
+async function loadConfiguredCaptchaGuildRuntimes() {
+  const result = await supabase
+    .from(CAPTCHA_SETTINGS_TABLE)
+    .select(
+      "guild_id, enabled, panel_channel_id, logs_channel_id, verified_role_ids, bypass_role_ids, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, challenge_title, challenge_description, max_attempts, timeout_seconds, kick_on_fail, success_message, updated_at",
+    )
+    .eq("enabled", true);
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(CAPTCHA_SETTINGS_TABLE)) {
+      return [];
+    }
+    return unwrap(result, "loadConfiguredCaptchaGuildRuntimes");
+  }
+
+  const settingsRows = result.data || [];
+  const accountLicenseRuntimeByGuild = await getGuildAccountLicenseRuntimeMap(
+    settingsRows.map((row) => row.guild_id),
+  );
+
+  return settingsRows
+    .map((settingsRow) => {
+      const accountLicenseRuntime =
+        accountLicenseRuntimeByGuild.get(settingsRow.guild_id) || {
+          licenseStatus: "not_paid",
+          licenseUsable: false,
+          latestCoverage: null,
+        };
+
+      return {
+        guildId: settingsRow.guild_id,
+        settings: settingsRow,
+        licenseStatus: accountLicenseRuntime.licenseStatus,
+        licenseUsable: accountLicenseRuntime.licenseUsable,
+        latestCoverage: accountLicenseRuntime.latestCoverage,
+        isConfigured: Boolean(
+          settingsRow.panel_channel_id &&
+            Array.isArray(settingsRow.verified_role_ids) &&
+            settingsRow.verified_role_ids.length,
+        ),
+      };
+    })
+    .filter((runtime) => runtime.settings);
+}
+
+async function getConfiguredCaptchaGuildRuntimes() {
+  return loadConfiguredCaptchaGuildRuntimes();
+}
+
+async function updateGuildCaptchaPanelMessageId(guildId, panelMessageId) {
+  const result = await supabase
+    .from(CAPTCHA_SETTINGS_TABLE)
+    .update({
+      panel_message_id: panelMessageId || null,
+    })
+    .eq("guild_id", guildId)
+    .select("guild_id, panel_message_id")
+    .single();
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(CAPTCHA_SETTINGS_TABLE)) {
+      return null;
+    }
+    return unwrap(result, "updateGuildCaptchaPanelMessageId");
+  }
+
+  return result.data;
+}
+
 module.exports = {
   deleteSecurityLogQueueItem,
   enqueueSecurityLogQueueItem,
@@ -1773,6 +1965,7 @@ module.exports = {
   getDueSecurityLogQueueItems,
   getDueTicketDirectMessages,
   getConfiguredTicketGuildRuntimes,
+  getConfiguredCaptchaGuildRuntimes,
   getGuildAntiLinkRuntime,
   getGuildAntiLinkSettings,
   getGuildAutoRoleRuntime,
@@ -1786,6 +1979,12 @@ module.exports = {
   getTicketAiSuggestionSession,
   getRecentTicketAiMessages,
   getGuildWelcomeRuntime,
+  getGuildCaptchaRuntime,
+  getGuildCaptchaSettings,
+  createGuildCaptchaSession,
+  getGuildCaptchaSession,
+  deleteGuildCaptchaSession,
+  updateGuildCaptchaPanelMessageId,
   getLastTicketForUser,
   getOpenTicketByChannel,
   getOpenTicketCount,

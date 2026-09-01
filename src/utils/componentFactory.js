@@ -93,7 +93,45 @@ function sanitizeSeparatorSpacing(value) {
   return "md";
 }
 
-function sanitizeAccentColor(value) {
+function sanitizeButtonEmoji(value) {
+  if (typeof value !== "string") return "";
+  return value.trim().slice(0, 120);
+}
+
+function parseButtonEmojiMarkup(value) {
+  const normalized = sanitizeButtonEmoji(value);
+  if (!normalized) return null;
+
+  const customMatch = normalized.match(/^<(a?):([a-zA-Z0-9_]+):(\d{17,20})>$/);
+  if (customMatch) {
+    return {
+      kind: "custom",
+      animated: customMatch[1] === "a",
+      name: customMatch[2],
+      id: customMatch[3],
+    };
+  }
+
+  return {
+    kind: "unicode",
+    name: normalized,
+  };
+}
+
+function buildDiscordButtonEmojiPayload(value) {
+  const parsed = parseButtonEmojiMarkup(value);
+  if (!parsed) return undefined;
+
+  if (parsed.kind === "custom") {
+    return {
+      id: parsed.id,
+      name: parsed.name,
+      animated: parsed.animated,
+    };
+  }
+
+  return { name: parsed.name };
+}
   const normalized = trimText(value);
   if (!normalized) return "";
   return /^#(?:[0-9a-fA-F]{6})$/.test(normalized) ? normalized : "";
@@ -123,13 +161,14 @@ function createDefaultTicketPanelLayout(legacy) {
       type: "separator",
       spacing: "md",
     },
-    {
-      id: "button_default",
-      type: "button",
-      label: buttonLabel,
-      style: "primary",
-      disabled: false,
-    },
+        {
+          id: "button_default",
+          type: "button",
+          label: buttonLabel,
+          emoji: "",
+          style: "primary",
+          disabled: false,
+        },
   ];
 }
 
@@ -171,6 +210,7 @@ function normalizeContentAccessory(value) {
     return {
       type: "link_button",
       label: getCandidateString(value, "label", "Abrir link", 80),
+      emoji: sanitizeButtonEmoji(value.emoji),
       url: getCandidateString(value, "url", "https://flowdesk.com.br", 1000),
     };
   }
@@ -179,6 +219,7 @@ function normalizeContentAccessory(value) {
     return {
       type: "button",
       label: getCandidateString(value, "label", "Acao", 80),
+      emoji: sanitizeButtonEmoji(value.emoji),
       style: sanitizeButtonStyle(value.style),
       disabled: Boolean(value.disabled),
     };
@@ -246,6 +287,7 @@ function normalizeNonContainerComponent(value, legacy) {
           DEFAULT_TICKET_PANEL_BUTTON_LABEL,
           80,
         ),
+        emoji: sanitizeButtonEmoji(value.emoji),
         style: sanitizeButtonStyle(value.style),
         disabled: Boolean(value.disabled),
       };
@@ -254,6 +296,7 @@ function normalizeNonContainerComponent(value, legacy) {
         id: trimText(value.id) || "link_runtime",
         type,
         label: getCandidateString(value, "label", "Abrir link", 80),
+        emoji: sanitizeButtonEmoji(value.emoji),
         url: getCandidateString(value, "url", "https://flowdesk.com.br", 1000),
       };
     case "select":
@@ -514,6 +557,7 @@ function buildTextDisplay(content) {
 function buildButton(component, state, options = {}) {
   const customId = trimText(options.customId) || CUSTOM_IDS.openTicket;
   const disableNonLink = Boolean(options.disableNonLink);
+  const emoji = buildDiscordButtonEmojiPayload(component.emoji);
 
   if (component.type === "link_button") {
     return {
@@ -521,6 +565,7 @@ function buildButton(component, state, options = {}) {
       style: BUTTON_STYLE.LINK,
       label: trimText(component.label) || "Abrir link",
       url: trimText(component.url) || "https://flowdesk.com.br",
+      ...(emoji ? { emoji } : {}),
     };
   }
 
@@ -531,6 +576,7 @@ function buildButton(component, state, options = {}) {
     style: resolveButtonStyle(component.style),
     label: trimText(component.label) || DEFAULT_TICKET_PANEL_BUTTON_LABEL,
     disabled: disableNonLink || Boolean(component.disabled),
+    ...(emoji ? { emoji } : {}),
   };
 }
 
@@ -822,6 +868,105 @@ function buildTicketPanelPayload({ settings, title, description, buttonLabel }) 
   return {
     flags: MESSAGE_FLAG_IS_COMPONENTS_V2,
     components,
+    allowedMentions: { parse: [] },
+  };
+}
+
+function buildCaptchaPanelPayload({ settings, title, description, buttonLabel }) {
+  const legacy = {
+    panelTitle:
+      trimText(settings?.panel_title) ||
+      trimText(title) ||
+      "Iniciar captcha",
+    panelDescription:
+      trimText(settings?.panel_description) ||
+      trimText(description) ||
+      "Complete a verificacao abaixo para liberar o acesso aos canais.",
+    panelButtonLabel:
+      trimText(settings?.panel_button_label) ||
+      trimText(buttonLabel) ||
+      "Iniciar captcha",
+  };
+
+  const layout = normalizeTicketPanelLayout(settings?.panel_layout, legacy);
+  const derived = deriveLegacyFromLayout(layout, legacy);
+  const state = { hasInteractiveOpenAction: false };
+  const actionOptions = { customId: CUSTOM_IDS.startCaptcha };
+  const components = buildComponentList(layout, state, actionOptions);
+
+  if (!state.hasInteractiveOpenAction) {
+    components.push({
+      type: COMPONENT_TYPE.ACTION_ROW,
+      components: [
+        {
+          type: COMPONENT_TYPE.BUTTON,
+          custom_id: CUSTOM_IDS.startCaptcha,
+          style: BUTTON_STYLE.PRIMARY,
+          label: derived.panelButtonLabel || "Iniciar captcha",
+        },
+      ],
+    });
+  }
+
+  return {
+    flags: MESSAGE_FLAG_IS_COMPONENTS_V2,
+    components,
+    allowedMentions: { parse: [] },
+  };
+}
+
+function buildCaptchaChallengePayload({
+  title,
+  description,
+  attachmentName,
+  options,
+}) {
+  const safeTitle = trimText(title) || "Verificacao de seguranca";
+  const safeDescription =
+    trimText(description) ||
+    "Selecione o codigo que aparece na imagem acima.";
+  const safeOptions = Array.isArray(options) ? options.slice(0, 5) : [];
+
+  return {
+    flags: MESSAGE_FLAG_IS_COMPONENTS_V2 | MessageFlags.Ephemeral,
+    components: [
+      {
+        type: COMPONENT_TYPE.CONTAINER,
+        accent_color: 0x0062ff,
+        components: [
+          {
+            type: COMPONENT_TYPE.TEXT_DISPLAY,
+            content: [`### ${safeTitle}`, safeDescription].join("\n\n"),
+          },
+          {
+            type: COMPONENT_TYPE.MEDIA_GALLERY,
+            items: [
+              {
+                media: {
+                  url: `attachment://${trimText(attachmentName) || "captcha.png"}`,
+                },
+              },
+            ],
+          },
+        ],
+      },
+      {
+        type: COMPONENT_TYPE.ACTION_ROW,
+        components: [
+          {
+            type: COMPONENT_TYPE.STRING_SELECT,
+            custom_id: CUSTOM_IDS.verifyCaptcha,
+            placeholder: "Escolha o codigo correto",
+            min_values: 1,
+            max_values: 1,
+            options: safeOptions.map((code) => ({
+              label: String(code),
+              value: String(code),
+            })),
+          },
+        ],
+      },
+    ],
     allowedMentions: { parse: [] },
   };
 }
@@ -1332,6 +1477,8 @@ function buildAiSuggestionPayload({ suggestion, guildName }) {
 
 module.exports = {
   buildTicketPanelPayload,
+  buildCaptchaPanelPayload,
+  buildCaptchaChallengePayload,
   buildWelcomeMessagePayload,
   buildTicketSimpleMessagePayload,
   buildTicketSystemDisabledPayload,
