@@ -218,13 +218,15 @@ async function handleCaptchaVerifyInteraction(interaction) {
       client: interaction.client,
     });
 
+    const successPayload = buildCaptchaSuccessPayload(
+      String(settings.success_message || "").trim() ||
+        "Verificacao concluida com sucesso. Bem-vindo ao servidor!",
+    );
+
     await interaction.update({
-      ...buildCaptchaSuccessPayload(
-        settings.success_message ||
-          "Verificacao concluida com sucesso. Bem-vindo ao servidor!",
-      ),
+      ...successPayload,
+      flags: successPayload.flags | MessageFlags.Ephemeral,
       files: [],
-      components: [],
     });
     return;
   }
@@ -240,12 +242,14 @@ async function handleCaptchaVerifyInteraction(interaction) {
         .catch(() => null);
     }
 
+    const exhaustedPayload = buildCaptchaFailurePayload(
+      "Voce esgotou as tentativas de verificacao. Tente novamente mais tarde.",
+    );
+
     await interaction.update({
-      ...buildCaptchaFailurePayload(
-        "Voce esgotou as tentativas de verificacao. Tente novamente mais tarde.",
-      ),
+      ...exhaustedPayload,
+      flags: exhaustedPayload.flags | MessageFlags.Ephemeral,
       files: [],
-      components: [],
     });
     return;
   }
