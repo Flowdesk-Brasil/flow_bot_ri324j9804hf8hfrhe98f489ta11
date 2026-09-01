@@ -132,6 +132,8 @@ function buildDiscordButtonEmojiPayload(value) {
 
   return { name: parsed.name };
 }
+
+function sanitizeAccentColor(value) {
   const normalized = trimText(value);
   if (!normalized) return "";
   return /^#(?:[0-9a-fA-F]{6})$/.test(normalized) ? normalized : "";
