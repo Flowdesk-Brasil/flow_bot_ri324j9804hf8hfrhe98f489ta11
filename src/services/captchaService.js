@@ -7,6 +7,7 @@ const { CUSTOM_IDS } = require("../constants/customIds");
 const {
   buildCaptchaChallengePayload,
   buildCaptchaResultPayload,
+  buildLogPayload,
   withEphemeralComponentsV2,
 } = require("../utils/componentFactory");
 const {
@@ -173,19 +174,21 @@ async function sendCaptchaVerificationLog({ guild, member, settings }) {
     .map((roleId) => `<@&${roleId}>`)
     .join(", ");
 
-  await channel
-    .send({
-      content: [
-        "### Membro verificado",
-        `Usuario: ${member} (\`${member.id}\`)`,
-        roleMentions ? `Cargos: ${roleMentions}` : "Cargos: nenhum configurado",
-        `Horario: <t:${Math.floor(Date.now() / 1000)}:F>`,
-      ].join("\n"),
-      allowedMentions: { parse: [] },
-    })
-    .catch((error) => {
-      console.error("[captcha-log]", error);
-    });
+  const payload = buildLogPayload({
+    accentColor: 0x2ecc71,
+    title: "Membro verificado",
+    lines: [
+      `**Usuario:** ${member} (\`${member.id}\`)`,
+      roleMentions
+        ? `**Cargos:** ${roleMentions}`
+        : "**Cargos:** nenhum configurado",
+      `**Horario:** <t:${Math.floor(Date.now() / 1000)}:F>`,
+    ],
+  });
+
+  await channel.send(payload).catch((error) => {
+    console.error("[captcha-log]", error);
+  });
 }
 
 async function assignVerifiedRoles(guild, memberRef, roleIds = []) {
