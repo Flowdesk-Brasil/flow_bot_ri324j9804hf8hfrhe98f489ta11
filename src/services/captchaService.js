@@ -1,6 +1,7 @@
 const {
   AttachmentBuilder,
   MessageFlags,
+  PermissionsBitField,
 } = require("discord.js");
 const { CUSTOM_IDS } = require("../constants/customIds");
 const {
@@ -11,6 +12,7 @@ const {
 const {
   generateCaptchaCode,
   generateCaptchaOptions,
+  normalizeCaptchaCode,
   renderCaptchaImage,
 } = require("./captchaImageGenerator");
 const {
@@ -22,15 +24,38 @@ const {
 
 const CAPTCHA_ATTACHMENT_NAME = "captcha-code.png";
 const DEFAULT_CHALLENGE_DESCRIPTION =
-  "Selecione o codigo que aparece na imagem acima.";
+  "Selecione o codigo (letras e numeros) que aparece na imagem acima.";
 const DEFAULT_SUCCESS_MESSAGE =
   "Verificacao concluida com sucesso. Bem-vindo ao servidor!";
 
+function normalizeRoleIds(value) {
+  if (!value) return [];
+  const raw = Array.isArray(value) ? value : [value];
+  return raw.map((roleId) => String(roleId || "").trim()).filter(Boolean);
+}
+
 function memberHasAnyRole(member, roleIds = []) {
-  if (!member?.roles?.cache || !Array.isArray(roleIds) || !roleIds.length) {
+  const normalizedRoleIds = normalizeRoleIds(roleIds);
+  if (!member?.roles?.cache || !normalizedRoleIds.length) {
     return false;
   }
-  return roleIds.some((roleId) => member.roles.cache.has(roleId));
+  return normalizedRoleIds.some((roleId) => member.roles.cache.has(roleId));
+}
+
+async function resolveGuildMember(guild, memberRef) {
+  if (!guild) return null;
+
+  const userId =
+    typeof memberRef === "string"
+      ? memberRef
+      : memberRef?.id || memberRef?.user?.id;
+
+  if (!userId) return null;
+
+  const cachedMember = guild.members.cache.get(userId);
+  if (cachedMember) return cachedMember;
+
+  return guild.members.fetch(userId).catch(() => null);
 }
 
 function buildCaptchaFailureResult(message) {
@@ -143,9 +168,7 @@ async function sendCaptchaVerificationLog({ guild, member, settings }) {
 
   if (!channel || !channel.isTextBased()) return;
 
-  const verifiedRoles = Array.isArray(settings.verified_role_ids)
-    ? settings.verified_role_ids
-    : [];
+  const verifiedRoles = normalizeRoleIds(settings.verified_role_ids);
   const roleMentions = verifiedRoles
     .map((roleId) => `<@&${roleId}>`)
     .join(", ");
@@ -165,18 +188,80 @@ async function sendCaptchaVerificationLog({ guild, member, settings }) {
     });
 }
 
-async function assignVerifiedRoles(member, roleIds = []) {
-  if (!member?.manageable || !Array.isArray(roleIds) || !roleIds.length) {
-    return;
+async function assignVerifiedRoles(guild, memberRef, roleIds = []) {
+  const normalizedRoleIds = normalizeRoleIds(roleIds);
+  if (!normalizedRoleIds.length) {
+    return { ok: false, reason: "no_roles_configured", added: [] };
   }
 
-  const assignableRoleIds = roleIds.filter((roleId) => {
-    const role = member.guild.roles.cache.get(roleId);
-    return Boolean(role && role.editable);
+  const member = await resolveGuildMember(guild, memberRef);
+  if (!member) {
+    return { ok: false, reason: "member_not_found", added: [] };
+  }
+
+  const me =
+    guild.members.me || (await guild.members.fetchMe().catch(() => null));
+  if (!me?.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
+    console.error("[captcha-roles] bot sem permissao ManageRoles");
+    return { ok: false, reason: "missing_manage_roles", added: [] };
+  }
+
+  await guild.roles.fetch().catch(() => null);
+
+  const assignableRoleIds = normalizedRoleIds.filter((roleId) => {
+    if (roleId === guild.id) return false;
+    const role = guild.roles.cache.get(roleId);
+    if (!role || role.managed) return false;
+    if (!me.roles?.highest) return false;
+    return me.roles.highest.comparePositionTo(role) > 0;
   });
 
-  if (!assignableRoleIds.length) return;
-  await member.roles.add(assignableRoleIds, "Captcha verificado").catch(() => null);
+  if (!assignableRoleIds.length) {
+    console.error("[captcha-roles] nenhum cargo atribuivel", {
+      guildId: guild.id,
+      configuredRoleIds: normalizedRoleIds,
+      botHighestRole: me.roles?.highest?.id || null,
+    });
+    return { ok: false, reason: "no_assignable_roles", added: [] };
+  }
+
+  const missingRoleIds = assignableRoleIds.filter(
+    (roleId) => !member.roles.cache.has(roleId),
+  );
+
+  if (!missingRoleIds.length) {
+    return { ok: true, reason: "already_has_roles", added: [] };
+  }
+
+  try {
+    await member.roles.add(missingRoleIds, "Captcha verificado");
+    return { ok: true, reason: "added", added: missingRoleIds };
+  } catch (error) {
+    console.error("[captcha-roles] falha ao adicionar cargo", error);
+    return {
+      ok: false,
+      reason: "add_failed",
+      added: [],
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function buildRoleAssignmentNotice(roleResult) {
+  if (!roleResult || roleResult.ok) return "";
+
+  switch (roleResult.reason) {
+    case "no_roles_configured":
+      return "Nenhum cargo de verificado esta configurado no painel.";
+    case "missing_manage_roles":
+      return "O bot nao tem permissao de **Gerenciar cargos**.";
+    case "no_assignable_roles":
+      return "O cargo de verificado esta acima do cargo do bot ou e invalido.";
+    case "add_failed":
+      return "Nao foi possivel aplicar o cargo automaticamente. Contate a equipe.";
+    default:
+      return "Nao foi possivel aplicar o cargo de verificado.";
+  }
 }
 
 async function handleCaptchaStartInteraction(interaction) {
@@ -197,12 +282,8 @@ async function handleCaptchaStartInteraction(interaction) {
   }
 
   const member = interaction.member;
-  const verifiedRoleIds = Array.isArray(settings.verified_role_ids)
-    ? settings.verified_role_ids
-    : [];
-  const bypassRoleIds = Array.isArray(settings.bypass_role_ids)
-    ? settings.bypass_role_ids
-    : [];
+  const verifiedRoleIds = normalizeRoleIds(settings.verified_role_ids);
+  const bypassRoleIds = normalizeRoleIds(settings.bypass_role_ids);
 
   if (memberHasAnyRole(member, verifiedRoleIds)) {
     await replyCaptchaMessage(
@@ -213,7 +294,7 @@ async function handleCaptchaStartInteraction(interaction) {
   }
 
   if (memberHasAnyRole(member, bypassRoleIds)) {
-    await assignVerifiedRoles(member, verifiedRoleIds);
+    await assignVerifiedRoles(interaction.guild, member, verifiedRoleIds);
     await replyCaptchaMessage(
       interaction,
       buildCaptchaSuccessResult(
@@ -223,7 +304,7 @@ async function handleCaptchaStartInteraction(interaction) {
     return;
   }
 
-  const correctCode = generateCaptchaCode(6);
+  const correctCode = generateCaptchaCode();
   const optionCodes = generateCaptchaOptions(correctCode, 5);
   const expiresAt = new Date(
     Date.now() + Math.max(30, Number(settings.timeout_seconds || 120)) * 1000,
@@ -274,7 +355,7 @@ async function handleCaptchaVerifyInteraction(interaction) {
       return;
     }
 
-    const selectedCode = String(interaction.values?.[0] || "").trim();
+    const selectedCode = normalizeCaptchaCode(interaction.values?.[0]);
     const session = await getGuildCaptchaSession(guildId, interaction.user.id);
 
     if (!session) {
@@ -298,22 +379,33 @@ async function handleCaptchaVerifyInteraction(interaction) {
       return;
     }
 
-    const correctCode = String(session.correct_code || "").trim();
+    const correctCode = normalizeCaptchaCode(session.correct_code);
 
     if (selectedCode && selectedCode === correctCode) {
       await deleteGuildCaptchaSession(guildId, interaction.user.id);
-      await assignVerifiedRoles(interaction.member, settings.verified_role_ids);
+      const roleResult = await assignVerifiedRoles(
+        interaction.guild,
+        interaction.user.id,
+        settings.verified_role_ids,
+      );
       await sendCaptchaVerificationLog({
         guild: interaction.guild,
-        member: interaction.member,
+        member:
+          (await resolveGuildMember(interaction.guild, interaction.user.id)) ||
+          interaction.member,
         settings,
       });
 
+      let successMessage =
+        String(settings.success_message || "").trim() || DEFAULT_SUCCESS_MESSAGE;
+      const roleNotice = buildRoleAssignmentNotice(roleResult);
+      if (roleNotice) {
+        successMessage = `${successMessage}\n\n${roleNotice}`;
+      }
+
       await replaceCaptchaVerifyMessage(
         interaction,
-        buildCaptchaSuccessResult(
-          String(settings.success_message || "").trim() || DEFAULT_SUCCESS_MESSAGE,
-        ),
+        buildCaptchaSuccessResult(successMessage),
       );
       return;
     }
@@ -341,7 +433,7 @@ async function handleCaptchaVerifyInteraction(interaction) {
       return;
     }
 
-    const nextCorrectCode = generateCaptchaCode(6);
+    const nextCorrectCode = generateCaptchaCode();
     const nextOptionCodes = generateCaptchaOptions(nextCorrectCode, 5);
     const expiresAt = new Date(
       Date.now() + Math.max(30, Number(settings.timeout_seconds || 120)) * 1000,
