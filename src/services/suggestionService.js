@@ -16,6 +16,10 @@ const {
 const {
   createGuildSuggestion,
   getGuildSuggestionById,
+  getGuildSuggestionByMessageId,
+  getOpenGuildSuggestionByMessageId,
+  getGuildSuggestionByThreadId,
+  closeGuildSuggestionAsRemoved,
   getGuildSuggestionsRuntime,
   getGuildSuggestionVotes,
   updateGuildSuggestionMessageIds,
@@ -518,6 +522,241 @@ function isSuggestionDetailsInteraction(interaction) {
   return Boolean(parsed && parsed.voteType === "details");
 }
 
+async function resolveMessageDeleteContext(message, client, fallbackChannel = null) {
+  const messageId = message?.id;
+  if (!messageId) {
+    return null;
+  }
+
+  const discordClient = message?.client || client;
+  if (!discordClient) {
+    return null;
+  }
+
+  let guild =
+    message.guild ||
+    message.channel?.guild ||
+    fallbackChannel?.guild ||
+    null;
+  let channelId =
+    message.channelId ||
+    message.channel?.id ||
+    fallbackChannel?.id ||
+    null;
+
+  if (!guild && channelId) {
+    const channel = await discordClient.channels.fetch(channelId).catch(() => null);
+    if (channel?.guild) {
+      guild = channel.guild;
+      channelId = channel.id;
+    } else if (channel?.guildId) {
+      guild = await discordClient.guilds.fetch(channel.guildId).catch(() => null);
+      channelId = channel.id;
+    }
+  }
+
+  if (!guild && message.guildId) {
+    guild = await discordClient.guilds.fetch(message.guildId).catch(() => null);
+  }
+
+  if (!guild) {
+    return {
+      guild: null,
+      messageId,
+      channelId,
+      client: discordClient,
+    };
+  }
+
+  return {
+    guild,
+    messageId,
+    channelId,
+    client: discordClient,
+  };
+}
+
+async function collectSuggestionDiscussionThreadIds(
+  guild,
+  channelId,
+  messageId,
+  knownThreadId = null,
+) {
+  const threadIds = new Set();
+
+  if (knownThreadId) {
+    threadIds.add(String(knownThreadId));
+  }
+
+  if (!guild || !channelId || !messageId) {
+    return [...threadIds];
+  }
+
+  const channel = await guild.channels.fetch(channelId).catch(() => null);
+  if (!channel?.threads?.fetchActive) {
+    return [...threadIds];
+  }
+
+  const collectFrom = (collection) => {
+    for (const thread of collection?.threads?.values?.() || []) {
+      if (String(thread.parentId || "") === String(messageId)) {
+        threadIds.add(thread.id);
+      }
+    }
+  };
+
+  try {
+    collectFrom(await channel.threads.fetchActive());
+  } catch (error) {
+    console.error("[suggestion-thread-lookup:active]", error);
+  }
+
+  try {
+    let before;
+    for (let page = 0; page < 5; page += 1) {
+      const archived = await channel.threads.fetchArchived({ limit: 100, before });
+      collectFrom(archived);
+      if (!archived?.hasMore || archived.threads.size === 0) {
+        break;
+      }
+      before = archived.threads.last()?.id;
+    }
+  } catch (error) {
+    console.error("[suggestion-thread-lookup:archived]", error);
+  }
+
+  return [...threadIds];
+}
+
+async function deleteSuggestionThreads(
+  guild,
+  channelId,
+  messageId,
+  knownThreadId,
+  reason,
+) {
+  if (!guild) return;
+
+  const threadIds = await collectSuggestionDiscussionThreadIds(
+    guild,
+    channelId,
+    messageId,
+    knownThreadId,
+  );
+
+  for (const threadId of threadIds) {
+    const threadChannel = await guild.channels.fetch(threadId).catch(() => null);
+    if (!threadChannel?.isThread?.()) {
+      continue;
+    }
+
+    const deleted = await threadChannel.delete(reason).catch((error) => {
+      console.error("[suggestion-thread-delete]", { threadId, error });
+      return null;
+    });
+
+    if (!deleted) {
+      await guild.client.rest
+        .delete(`/channels/${threadId}`)
+        .catch((error) => {
+          console.error("[suggestion-thread-delete:rest]", { threadId, error });
+        });
+    }
+  }
+}
+
+async function suggestionPublishMessageExists(guild, suggestion) {
+  if (!guild || !suggestion?.message_id || !suggestion?.publish_channel_id) {
+    return false;
+  }
+
+  const channel = await guild.channels.fetch(suggestion.publish_channel_id).catch(() => null);
+  if (!channel?.isTextBased?.()) {
+    return false;
+  }
+
+  const message = await channel.messages.fetch(suggestion.message_id).catch(() => null);
+  return Boolean(message);
+}
+
+async function reconcileDeletedSuggestionMessage(message, client, fallbackChannel = null) {
+  const context = await resolveMessageDeleteContext(message, client, fallbackChannel);
+  const messageId = context?.messageId || message?.id;
+
+  if (!messageId) {
+    return null;
+  }
+
+  const discordClient = context?.client || message?.client || client;
+  if (!discordClient) {
+    return null;
+  }
+
+  let suggestion = context?.guild
+    ? await getGuildSuggestionByMessageId(context.guild.id, messageId)
+    : null;
+
+  if (!suggestion) {
+    suggestion = await getOpenGuildSuggestionByMessageId(messageId);
+  }
+
+  if (!suggestion || suggestion.status !== "open") {
+    return null;
+  }
+
+  const guild =
+    context?.guild ||
+    (await discordClient.guilds.fetch(suggestion.guild_id).catch(() => null));
+
+  if (!guild) {
+    console.warn("[suggestion:messageDelete] guild indisponivel", {
+      messageId,
+      suggestionId: suggestion.id,
+      guildId: suggestion.guild_id,
+    });
+    await closeGuildSuggestionAsRemoved(suggestion.id);
+    return suggestion;
+  }
+
+  const channelId = context?.channelId || suggestion.publish_channel_id;
+
+  await deleteSuggestionThreads(
+    guild,
+    channelId,
+    messageId,
+    suggestion.thread_id,
+    "Embed da sugestao removida manualmente",
+  );
+
+  const closedSuggestion = await closeGuildSuggestionAsRemoved(suggestion.id);
+  console.info("[suggestion:messageDelete] sugestao reconciliada", {
+    messageId,
+    suggestionId: suggestion.id,
+    threadId: suggestion.thread_id || null,
+    channelId: channelId || null,
+  });
+
+  return closedSuggestion;
+}
+
+async function reconcileDeletedSuggestionThread(guild, threadId) {
+  if (!guild?.id || !threadId) {
+    return null;
+  }
+
+  const suggestion = await getGuildSuggestionByThreadId(guild.id, threadId);
+  if (!suggestion || suggestion.status !== "open") {
+    return null;
+  }
+
+  const publishMessageStillExists = await suggestionPublishMessageExists(guild, suggestion);
+  if (!publishMessageStillExists) {
+    return closeGuildSuggestionAsRemoved(suggestion.id);
+  }
+
+  return updateGuildSuggestionMessageIds(suggestion.id, { threadId: null });
+}
+
 module.exports = {
   showSuggestionModal,
   handleSuggestionModalSubmit,
@@ -529,4 +768,6 @@ module.exports = {
   isSuggestionDetailsInteraction,
   sendSuggestionSubmissionLog,
   sendSuggestionVoteLog,
+  reconcileDeletedSuggestionMessage,
+  reconcileDeletedSuggestionThread,
 };

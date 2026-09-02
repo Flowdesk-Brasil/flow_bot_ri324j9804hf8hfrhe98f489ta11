@@ -1,5 +1,6 @@
 const { ChannelType } = require("discord.js");
 const { reconcileDeletedTicketChannel } = require("../services/ticketService");
+const { reconcileDeletedSuggestionThread } = require("../services/suggestionService");
 
 module.exports = {
   name: "channelDelete",
@@ -18,8 +19,15 @@ module.exports = {
       }
 
       await reconcileDeletedTicketChannel(channel.guild.id, channel.id);
+
+      if (
+        channel.type === ChannelType.PublicThread ||
+        channel.type === ChannelType.PrivateThread
+      ) {
+        await reconcileDeletedSuggestionThread(channel.guild, channel.id);
+      }
     } catch (error) {
-      console.error("[channelDelete] Falha ao reconciliar ticket deletado", {
+      console.error("[channelDelete] Falha ao reconciliar canal deletado", {
         guildId: channel?.guild?.id || null,
         channelId: channel?.id || null,
         error,

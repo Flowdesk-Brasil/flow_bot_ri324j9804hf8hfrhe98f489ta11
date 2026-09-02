@@ -2121,6 +2121,114 @@ async function getGuildSuggestionById(suggestionId) {
   return result.data;
 }
 
+async function getGuildSuggestionByMessageId(guildId, messageId) {
+  if (!guildId || !messageId) {
+    return null;
+  }
+
+  const result = await supabase
+    .from(SUGGESTIONS_TABLE)
+    .select(
+      "id, guild_id, author_user_id, title, body, status, publish_channel_id, message_id, thread_id, yes_votes, no_votes, created_at, updated_at",
+    )
+    .eq("guild_id", guildId)
+    .eq("message_id", String(messageId))
+    .maybeSingle();
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(SUGGESTIONS_TABLE)) {
+      return null;
+    }
+    return unwrap(result, "getGuildSuggestionByMessageId");
+  }
+
+  return result.data;
+}
+
+async function getOpenGuildSuggestionByMessageId(messageId) {
+  if (!messageId) {
+    return null;
+  }
+
+  const result = await supabase
+    .from(SUGGESTIONS_TABLE)
+    .select(
+      "id, guild_id, author_user_id, title, body, status, publish_channel_id, message_id, thread_id, yes_votes, no_votes, created_at, updated_at",
+    )
+    .eq("message_id", String(messageId))
+    .eq("status", "open")
+    .maybeSingle();
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(SUGGESTIONS_TABLE)) {
+      return null;
+    }
+    return unwrap(result, "getOpenGuildSuggestionByMessageId");
+  }
+
+  return result.data;
+}
+
+async function getGuildSuggestionByThreadId(guildId, threadId) {
+  if (!guildId || !threadId) {
+    return null;
+  }
+
+  const result = await supabase
+    .from(SUGGESTIONS_TABLE)
+    .select(
+      "id, guild_id, author_user_id, title, body, status, publish_channel_id, message_id, thread_id, yes_votes, no_votes, created_at, updated_at",
+    )
+    .eq("guild_id", guildId)
+    .eq("thread_id", threadId)
+    .maybeSingle();
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(SUGGESTIONS_TABLE)) {
+      return null;
+    }
+    return unwrap(result, "getGuildSuggestionByThreadId");
+  }
+
+  return result.data;
+}
+
+async function closeGuildSuggestionAsRemoved(suggestionId) {
+  if (!suggestionId) {
+    return null;
+  }
+
+  const result = await supabase
+    .from(SUGGESTIONS_TABLE)
+    .update({
+      status: "closed",
+      message_id: null,
+      thread_id: null,
+    })
+    .eq("id", suggestionId)
+    .select(
+      "id, guild_id, author_user_id, title, body, status, publish_channel_id, message_id, thread_id, yes_votes, no_votes, created_at, updated_at",
+    )
+    .maybeSingle();
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(SUGGESTIONS_TABLE)) {
+      return null;
+    }
+    return unwrap(result, "closeGuildSuggestionAsRemoved");
+  }
+
+  return result.data;
+}
+
 async function updateGuildSuggestionMessageIds(suggestionId, input = {}) {
   const payload = {};
   if (input.messageId !== undefined) payload.message_id = input.messageId || null;
@@ -2307,6 +2415,10 @@ module.exports = {
   updateGuildSuggestionsPanelMessageId,
   createGuildSuggestion,
   getGuildSuggestionById,
+  getGuildSuggestionByMessageId,
+  getOpenGuildSuggestionByMessageId,
+  getGuildSuggestionByThreadId,
+  closeGuildSuggestionAsRemoved,
   updateGuildSuggestionMessageIds,
   upsertGuildSuggestionVote,
   getGuildSuggestionVotes,
