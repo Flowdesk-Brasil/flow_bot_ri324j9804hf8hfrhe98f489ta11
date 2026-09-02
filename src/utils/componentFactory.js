@@ -60,6 +60,18 @@ function stripMarkdownDecorators(value) {
     .trim();
 }
 
+function sanitizeLegacyPanelPlainText(value) {
+  return String(value || "")
+    .replace(/<a?:\w+:\d+>/g, " ")
+    .replace(/<@!?\d+>/g, " ")
+    .replace(/<@&\d+>/g, " ")
+    .replace(/<#\d+>/g, " ")
+    .replace(/<t:\d+(?::[tTdD])?>/g, " ")
+    .replace(/[<>]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function getCandidateString(candidate, key, fallback, maxLength) {
   if (typeof candidate?.[key] === "string") {
     return clampText(candidate[key], maxLength);
@@ -901,13 +913,20 @@ function deriveLegacyFromLayout(layout, legacy) {
     .filter(Boolean);
 
   const firstMeaningfulLine = markdownLines[0] || "";
-  const titleCandidate = stripMarkdownDecorators(firstMeaningfulLine);
-  const descriptionCandidate = markdownLines
-    .slice(1)
-    .map((line) => stripMarkdownDecorators(line))
-    .filter(Boolean)
-    .join("\n")
-    .trim();
+  const titleCandidate = sanitizeLegacyPanelPlainText(
+    stripMarkdownDecorators(firstMeaningfulLine),
+  );
+  const descriptionCandidate = sanitizeLegacyPanelPlainText(
+    markdownLines
+      .slice(1)
+      .map((line) => stripMarkdownDecorators(line))
+      .filter(Boolean)
+      .join("\n")
+      .trim(),
+  );
+  const buttonLabelCandidate = sanitizeLegacyPanelPlainText(
+    (firstAction && (firstAction.placeholder || firstAction.label)) || "",
+  );
 
   return {
     panelTitle: clampText(
@@ -921,7 +940,7 @@ function deriveLegacyFromLayout(layout, legacy) {
       400,
     ),
     panelButtonLabel: clampText(
-      (firstAction && (firstAction.placeholder || firstAction.label)) ||
+      buttonLabelCandidate ||
         legacy?.panelButtonLabel ||
         DEFAULT_TICKET_PANEL_BUTTON_LABEL,
       40,
@@ -1466,6 +1485,19 @@ function buildSuggestionVoteCustomId(type, suggestionId) {
   return `suggestion:vote:${type}:${suggestionId}`;
 }
 
+function buildSuggestionDetailsVoteButton(suggestionId) {
+  return {
+    type: COMPONENT_TYPE.BUTTON,
+    custom_id: buildSuggestionVoteCustomId("details", suggestionId),
+    style: BUTTON_STYLE.SECONDARY,
+    emoji: {
+      id: "1539833029717917746",
+      name: "animated_settings",
+      animated: true,
+    },
+  };
+}
+
 function formatSuggestionPublishedBody(body) {
   const safe = trimText(body);
   if (!safe) {
@@ -1586,7 +1618,6 @@ function buildPublishedSuggestionPayload({
   const noLabel =
     voteLabels?.no ||
     `❌ ${noVotes} ${noVotes === 1 ? "voto" : "votos"} | (${formatVotePercentage(noVotes, totalVotes)}%)`;
-  const detailsLabel = voteLabels?.details || "?";
 
   const suggestionId = suggestion?.id;
   const tokenMap = {
@@ -1630,12 +1661,7 @@ function buildPublishedSuggestionPayload({
           style: BUTTON_STYLE.DANGER,
           label: clampText(noLabel, 80),
         },
-        {
-          type: COMPONENT_TYPE.BUTTON,
-          custom_id: buildSuggestionVoteCustomId("details", suggestionId),
-          style: BUTTON_STYLE.SECONDARY,
-          label: clampText(detailsLabel, 80),
-        },
+        buildSuggestionDetailsVoteButton(suggestionId),
       ],
     });
 
@@ -1683,12 +1709,7 @@ function buildPublishedSuggestionPayload({
             style: BUTTON_STYLE.DANGER,
             label: clampText(noLabel, 80),
           },
-          {
-            type: COMPONENT_TYPE.BUTTON,
-            custom_id: buildSuggestionVoteCustomId("details", suggestionId),
-            style: BUTTON_STYLE.SECONDARY,
-            label: clampText(detailsLabel, 80),
-          },
+          buildSuggestionDetailsVoteButton(suggestionId),
         ],
       },
     ],
