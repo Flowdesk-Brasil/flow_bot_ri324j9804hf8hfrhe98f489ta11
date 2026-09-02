@@ -36,6 +36,16 @@ const {
   isCaptchaSelectInteraction,
 } = require("../services/captchaService");
 const {
+  showSuggestionModal,
+  handleSuggestionModalSubmit,
+  handleSuggestionVoteInteraction,
+  handleSuggestionDetailsInteraction,
+  isSuggestionButtonInteraction,
+  isSuggestionModalSubmit,
+  isSuggestionVoteInteraction,
+  isSuggestionDetailsInteraction,
+} = require("../services/suggestionService");
+const {
   getGuildTicketRuntime,
 } = require("../services/supabaseService");
 const { isDiscordUserSuspended, isDiscordUserAtRisk } = require("../services/violationService");
@@ -130,6 +140,10 @@ module.exports = {
           await handleTicketModalSubmit(interaction);
           return;
         }
+        if (isSuggestionModalSubmit(interaction)) {
+          await handleSuggestionModalSubmit(interaction);
+          return;
+        }
         if (isSalesComponentInteraction(interaction)) {
           await handleSalesInteraction(interaction, client);
           return;
@@ -164,6 +178,21 @@ module.exports = {
 
       if (isCaptchaButtonInteraction(interaction)) {
         await handleCaptchaStartInteraction(interaction);
+        return;
+      }
+
+      if (isSuggestionVoteInteraction(interaction)) {
+        await handleSuggestionVoteInteraction(interaction);
+        return;
+      }
+
+      if (isSuggestionDetailsInteraction(interaction)) {
+        await handleSuggestionDetailsInteraction(interaction);
+        return;
+      }
+
+      if (isSuggestionButtonInteraction(interaction)) {
+        await showSuggestionModal(interaction);
         return;
       }
 

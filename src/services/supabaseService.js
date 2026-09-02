@@ -9,6 +9,10 @@ const TICKET_STAFF_SETTINGS_TABLE = "guild_ticket_staff_settings";
 const WELCOME_SETTINGS_TABLE = "guild_welcome_settings";
 const CAPTCHA_SETTINGS_TABLE = "guild_captcha_settings";
 const CAPTCHA_SESSIONS_TABLE = "guild_captcha_sessions";
+const SUGGESTIONS_SETTINGS_TABLE = "guild_suggestions_settings";
+const SUGGESTIONS_TABLE = "guild_suggestions";
+const SUGGESTION_VOTES_TABLE = "guild_suggestion_votes";
+const SUGGESTION_VOTE_EVENTS_TABLE = "guild_suggestion_vote_events";
 const ANTILINK_SETTINGS_TABLE = "guild_antilink_settings";
 const AUTOROLE_SETTINGS_TABLE = "guild_autorole_settings";
 const AUTOROLE_QUEUE_TABLE = "guild_autorole_queue";
@@ -34,6 +38,7 @@ const moduleRuntimeCache = {
   ticket: new Map(),
   welcome: new Map(),
   captcha: new Map(),
+  suggestions: new Map(),
   antiLink: new Map(),
   autoRole: new Map(),
   securityLogs: new Map(),
@@ -42,6 +47,7 @@ const moduleRuntimeInflight = {
   ticket: new Map(),
   welcome: new Map(),
   captcha: new Map(),
+  suggestions: new Map(),
   antiLink: new Map(),
   autoRole: new Map(),
   securityLogs: new Map(),
@@ -1953,6 +1959,316 @@ async function updateGuildCaptchaPanelMessageId(guildId, panelMessageId) {
   return result.data;
 }
 
+async function getGuildSuggestionsSettings(guildId) {
+  const result = await supabase
+    .from(SUGGESTIONS_SETTINGS_TABLE)
+    .select(
+      "guild_id, enabled, panel_channel_id, publish_channel_id, logs_channel_id, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, suggestion_layout, published_header, published_footer, thread_name_prefix, updated_at",
+    )
+    .eq("guild_id", guildId)
+    .maybeSingle();
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(SUGGESTIONS_SETTINGS_TABLE)) {
+      return null;
+    }
+    return unwrap(result, "getGuildSuggestionsSettings");
+  }
+
+  return result.data;
+}
+
+async function loadGuildSuggestionsRuntime(guildId) {
+  const [settings, accountLicenseRuntime] = await Promise.all([
+    getGuildSuggestionsSettings(guildId),
+    getGuildAccountLicenseRuntime(guildId),
+  ]);
+
+  return {
+    guildId,
+    settings: settings || null,
+    licenseStatus: accountLicenseRuntime.licenseStatus,
+    licenseUsable: accountLicenseRuntime.licenseUsable,
+    latestCoverage: accountLicenseRuntime.latestCoverage,
+    isConfigured: Boolean(
+      settings?.enabled &&
+        settings?.panel_channel_id &&
+        settings?.publish_channel_id,
+    ),
+  };
+}
+
+async function getGuildSuggestionsRuntime(guildId) {
+  return await withCachedResult(
+    moduleRuntimeCache.suggestions,
+    moduleRuntimeInflight.suggestions,
+    guildId,
+    MODULE_RUNTIME_CACHE_TTL_MS,
+    () => loadGuildSuggestionsRuntime(guildId),
+  );
+}
+
+async function loadConfiguredSuggestionsGuildRuntimes() {
+  const result = await supabase
+    .from(SUGGESTIONS_SETTINGS_TABLE)
+    .select(
+      "guild_id, enabled, panel_channel_id, publish_channel_id, logs_channel_id, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, suggestion_layout, published_header, published_footer, thread_name_prefix, updated_at",
+    )
+    .eq("enabled", true);
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(SUGGESTIONS_SETTINGS_TABLE)) {
+      return [];
+    }
+    return unwrap(result, "loadConfiguredSuggestionsGuildRuntimes");
+  }
+
+  const settingsRows = result.data || [];
+  const accountLicenseRuntimeByGuild = await getGuildAccountLicenseRuntimeMap(
+    settingsRows.map((row) => row.guild_id),
+  );
+
+  return settingsRows
+    .map((settingsRow) => {
+      const accountLicenseRuntime =
+        accountLicenseRuntimeByGuild.get(settingsRow.guild_id) || {
+          licenseStatus: "not_paid",
+          licenseUsable: false,
+          latestCoverage: null,
+        };
+
+      return {
+        guildId: settingsRow.guild_id,
+        settings: settingsRow,
+        licenseStatus: accountLicenseRuntime.licenseStatus,
+        licenseUsable: accountLicenseRuntime.licenseUsable,
+        latestCoverage: accountLicenseRuntime.latestCoverage,
+        isConfigured: Boolean(
+          settingsRow.panel_channel_id && settingsRow.publish_channel_id,
+        ),
+      };
+    })
+    .filter((runtime) => runtime.settings);
+}
+
+async function getConfiguredSuggestionsGuildRuntimes() {
+  return loadConfiguredSuggestionsGuildRuntimes();
+}
+
+async function updateGuildSuggestionsPanelMessageId(guildId, panelMessageId) {
+  const result = await supabase
+    .from(SUGGESTIONS_SETTINGS_TABLE)
+    .update({
+      panel_message_id: panelMessageId || null,
+    })
+    .eq("guild_id", guildId)
+    .select("guild_id, panel_message_id")
+    .single();
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(SUGGESTIONS_SETTINGS_TABLE)) {
+      return null;
+    }
+    return unwrap(result, "updateGuildSuggestionsPanelMessageId");
+  }
+
+  return result.data;
+}
+
+async function createGuildSuggestion(input) {
+  const result = await supabase
+    .from(SUGGESTIONS_TABLE)
+    .insert({
+      guild_id: input.guildId,
+      author_user_id: input.authorUserId,
+      title: input.title,
+      body: input.body,
+      status: input.status || "open",
+      publish_channel_id: input.publishChannelId || null,
+    })
+    .select(
+      "id, guild_id, author_user_id, title, body, status, publish_channel_id, message_id, thread_id, yes_votes, no_votes, created_at, updated_at",
+    )
+    .single();
+
+  return unwrap(result, "createGuildSuggestion");
+}
+
+async function getGuildSuggestionById(suggestionId) {
+  const result = await supabase
+    .from(SUGGESTIONS_TABLE)
+    .select(
+      "id, guild_id, author_user_id, title, body, status, publish_channel_id, message_id, thread_id, yes_votes, no_votes, created_at, updated_at",
+    )
+    .eq("id", suggestionId)
+    .maybeSingle();
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(SUGGESTIONS_TABLE)) {
+      return null;
+    }
+    return unwrap(result, "getGuildSuggestionById");
+  }
+
+  return result.data;
+}
+
+async function updateGuildSuggestionMessageIds(suggestionId, input = {}) {
+  const payload = {};
+  if (input.messageId !== undefined) payload.message_id = input.messageId || null;
+  if (input.threadId !== undefined) payload.thread_id = input.threadId || null;
+  if (input.yesVotes !== undefined) payload.yes_votes = input.yesVotes;
+  if (input.noVotes !== undefined) payload.no_votes = input.noVotes;
+
+  const result = await supabase
+    .from(SUGGESTIONS_TABLE)
+    .update(payload)
+    .eq("id", suggestionId)
+    .select(
+      "id, guild_id, author_user_id, title, body, status, publish_channel_id, message_id, thread_id, yes_votes, no_votes, created_at, updated_at",
+    )
+    .single();
+
+  return unwrap(result, "updateGuildSuggestionMessageIds");
+}
+
+async function createGuildSuggestionVoteEvent(input) {
+  const result = await supabase
+    .from(SUGGESTION_VOTE_EVENTS_TABLE)
+    .insert({
+      suggestion_id: input.suggestionId,
+      guild_id: input.guildId,
+      user_id: input.userId,
+      previous_vote: input.previousVote || null,
+      new_vote: input.newVote || null,
+      action: input.action,
+    })
+    .select("id, suggestion_id, guild_id, user_id, previous_vote, new_vote, action, created_at")
+    .single();
+
+  return unwrap(result, "createGuildSuggestionVoteEvent");
+}
+
+async function upsertGuildSuggestionVote(input) {
+  const existingResult = await supabase
+    .from(SUGGESTION_VOTES_TABLE)
+    .select("id, suggestion_id, guild_id, user_id, vote")
+    .eq("suggestion_id", input.suggestionId)
+    .eq("user_id", input.userId)
+    .maybeSingle();
+
+  if (existingResult.error) {
+    return unwrap(existingResult, "upsertGuildSuggestionVote.lookup");
+  }
+
+  const previousVote = existingResult.data?.vote || null;
+  const newVote = input.vote;
+
+  let action = "cast";
+  if (previousVote && previousVote !== newVote) {
+    action = "change";
+  } else if (previousVote === newVote) {
+    action = "cast";
+  }
+
+  const upsertResult = await supabase
+    .from(SUGGESTION_VOTES_TABLE)
+    .upsert(
+      {
+        suggestion_id: input.suggestionId,
+        guild_id: input.guildId,
+        user_id: input.userId,
+        vote: newVote,
+      },
+      { onConflict: "suggestion_id,user_id" },
+    )
+    .select("id, suggestion_id, guild_id, user_id, vote, created_at, updated_at")
+    .single();
+
+  const voteRow = unwrap(upsertResult, "upsertGuildSuggestionVote.upsert");
+
+  if (!previousVote || previousVote !== newVote) {
+    await createGuildSuggestionVoteEvent({
+      suggestionId: input.suggestionId,
+      guildId: input.guildId,
+      userId: input.userId,
+      previousVote,
+      newVote,
+      action: previousVote ? "change" : "cast",
+    });
+  }
+
+  const counts = await getGuildSuggestionVoteCounts(input.suggestionId);
+  await updateGuildSuggestionMessageIds(input.suggestionId, {
+    yesVotes: counts.yes,
+    noVotes: counts.no,
+  });
+
+  return {
+    vote: voteRow,
+    previousVote,
+    action: previousVote && previousVote !== newVote ? "change" : previousVote ? "cast" : "cast",
+    counts,
+  };
+}
+
+async function getGuildSuggestionVotes(suggestionId) {
+  const result = await supabase
+    .from(SUGGESTION_VOTES_TABLE)
+    .select("id, suggestion_id, guild_id, user_id, vote, created_at, updated_at")
+    .eq("suggestion_id", suggestionId)
+    .order("created_at", { ascending: true });
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(SUGGESTION_VOTES_TABLE)) {
+      return [];
+    }
+    return unwrap(result, "getGuildSuggestionVotes");
+  }
+
+  return result.data || [];
+}
+
+async function getGuildSuggestionVoteCounts(suggestionId) {
+  const votes = await getGuildSuggestionVotes(suggestionId);
+  let yes = 0;
+  let no = 0;
+
+  for (const voteRow of votes) {
+    if (voteRow.vote === "yes") yes += 1;
+    if (voteRow.vote === "no") no += 1;
+  }
+
+  return { yes, no, total: yes + no };
+}
+
+async function createGuildSuggestionVoteLog(input) {
+  const result = await supabase
+    .from(SUGGESTION_VOTE_EVENTS_TABLE)
+    .insert({
+      suggestion_id: input.suggestionId,
+      guild_id: input.guildId,
+      user_id: input.userId,
+      previous_vote: input.previousVote || null,
+      new_vote: input.newVote || null,
+      action: input.action || "cast",
+    })
+    .select("id, suggestion_id, guild_id, user_id, previous_vote, new_vote, action, created_at")
+    .single();
+
+  return unwrap(result, "createGuildSuggestionVoteLog");
+}
+
 module.exports = {
   deleteSecurityLogQueueItem,
   enqueueSecurityLogQueueItem,
@@ -1985,6 +2301,17 @@ module.exports = {
   getGuildCaptchaSession,
   deleteGuildCaptchaSession,
   updateGuildCaptchaPanelMessageId,
+  getGuildSuggestionsSettings,
+  getGuildSuggestionsRuntime,
+  getConfiguredSuggestionsGuildRuntimes,
+  updateGuildSuggestionsPanelMessageId,
+  createGuildSuggestion,
+  getGuildSuggestionById,
+  updateGuildSuggestionMessageIds,
+  upsertGuildSuggestionVote,
+  getGuildSuggestionVotes,
+  getGuildSuggestionVoteCounts,
+  createGuildSuggestionVoteLog,
   getLastTicketForUser,
   getOpenTicketByChannel,
   getOpenTicketCount,

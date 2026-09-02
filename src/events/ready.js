@@ -1,5 +1,6 @@
 const { ensureOfficialLinkPanel } = require("../services/officialLinkPanelService");
 const { syncAllCaptchaPanels } = require("../services/captchaPanelService");
+const { syncAllSuggestionPanels } = require("../services/suggestionPanelService");
 const {
   syncAllTicketPanels,
   syncOpenTicketControlMessages,
@@ -178,6 +179,19 @@ module.exports = {
           }
         } catch (error) {
           console.error("[captcha-panels]", error);
+        }
+      }, env.ticketPanelSyncIntervalMs);
+
+      setInterval(async () => {
+        try {
+          const result = await syncAllSuggestionPanels(client);
+          if (result.applied.length) {
+            console.log(
+              `[suggestion-panels] synced ${result.applied.length}/${result.total} paineis`,
+            );
+          }
+        } catch (error) {
+          console.error("[suggestion-panels]", error);
         }
       }, env.ticketPanelSyncIntervalMs);
 

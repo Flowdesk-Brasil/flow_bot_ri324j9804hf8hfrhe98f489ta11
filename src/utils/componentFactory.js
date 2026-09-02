@@ -1314,6 +1314,195 @@ function buildTicketIntroPayload({ ticket } = {}) {
   };
 }
 
+function buildSuggestionPanelPayload({ settings, title, description, buttonLabel }) {
+  const legacy = {
+    panelTitle:
+      trimText(settings?.panel_title) ||
+      trimText(title) ||
+      "Sugestoes",
+    panelDescription:
+      trimText(settings?.panel_description) ||
+      trimText(description) ||
+      "Envie sua sugestao para a equipe do servidor.",
+    panelButtonLabel:
+      trimText(settings?.panel_button_label) ||
+      trimText(buttonLabel) ||
+      "Iniciar Sugestao",
+  };
+
+  const layout = normalizeTicketPanelLayout(settings?.panel_layout, legacy);
+  const derived = deriveLegacyFromLayout(layout, legacy);
+  const state = { hasInteractiveOpenAction: false };
+  const actionOptions = { customId: CUSTOM_IDS.startSuggestion };
+  const components = buildComponentList(layout, state, actionOptions);
+
+  if (!state.hasInteractiveOpenAction) {
+    components.push({
+      type: COMPONENT_TYPE.ACTION_ROW,
+      components: [
+        {
+          type: COMPONENT_TYPE.BUTTON,
+          custom_id: CUSTOM_IDS.startSuggestion,
+          style: BUTTON_STYLE.PRIMARY,
+          label: derived.panelButtonLabel || "Iniciar Sugestao",
+        },
+      ],
+    });
+  }
+
+  return {
+    flags: MESSAGE_FLAG_IS_COMPONENTS_V2,
+    components,
+    allowedMentions: { parse: [] },
+  };
+}
+
+function formatVotePercentage(count, total) {
+  if (!total) return "0.00";
+  return ((count / total) * 100).toFixed(2);
+}
+
+function buildSuggestionVoteCustomId(type, suggestionId) {
+  return `suggestion:vote:${type}:${suggestionId}`;
+}
+
+function buildPublishedSuggestionPayload({
+  suggestion,
+  settings,
+  authorMention,
+  voteLabels,
+}) {
+  const header =
+    trimText(settings?.published_header) || "NOVA SUGESTAO ENVIADA!";
+  const footer =
+    trimText(settings?.published_footer) || "Flowdesk | Sistema de sugestoes";
+  const safeTitle = trimText(suggestion?.title) || "Sugestao";
+  const safeBody = trimText(suggestion?.body) || "";
+  const authorLine = authorMention
+    ? `-# Enviada por ${authorMention}`
+    : suggestion?.author_user_id
+      ? `-# Enviada por <@${suggestion.author_user_id}>`
+      : "";
+
+  const yesVotes = Number(suggestion?.yes_votes || 0);
+  const noVotes = Number(suggestion?.no_votes || 0);
+  const totalVotes = yesVotes + noVotes;
+
+  const yesLabel =
+    voteLabels?.yes ||
+    `✅ ${yesVotes} ${yesVotes === 1 ? "voto" : "votos"} | (${formatVotePercentage(yesVotes, totalVotes)}%)`;
+  const noLabel =
+    voteLabels?.no ||
+    `❌ ${noVotes} ${noVotes === 1 ? "voto" : "votos"} | (${formatVotePercentage(noVotes, totalVotes)}%)`;
+  const detailsLabel = voteLabels?.details || "?";
+
+  const suggestionId = suggestion?.id;
+
+  return {
+    flags: MESSAGE_FLAG_IS_COMPONENTS_V2,
+    components: [
+      {
+        type: COMPONENT_TYPE.CONTAINER,
+        accent_color: 0x00bcd4,
+        components: [
+          {
+            type: COMPONENT_TYPE.TEXT_DISPLAY,
+            content: [
+              `## 💡 ${header}`,
+              "",
+              `### ${safeTitle}`,
+              safeBody,
+              authorLine,
+              `-# ${footer}`,
+            ]
+              .filter(Boolean)
+              .join("\n"),
+          },
+        ],
+      },
+      {
+        type: COMPONENT_TYPE.ACTION_ROW,
+        components: [
+          {
+            type: COMPONENT_TYPE.BUTTON,
+            custom_id: buildSuggestionVoteCustomId("yes", suggestionId),
+            style: BUTTON_STYLE.SUCCESS,
+            label: clampText(yesLabel, 80),
+          },
+          {
+            type: COMPONENT_TYPE.BUTTON,
+            custom_id: buildSuggestionVoteCustomId("no", suggestionId),
+            style: BUTTON_STYLE.DANGER,
+            label: clampText(noLabel, 80),
+          },
+          {
+            type: COMPONENT_TYPE.BUTTON,
+            custom_id: buildSuggestionVoteCustomId("details", suggestionId),
+            style: BUTTON_STYLE.SECONDARY,
+            label: clampText(detailsLabel, 80),
+          },
+        ],
+      },
+    ],
+    allowedMentions: { parse: ["users"] },
+  };
+}
+
+function buildSuggestionVoteDetailsPayload({
+  suggestion,
+  yesVoters,
+  noVoters,
+  settings,
+}) {
+  const safeTitle = trimText(suggestion?.title) || "Sugestao";
+  const safeBody = trimText(suggestion?.body) || "";
+  const yesVotes = Number(suggestion?.yes_votes || 0);
+  const noVotes = Number(suggestion?.no_votes || 0);
+  const totalVotes = yesVotes + noVotes;
+
+  const yesList = Array.isArray(yesVoters) && yesVoters.length
+    ? yesVoters.map((userId) => `<@${userId}>`).join(", ")
+    : "Nenhum voto a favor ainda.";
+  const noList = Array.isArray(noVoters) && noVoters.length
+    ? noVoters.map((userId) => `<@${userId}>`).join(", ")
+    : "Nenhum voto contra ainda.";
+
+  const footer =
+    trimText(settings?.published_footer) || "Flowdesk | Sistema de sugestoes";
+
+  return withEphemeralComponentsV2({
+    components: [
+      {
+        type: COMPONENT_TYPE.CONTAINER,
+        accent_color: 0x00bcd4,
+        components: [
+          {
+            type: COMPONENT_TYPE.TEXT_DISPLAY,
+            content: [
+              `## Detalhes da sugestao`,
+              "",
+              `### ${safeTitle}`,
+              safeBody,
+              "",
+              `**Total de votos:** ${totalVotes}`,
+              `**A favor:** ${yesVotes} (${formatVotePercentage(yesVotes, totalVotes)}%)`,
+              `**Contra:** ${noVotes} (${formatVotePercentage(noVotes, totalVotes)}%)`,
+              "",
+              `**Votaram a favor:**`,
+              yesList,
+              "",
+              `**Votaram contra:**`,
+              noList,
+              "",
+              `-# ${footer}`,
+            ].join("\n"),
+          },
+        ],
+      },
+    ],
+  });
+}
+
 function buildLogPayload({
   accentColor,
   title,
@@ -1516,6 +1705,9 @@ function buildAiSuggestionPayload({ suggestion, guildName }) {
 module.exports = {
   buildTicketPanelPayload,
   buildCaptchaPanelPayload,
+  buildSuggestionPanelPayload,
+  buildPublishedSuggestionPayload,
+  buildSuggestionVoteDetailsPayload,
   buildCaptchaChallengePayload,
   buildCaptchaResultPayload,
   withEphemeralComponentsV2,

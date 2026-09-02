@@ -24,6 +24,10 @@ const CUSTOM_IDS = {
   aiSuggestionContinue: "ticket:ai_continue",
   startCaptcha: "captcha:start",
   verifyCaptcha: "captcha:verify",
+  startSuggestion: "suggestion:start",
+  submitSuggestionModal: "suggestion:submit",
+  suggestionTitleInput: "suggestion:title",
+  suggestionBodyInput: "suggestion:body",
 };
 
 module.exports = { CUSTOM_IDS };
