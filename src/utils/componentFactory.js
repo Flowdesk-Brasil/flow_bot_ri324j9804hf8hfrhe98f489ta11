@@ -425,6 +425,98 @@ function resolveWelcomeUserAvatarUrl(tokenMap, thumbnailOverrideUrl) {
   return trimText(thumbnailOverrideUrl) || trimText(tokenMap?.["user.avatar"]);
 }
 
+function layoutHasUserThumbnail(components) {
+  if (!Array.isArray(components)) return false;
+
+  for (const component of components) {
+    if (!component || typeof component !== "object") continue;
+
+    if (component.type === "container") {
+      if (layoutHasUserThumbnail(component.children)) return true;
+      continue;
+    }
+
+    if (
+      component.type === "content" &&
+      component.accessory?.type === "user_thumbnail"
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function mapContainerChildUserThumbnail(child, userAvatarUrl) {
+  if (
+    child?.type === "content" &&
+    child.accessory?.type === "user_thumbnail" &&
+    trimText(userAvatarUrl)
+  ) {
+    return {
+      ...child,
+      accessory: {
+        type: "thumbnail",
+        imageUrl: trimText(userAvatarUrl),
+        alt: trimText(child.accessory.alt) || "",
+      },
+    };
+  }
+
+  return child;
+}
+
+function mapComponentUserThumbnail(component, userAvatarUrl) {
+  if (!component || typeof component !== "object") return component;
+
+  if (component.type === "container") {
+    return {
+      ...component,
+      children: (component.children || []).map((child) =>
+        mapContainerChildUserThumbnail(child, userAvatarUrl),
+      ),
+    };
+  }
+
+  if (
+    component.type === "content" &&
+    component.accessory?.type === "user_thumbnail" &&
+    trimText(userAvatarUrl)
+  ) {
+    return {
+      ...component,
+      accessory: {
+        type: "thumbnail",
+        imageUrl: trimText(userAvatarUrl),
+        alt: trimText(component.accessory.alt) || "",
+      },
+    };
+  }
+
+  return component;
+}
+
+function applyUserAvatarThumbnailToLayout(layout, userAvatarUrl) {
+  const safeUrl = trimText(userAvatarUrl);
+  if (!safeUrl || !Array.isArray(layout)) return layout;
+
+  return layout.map((component) => mapComponentUserThumbnail(component, safeUrl));
+}
+
+function resolveThumbnailAccessoryUrl(accessory, userAvatarUrl) {
+  if (!accessory || typeof accessory !== "object") return "";
+
+  if (accessory.type === "thumbnail") {
+    return trimText(accessory.imageUrl);
+  }
+
+  if (accessory.type === "user_thumbnail") {
+    return trimText(userAvatarUrl);
+  }
+
+  return "";
+}
+
 function replaceWelcomeAccessory(accessory, tokenMap, thumbnailOverrideUrl) {
   if (!accessory || typeof accessory !== "object") return accessory;
 
@@ -650,14 +742,19 @@ function addContentComponent(target, content, state, actionOptions = {}) {
     return;
   }
 
-  if (content.accessory.type === "thumbnail" && trimText(content.accessory.imageUrl)) {
+  const thumbnailUrl = resolveThumbnailAccessoryUrl(
+    content.accessory,
+    actionOptions.userAvatarUrl,
+  );
+
+  if (thumbnailUrl) {
     target.push({
       type: COMPONENT_TYPE.SECTION,
       components: [buildTextDisplay(textContent)],
       accessory: {
         type: COMPONENT_TYPE.THUMBNAIL,
         media: {
-          url: trimText(content.accessory.imageUrl),
+          url: thumbnailUrl,
         },
       },
     });
@@ -1030,8 +1127,11 @@ function buildWelcomeMessagePayload({
         ];
 
   const tokenMap = buildWelcomeTokenMap({ member, guild, inviter });
+  const layoutHasUserThumb = layoutHasUserThumbnail(baseLayout);
   const thumbnailOverrideUrl =
-    thumbnailMode === "avatar" ? resolveMemberAvatarUrl(member) : "";
+    thumbnailMode === "avatar" || layoutHasUserThumb
+      ? resolveMemberAvatarUrl(member)
+      : "";
   const hydratedLayout = applyWelcomeTokensToLayout(
     baseLayout,
     tokenMap,
@@ -1465,12 +1565,9 @@ function buildPublishedSuggestionPayload({
   suggestion,
   settings,
   authorMention,
+  authorAvatarUrl,
   voteLabels,
 }) {
-  const header =
-    trimText(settings?.published_header) || "NOVA SUGESTAO ENVIADA!";
-  const footer =
-    trimText(settings?.published_footer) || "Flowdesk | Sistema de sugestoes";
   const safeTitle = trimText(suggestion?.title) || "Sugestao";
   const safeBody = trimText(suggestion?.body) || "";
   const authorLine = authorMention
@@ -1493,8 +1590,8 @@ function buildPublishedSuggestionPayload({
 
   const suggestionId = suggestion?.id;
   const tokenMap = {
-    published_header: header,
-    published_footer: footer,
+    published_header: "NOVA SUGESTAO ENVIADA!",
+    published_footer: "Flowdesk | Sistema de sugestoes",
     suggestion_title: `### ${safeTitle}`,
     suggestion_body: formatSuggestionPublishedBody(safeBody),
     suggestion_author: authorLine,
@@ -1508,9 +1605,14 @@ function buildPublishedSuggestionPayload({
 
   if (layout?.length) {
     const layoutWithTokens = applySuggestionTokensToLayout(layout, tokenMap);
+    const hydratedLayout = applyUserAvatarThumbnailToLayout(
+      layoutWithTokens,
+      authorAvatarUrl,
+    );
     const state = { hasInteractiveOpenAction: false };
-    const components = buildComponentList(layoutWithTokens, state, {
+    const components = buildComponentList(hydratedLayout, state, {
       disableNonLink: true,
+      userAvatarUrl: trimText(authorAvatarUrl),
     });
 
     components.push({
@@ -1554,12 +1656,12 @@ function buildPublishedSuggestionPayload({
           {
             type: COMPONENT_TYPE.TEXT_DISPLAY,
             content: [
-              `## 💡 ${header}`,
+              `## 💡 NOVA SUGESTAO ENVIADA!`,
               "",
               `### ${safeTitle}`,
               formatSuggestionPublishedBody(safeBody),
               authorLine ? `-# Enviada por ${authorLine}` : "",
-              `-# ${footer}`,
+              `-# Flowdesk | Sistema de sugestoes`,
             ]
               .filter(Boolean)
               .join("\n"),
@@ -1613,8 +1715,7 @@ function buildSuggestionVoteDetailsPayload({
     ? noVoters.map((userId) => `<@${userId}>`).join(", ")
     : "Nenhum voto contra ainda.";
 
-  const footer =
-    trimText(settings?.published_footer) || "Flowdesk | Sistema de sugestoes";
+  const footer = "Flowdesk | Sistema de sugestoes";
 
   return withEphemeralComponentsV2({
     components: [
@@ -1864,4 +1965,5 @@ module.exports = {
   buildLogPayload,
   buildTicketClosureDmPayload,
   buildAiSuggestionPayload,
+  resolveMemberAvatarUrl,
 };

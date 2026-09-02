@@ -10,6 +10,7 @@ const {
   buildLogPayload,
   buildPublishedSuggestionPayload,
   buildSuggestionVoteDetailsPayload,
+  resolveMemberAvatarUrl,
   withEphemeralComponentsV2,
 } = require("../utils/componentFactory");
 const {
@@ -289,11 +290,15 @@ async function handleSuggestionModalSubmit(interaction) {
   }
 
   const authorMention = `<@${interaction.user.id}>`;
+  const authorAvatarUrl = resolveMemberAvatarUrl(
+    interaction.member || interaction.user,
+  );
   const voteLabels = buildVoteLabels(0, 0);
   const payload = buildPublishedSuggestionPayload({
     suggestion,
     settings,
     authorMention,
+    authorAvatarUrl,
     voteLabels,
   });
 
@@ -312,9 +317,7 @@ async function handleSuggestionModalSubmit(interaction) {
   }
 
   let thread = null;
-  const threadPrefix =
-    String(settings.thread_name_prefix || "").trim() || "Debater sugestao";
-  const threadName = `${threadPrefix} #${suggestion.id}`.slice(0, 100);
+  const threadName = `Debater sugestao #${suggestion.id}`.slice(0, 100);
 
   try {
     thread = await publishedMessage.startThread({
@@ -369,9 +372,18 @@ async function syncPublishedSuggestionMessage(interaction, suggestion, settings)
   const noVotes = Number(suggestion.no_votes || 0);
   const voteLabels = buildVoteLabels(yesVotes, noVotes);
 
+  let authorAvatarUrl = "";
+  if (suggestion?.author_user_id) {
+    const author = await interaction.client.users
+      .fetch(suggestion.author_user_id)
+      .catch(() => null);
+    authorAvatarUrl = resolveMemberAvatarUrl(author);
+  }
+
   const payload = buildPublishedSuggestionPayload({
     suggestion,
     settings,
+    authorAvatarUrl,
     voteLabels,
   });
 
