@@ -1366,6 +1366,101 @@ function buildSuggestionVoteCustomId(type, suggestionId) {
   return `suggestion:vote:${type}:${suggestionId}`;
 }
 
+function formatSuggestionPublishedBody(body) {
+  const safe = trimText(body);
+  if (!safe) {
+    return "> ```descricao```";
+  }
+
+  return `> \`\`\`${safe}\`\`\``;
+}
+
+const SUGGESTION_PUBLISHED_HEADER_TOKEN = "{{published_header}}";
+const SUGGESTION_PUBLISHED_FOOTER_TOKEN = "{{published_footer}}";
+const SUGGESTION_PUBLISHED_TITLE_TOKEN = "{{suggestion_title}}";
+const SUGGESTION_PUBLISHED_BODY_TOKEN = "{{suggestion_body}}";
+const SUGGESTION_PUBLISHED_AUTHOR_TOKEN = "{{suggestion_author}}";
+
+function replaceSuggestionTokens(text, tokenMap) {
+  return String(text || "")
+    .split(SUGGESTION_PUBLISHED_HEADER_TOKEN)
+    .join(tokenMap.published_header)
+    .split(SUGGESTION_PUBLISHED_FOOTER_TOKEN)
+    .join(tokenMap.published_footer)
+    .split(SUGGESTION_PUBLISHED_TITLE_TOKEN)
+    .join(tokenMap.suggestion_title)
+    .split(SUGGESTION_PUBLISHED_BODY_TOKEN)
+    .join(tokenMap.suggestion_body)
+    .split(SUGGESTION_PUBLISHED_AUTHOR_TOKEN)
+    .join(tokenMap.suggestion_author);
+}
+
+function applySuggestionTokensToLayout(layout, tokenMap) {
+  return layout.map((component) => {
+    if (!component || typeof component !== "object") return component;
+
+    if (component.type === "container") {
+      return {
+        ...component,
+        children: applySuggestionTokensToLayout(
+          component.children || [],
+          tokenMap,
+        ),
+      };
+    }
+
+    if (component.type === "content") {
+      return {
+        ...component,
+        markdown: replaceSuggestionTokens(component.markdown, tokenMap),
+        accessory: component.accessory,
+      };
+    }
+
+    if (component.type === "image") {
+      return {
+        ...component,
+        url: replaceSuggestionTokens(component.url, tokenMap),
+      };
+    }
+
+    if (component.type === "file") {
+      return {
+        ...component,
+        name: replaceSuggestionTokens(component.name, tokenMap),
+        sizeLabel: replaceSuggestionTokens(component.sizeLabel, tokenMap),
+      };
+    }
+
+    if (component.type === "button" || component.type === "link_button") {
+      return {
+        ...component,
+        label: replaceSuggestionTokens(component.label, tokenMap),
+        url:
+          component.type === "link_button"
+            ? replaceSuggestionTokens(component.url, tokenMap)
+            : component.url,
+      };
+    }
+
+    if (component.type === "select") {
+      return {
+        ...component,
+        placeholder: replaceSuggestionTokens(component.placeholder, tokenMap),
+        options: Array.isArray(component.options)
+          ? component.options.map((option) => ({
+              ...option,
+              label: replaceSuggestionTokens(option.label, tokenMap),
+              description: replaceSuggestionTokens(option.description, tokenMap),
+            }))
+          : component.options,
+      };
+    }
+
+    return component;
+  });
+}
+
 function buildPublishedSuggestionPayload({
   suggestion,
   settings,
@@ -1379,9 +1474,9 @@ function buildPublishedSuggestionPayload({
   const safeTitle = trimText(suggestion?.title) || "Sugestao";
   const safeBody = trimText(suggestion?.body) || "";
   const authorLine = authorMention
-    ? `-# Enviada por ${authorMention}`
+    ? authorMention
     : suggestion?.author_user_id
-      ? `-# Enviada por <@${suggestion.author_user_id}>`
+      ? `<@${suggestion.author_user_id}>`
       : "";
 
   const yesVotes = Number(suggestion?.yes_votes || 0);
@@ -1397,6 +1492,57 @@ function buildPublishedSuggestionPayload({
   const detailsLabel = voteLabels?.details || "?";
 
   const suggestionId = suggestion?.id;
+  const tokenMap = {
+    published_header: header,
+    published_footer: footer,
+    suggestion_title: `### ${safeTitle}`,
+    suggestion_body: formatSuggestionPublishedBody(safeBody),
+    suggestion_author: authorLine,
+  };
+
+  const rawLayout = settings?.suggestion_layout;
+  const layout =
+    Array.isArray(rawLayout) && rawLayout.length
+      ? normalizeTicketPanelLayout(rawLayout)
+      : null;
+
+  if (layout?.length) {
+    const layoutWithTokens = applySuggestionTokensToLayout(layout, tokenMap);
+    const state = { hasInteractiveOpenAction: false };
+    const components = buildComponentList(layoutWithTokens, state, {
+      disableNonLink: true,
+    });
+
+    components.push({
+      type: COMPONENT_TYPE.ACTION_ROW,
+      components: [
+        {
+          type: COMPONENT_TYPE.BUTTON,
+          custom_id: buildSuggestionVoteCustomId("yes", suggestionId),
+          style: BUTTON_STYLE.SUCCESS,
+          label: clampText(yesLabel, 80),
+        },
+        {
+          type: COMPONENT_TYPE.BUTTON,
+          custom_id: buildSuggestionVoteCustomId("no", suggestionId),
+          style: BUTTON_STYLE.DANGER,
+          label: clampText(noLabel, 80),
+        },
+        {
+          type: COMPONENT_TYPE.BUTTON,
+          custom_id: buildSuggestionVoteCustomId("details", suggestionId),
+          style: BUTTON_STYLE.SECONDARY,
+          label: clampText(detailsLabel, 80),
+        },
+      ],
+    });
+
+    return {
+      flags: MESSAGE_FLAG_IS_COMPONENTS_V2,
+      components,
+      allowedMentions: { parse: ["users"] },
+    };
+  }
 
   return {
     flags: MESSAGE_FLAG_IS_COMPONENTS_V2,
@@ -1411,8 +1557,8 @@ function buildPublishedSuggestionPayload({
               `## 💡 ${header}`,
               "",
               `### ${safeTitle}`,
-              safeBody,
-              authorLine,
+              formatSuggestionPublishedBody(safeBody),
+              authorLine ? `-# Enviada por ${authorLine}` : "",
               `-# ${footer}`,
             ]
               .filter(Boolean)
