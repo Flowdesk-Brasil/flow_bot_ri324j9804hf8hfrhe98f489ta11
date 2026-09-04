@@ -147,6 +147,7 @@ async function sendBatePontoLog({
   session,
   settings,
   hourBankBalance,
+  note,
 }) {
   const channelId = settings?.logs_channel_id;
   if (!channelId) {
@@ -164,6 +165,7 @@ async function sendBatePontoLog({
     session,
     settings,
     hourBankBalance,
+    note,
   });
 
   await channel.send(payload).catch((error) => {
@@ -282,6 +284,13 @@ async function handleStartAction({ guildId, userId, settings, member, guild }) {
     sessionId: session.id,
     action: "start",
   });
+
+  const voiceChannelId = member?.voice?.channelId;
+  if (voiceChannelId) {
+    await updateGuildBatePontoSession(session.id, {
+      voiceChannelId: String(voiceChannelId),
+    });
+  }
 
   await sendBatePontoLog({
     guild,
@@ -423,7 +432,15 @@ async function handleResumeAction({ guildId, userId, settings, member, guild, se
   };
 }
 
-async function handleFinishAction({ guildId, userId, settings, member, guild, session }) {
+async function finishBatePontoSessionCore({
+  guildId,
+  userId,
+  settings,
+  member,
+  guild,
+  session,
+  note = null,
+}) {
   if (!session || !["active", "on_break"].includes(session.status)) {
     return {
       ok: false,
@@ -484,6 +501,7 @@ async function handleFinishAction({ guildId, userId, settings, member, guild, se
     workedSeconds,
     breakSeconds,
     hourBankDeltaSeconds,
+    note,
   });
 
   await sendBatePontoLog({
@@ -493,6 +511,7 @@ async function handleFinishAction({ guildId, userId, settings, member, guild, se
     session: finishedSession,
     settings,
     hourBankBalance,
+    note,
   });
 
   const messageLines = [
@@ -507,6 +526,10 @@ async function handleFinishAction({ guildId, userId, settings, member, guild, se
     messageLines.push(`Banco de horas: **${formatDurationLabel(hourBankBalance)}**`);
   }
 
+  if (note) {
+    messageLines.push(note);
+  }
+
   return {
     ok: true,
     payload: buildBatePontoResultPayload({
@@ -514,7 +537,30 @@ async function handleFinishAction({ guildId, userId, settings, member, guild, se
       message: messageLines.join("\n"),
       tone: "success",
     }),
+    finishedSession,
+    workedSeconds,
+    breakSeconds,
+    hourBankBalance,
   };
+}
+
+async function handleFinishAction({ guildId, userId, settings, member, guild, session, note = null }) {
+  const result = await finishBatePontoSessionCore({
+    guildId,
+    userId,
+    settings,
+    member,
+    guild,
+    session,
+    note,
+  });
+
+  if (result.ok) {
+    const { clearBatePontoVoiceAbsenceTracking } = require("./batePontoVoiceService");
+    clearBatePontoVoiceAbsenceTracking(guildId, userId);
+  }
+
+  return result;
 }
 
 async function handleBatePontoModalSubmit(interaction) {
@@ -620,4 +666,7 @@ module.exports = {
   handleBatePontoModalSubmit,
   isBatePontoButtonInteraction,
   isBatePontoModalSubmit,
+  finishBatePontoSessionCore,
+  memberMeetsVoiceRequirement,
+  memberHasBatePontoAccess,
 };

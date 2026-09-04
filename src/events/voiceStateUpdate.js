@@ -1,5 +1,6 @@
 const { handleVoiceStateSecurityLog } = require("../services/securityLogsService");
 const { handleVoicePresenceStateUpdate } = require("../services/voicePresenceService");
+const { handleBatePontoVoiceStateUpdate } = require("../services/batePontoVoiceService");
 
 module.exports = {
   name: "voiceStateUpdate",
@@ -14,6 +15,12 @@ module.exports = {
       await handleVoicePresenceStateUpdate(oldState, newState, client);
     } catch (error) {
       console.error("[voice-presence:voiceStateUpdate]", error);
+    }
+
+    try {
+      await handleBatePontoVoiceStateUpdate(oldState, newState, client);
+    } catch (error) {
+      console.error("[bate-ponto-voice:voiceStateUpdate]", error);
     }
   },
 };

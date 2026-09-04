@@ -11,6 +11,7 @@ const {
   startSecurityLogQueueWorker,
 } = require("../services/securityLogsService");
 const { startDirectMessageQueueWorker } = require("../services/directMessageQueueService");
+const { startBatePontoVoiceAbsenceWorker } = require("../services/batePontoVoiceService");
 const { startAutoRoleWorker } = require("../services/autoRoleService");
 const { primeInviteCacheForClient } = require("../utils/inviteTracker");
 const { syncSlashCommandsForClient } = require("../services/slashCommandSyncService");
@@ -102,6 +103,7 @@ module.exports = {
       startDirectMessageQueueWorker(client);
       startSecurityLogQueueWorker(client);
       startAutoRoleWorker(client);
+      startBatePontoVoiceAbsenceWorker(client);
 
       if (env.clientRoleStartupSyncMode !== "off") {
         try {

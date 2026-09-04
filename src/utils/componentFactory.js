@@ -1506,7 +1506,7 @@ function resolveBatePontoActionAccentColor(action) {
   return BATE_PONTO_ACTION_COLORS[action] || resolveTicketMessageToneColor("neutral");
 }
 
-function buildBatePontoLogLines({ action, member, session, hourBankBalance }) {
+function buildBatePontoLogLines({ action, member, session, hourBankBalance, note }) {
   const memberLabel = member?.toString?.() || `<@${member?.id || member?.user?.id || ""}>`;
   const memberId = member?.id || member?.user?.id || "";
   const timestamp = `<t:${Math.floor(Date.now() / 1000)}:F>`;
@@ -1532,6 +1532,11 @@ function buildBatePontoLogLines({ action, member, session, hourBankBalance }) {
     lines.push(`**Banco de horas:** ${formatBatePontoDuration(hourBankBalance)}`);
   }
 
+  const safeNote = trimText(note);
+  if (safeNote) {
+    lines.push(`**Observacao:** ${safeNote}`);
+  }
+
   return lines;
 }
 
@@ -1541,6 +1546,7 @@ function buildBatePontoLogPayload({
   session,
   settings,
   hourBankBalance,
+  note,
 }) {
   const safeAction = trimText(action) || "start";
   const title = BATE_PONTO_ACTION_LABELS[safeAction] || "Registro de ponto";
@@ -1549,6 +1555,7 @@ function buildBatePontoLogPayload({
     member,
     session,
     hourBankBalance,
+    note,
   });
 
   const logLayout = Array.isArray(settings?.log_layout) ? settings.log_layout : [];
@@ -1562,6 +1569,7 @@ function buildBatePontoLogPayload({
       "{{hour_bank}}": formatBatePontoDuration(hourBankBalance || 0),
       "{{session_id}}": session?.id ? String(session.id) : "",
       "{{timestamp}}": `<t:${Math.floor(Date.now() / 1000)}:F>`,
+      "{{note}}": trimText(note) || "",
     };
 
     const legacy = {
@@ -1628,6 +1636,66 @@ function buildBatePontoResultPayload({ title, message, tone = "neutral" }) {
       },
     ],
   });
+}
+
+function buildBatePontoVoiceWarningDmPayload({
+  guildName,
+  channelName,
+  joinUrl,
+  minutesUntilFinish = 2,
+}) {
+  const safeGuildName = trimText(guildName) || "servidor";
+  const safeChannelName = trimText(channelName) || "call autorizada";
+  const safeJoinUrl = trimText(joinUrl);
+  const safeMinutes = Math.max(1, Number(minutesUntilFinish) || 2);
+
+  const lines = [
+    "### Voce saiu da call autorizada",
+    "",
+    `Seu ponto em **${safeGuildName}** continua aberto, mas voce nao esta mais na call permitida (**${safeChannelName}**).`,
+    "",
+    `Se nao voltar em **${safeMinutes} minuto${safeMinutes === 1 ? "" : "s"}**, seu ponto sera **finalizado automaticamente** por ausencia.`,
+    "",
+    "Use o botao abaixo para retornar a ultima call autorizada em que voce estava conectado.",
+  ];
+
+  const containerComponents = [
+    {
+      type: COMPONENT_TYPE.TEXT_DISPLAY,
+      content: lines.join("\n"),
+    },
+  ];
+
+  if (safeJoinUrl) {
+    containerComponents.push({
+      type: COMPONENT_TYPE.SEPARATOR,
+      divider: true,
+      spacing: SeparatorSpacingSize.Small,
+    });
+    containerComponents.push({
+      type: COMPONENT_TYPE.ACTION_ROW,
+      components: [
+        {
+          type: COMPONENT_TYPE.BUTTON,
+          style: BUTTON_STYLE.LINK,
+          label: "Voltar para a call",
+          url: safeJoinUrl,
+        },
+      ],
+    });
+  }
+
+  return {
+    flags: MessageFlags.IsComponentsV2,
+    components: [
+      {
+        type: COMPONENT_TYPE.CONTAINER,
+        accent_color: resolveTicketMessageToneColor("warning"),
+        components: containerComponents,
+      },
+    ],
+    allowedMentions: { parse: [] },
+  };
 }
 
 function buildSuggestionPanelPayload({ settings, title, description, buttonLabel }) {
@@ -2174,6 +2242,7 @@ module.exports = {
   buildBatePontoPanelPayload,
   buildBatePontoLogPayload,
   buildBatePontoResultPayload,
+  buildBatePontoVoiceWarningDmPayload,
   buildPublishedSuggestionPayload,
   buildSuggestionVoteDetailsPayload,
   buildCaptchaChallengePayload,

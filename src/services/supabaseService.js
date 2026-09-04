@@ -65,7 +65,7 @@ const BATE_PONTO_SETTINGS_SELECT =
   "guild_id, enabled, panel_channel_id, logs_channel_id, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, log_layout, allowed_role_ids, hour_bank_enabled, daily_target_minutes, timezone, auto_finish_open_sessions, max_open_hours, require_voice_channel, required_voice_channel_ids, updated_at";
 
 const BATE_PONTO_SESSION_SELECT =
-  "id, guild_id, user_id, status, started_at, ended_at, last_action_at, worked_seconds, break_seconds, break_started_at, created_at, updated_at";
+  "id, guild_id, user_id, status, started_at, ended_at, last_action_at, worked_seconds, break_seconds, break_started_at, voice_channel_id, voice_left_at, voice_warning_sent_at, created_at, updated_at";
 
 const BATE_PONTO_EVENT_SELECT =
   "id, guild_id, user_id, session_id, action, worked_seconds, break_seconds, hour_bank_delta_seconds, note, created_at";
@@ -2572,6 +2572,11 @@ async function updateGuildBatePontoSession(sessionId, input = {}) {
   if (input.breakSeconds !== undefined) patch.break_seconds = input.breakSeconds;
   if (input.breakStartedAt !== undefined) patch.break_started_at = input.breakStartedAt;
   if (input.endedAt !== undefined) patch.ended_at = input.endedAt;
+  if (input.voiceChannelId !== undefined) patch.voice_channel_id = input.voiceChannelId;
+  if (input.voiceLeftAt !== undefined) patch.voice_left_at = input.voiceLeftAt;
+  if (input.voiceWarningSentAt !== undefined) {
+    patch.voice_warning_sent_at = input.voiceWarningSentAt;
+  }
 
   if (!Object.keys(patch).length) {
     return null;
@@ -2605,7 +2610,32 @@ async function finishGuildBatePontoSession(sessionId, input = {}) {
     workedSeconds: input.workedSeconds,
     breakSeconds: input.breakSeconds,
     breakStartedAt: null,
+    voiceChannelId: null,
+    voiceLeftAt: null,
+    voiceWarningSentAt: null,
   });
+}
+
+async function listOpenGuildBatePontoSessionsWithVoiceAbsence() {
+  const result = await supabase
+    .from(BATE_PONTO_SESSIONS_TABLE)
+    .select(BATE_PONTO_SESSION_SELECT)
+    .in("status", ["active", "on_break"])
+    .not("voice_left_at", "is", null);
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(BATE_PONTO_SESSIONS_TABLE)) {
+      return [];
+    }
+    if (code === "42703" || message.includes("voice_left_at")) {
+      return [];
+    }
+    return unwrap(result, "listOpenGuildBatePontoSessionsWithVoiceAbsence");
+  }
+
+  return result.data || [];
 }
 
 async function createGuildBatePontoEvent(input) {
@@ -2811,6 +2841,7 @@ module.exports = {
   createGuildBatePontoSession,
   updateGuildBatePontoSession,
   finishGuildBatePontoSession,
+  listOpenGuildBatePontoSessionsWithVoiceAbsence,
   createGuildBatePontoEvent,
   getGuildBatePontoHourBank,
   upsertGuildBatePontoHourBank,
