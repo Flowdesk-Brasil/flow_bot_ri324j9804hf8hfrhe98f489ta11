@@ -62,7 +62,7 @@ let configuredTicketGuildRuntimesCache = null;
 let configuredTicketGuildRuntimesInflight = null;
 
 const BATE_PONTO_SETTINGS_SELECT =
-  "guild_id, enabled, panel_channel_id, logs_channel_id, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, log_layout, allowed_role_ids, hour_bank_enabled, daily_target_minutes, timezone, auto_finish_open_sessions, max_open_hours, updated_at";
+  "guild_id, enabled, panel_channel_id, logs_channel_id, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, log_layout, allowed_role_ids, hour_bank_enabled, daily_target_minutes, timezone, auto_finish_open_sessions, max_open_hours, require_voice_channel, required_voice_channel_ids, updated_at";
 
 const BATE_PONTO_SESSION_SELECT =
   "id, guild_id, user_id, status, started_at, ended_at, last_action_at, worked_seconds, break_seconds, break_started_at, created_at, updated_at";

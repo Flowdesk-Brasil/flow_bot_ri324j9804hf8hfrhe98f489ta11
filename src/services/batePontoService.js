@@ -66,6 +66,39 @@ function memberHasBatePontoAccess(member, settings) {
   return allowedRoleIds.some((roleId) => member.roles.cache.has(String(roleId)));
 }
 
+function memberMeetsVoiceRequirement(member, settings) {
+  if (!settings?.require_voice_channel) {
+    return true;
+  }
+
+  const voiceChannelId = member?.voice?.channelId;
+  if (!voiceChannelId) {
+    return false;
+  }
+
+  const requiredVoiceChannelIds = Array.isArray(settings?.required_voice_channel_ids)
+    ? settings.required_voice_channel_ids.filter(Boolean)
+    : [];
+
+  if (!requiredVoiceChannelIds.length) {
+    return true;
+  }
+
+  return requiredVoiceChannelIds.includes(String(voiceChannelId));
+}
+
+function buildVoiceRequirementMessage(settings) {
+  const requiredVoiceChannelIds = Array.isArray(settings?.required_voice_channel_ids)
+    ? settings.required_voice_channel_ids.filter(Boolean)
+    : [];
+
+  if (!requiredVoiceChannelIds.length) {
+    return "Voce precisa estar em uma call do servidor para iniciar o ponto.";
+  }
+
+  return "Voce precisa estar em uma das calls autorizadas para iniciar o ponto.";
+}
+
 function buildModalOptionsForSession(session) {
   if (!session) {
     return [BATE_PONTO_MODAL_OPTIONS.start];
@@ -208,6 +241,17 @@ async function showBatePontoModal(interaction) {
 }
 
 async function handleStartAction({ guildId, userId, settings, member, guild }) {
+  if (!memberMeetsVoiceRequirement(member, settings)) {
+    return {
+      ok: false,
+      payload: buildBatePontoResultPayload({
+        title: "Call obrigatoria",
+        message: buildVoiceRequirementMessage(settings),
+        tone: "error",
+      }),
+    };
+  }
+
   const existingSession = await getActiveGuildBatePontoSession(guildId, userId);
   if (existingSession) {
     return {
