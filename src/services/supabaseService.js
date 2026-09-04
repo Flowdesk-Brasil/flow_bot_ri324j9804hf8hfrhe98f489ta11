@@ -13,6 +13,10 @@ const SUGGESTIONS_SETTINGS_TABLE = "guild_suggestions_settings";
 const SUGGESTIONS_TABLE = "guild_suggestions";
 const SUGGESTION_VOTES_TABLE = "guild_suggestion_votes";
 const SUGGESTION_VOTE_EVENTS_TABLE = "guild_suggestion_vote_events";
+const BATE_PONTO_SETTINGS_TABLE = "guild_bate_ponto_settings";
+const BATE_PONTO_SESSIONS_TABLE = "guild_bate_ponto_sessions";
+const BATE_PONTO_EVENTS_TABLE = "guild_bate_ponto_events";
+const BATE_PONTO_HOUR_BANK_TABLE = "guild_bate_ponto_hour_bank";
 const ANTILINK_SETTINGS_TABLE = "guild_antilink_settings";
 const AUTOROLE_SETTINGS_TABLE = "guild_autorole_settings";
 const AUTOROLE_QUEUE_TABLE = "guild_autorole_queue";
@@ -39,6 +43,7 @@ const moduleRuntimeCache = {
   welcome: new Map(),
   captcha: new Map(),
   suggestions: new Map(),
+  batePonto: new Map(),
   antiLink: new Map(),
   autoRole: new Map(),
   securityLogs: new Map(),
@@ -48,12 +53,22 @@ const moduleRuntimeInflight = {
   welcome: new Map(),
   captcha: new Map(),
   suggestions: new Map(),
+  batePonto: new Map(),
   antiLink: new Map(),
   autoRole: new Map(),
   securityLogs: new Map(),
 };
 let configuredTicketGuildRuntimesCache = null;
 let configuredTicketGuildRuntimesInflight = null;
+
+const BATE_PONTO_SETTINGS_SELECT =
+  "guild_id, enabled, panel_channel_id, logs_channel_id, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, log_layout, allowed_role_ids, hour_bank_enabled, daily_target_minutes, timezone, auto_finish_open_sessions, max_open_hours, updated_at";
+
+const BATE_PONTO_SESSION_SELECT =
+  "id, guild_id, user_id, status, started_at, ended_at, last_action_at, worked_seconds, break_seconds, break_started_at, created_at, updated_at";
+
+const BATE_PONTO_EVENT_SELECT =
+  "id, guild_id, user_id, session_id, action, worked_seconds, break_seconds, hour_bank_delta_seconds, note, created_at";
 
 const supabase = createClient(env.supabaseUrl, env.supabaseServiceRoleKey, {
   auth: {
@@ -2377,6 +2392,370 @@ async function createGuildSuggestionVoteLog(input) {
   return unwrap(result, "createGuildSuggestionVoteLog");
 }
 
+async function getGuildBatePontoSettings(guildId) {
+  const result = await supabase
+    .from(BATE_PONTO_SETTINGS_TABLE)
+    .select(BATE_PONTO_SETTINGS_SELECT)
+    .eq("guild_id", guildId)
+    .maybeSingle();
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(BATE_PONTO_SETTINGS_TABLE)) {
+      return null;
+    }
+    return unwrap(result, "getGuildBatePontoSettings");
+  }
+
+  return result.data;
+}
+
+async function loadGuildBatePontoRuntime(guildId) {
+  const [settings, accountLicenseRuntime] = await Promise.all([
+    getGuildBatePontoSettings(guildId),
+    getGuildAccountLicenseRuntime(guildId),
+  ]);
+
+  return {
+    guildId,
+    settings: settings || null,
+    licenseStatus: accountLicenseRuntime.licenseStatus,
+    licenseUsable: accountLicenseRuntime.licenseUsable,
+    latestCoverage: accountLicenseRuntime.latestCoverage,
+    isConfigured: Boolean(settings?.enabled && settings?.panel_channel_id),
+  };
+}
+
+async function getGuildBatePontoRuntime(guildId) {
+  return await withCachedResult(
+    moduleRuntimeCache.batePonto,
+    moduleRuntimeInflight.batePonto,
+    guildId,
+    MODULE_RUNTIME_CACHE_TTL_MS,
+    () => loadGuildBatePontoRuntime(guildId),
+  );
+}
+
+async function loadConfiguredBatePontoGuildRuntimes() {
+  const result = await supabase
+    .from(BATE_PONTO_SETTINGS_TABLE)
+    .select(BATE_PONTO_SETTINGS_SELECT)
+    .eq("enabled", true);
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(BATE_PONTO_SETTINGS_TABLE)) {
+      return [];
+    }
+    return unwrap(result, "loadConfiguredBatePontoGuildRuntimes");
+  }
+
+  const settingsRows = result.data || [];
+  const accountLicenseRuntimeByGuild = await getGuildAccountLicenseRuntimeMap(
+    settingsRows.map((row) => row.guild_id),
+  );
+
+  return settingsRows
+    .map((settingsRow) => {
+      const accountLicenseRuntime =
+        accountLicenseRuntimeByGuild.get(settingsRow.guild_id) || {
+          licenseStatus: "not_paid",
+          licenseUsable: false,
+          latestCoverage: null,
+        };
+
+      return {
+        guildId: settingsRow.guild_id,
+        settings: settingsRow,
+        licenseStatus: accountLicenseRuntime.licenseStatus,
+        licenseUsable: accountLicenseRuntime.licenseUsable,
+        latestCoverage: accountLicenseRuntime.latestCoverage,
+        isConfigured: Boolean(settingsRow.panel_channel_id),
+      };
+    })
+    .filter((runtime) => runtime.settings);
+}
+
+async function getConfiguredBatePontoGuildRuntimes() {
+  return loadConfiguredBatePontoGuildRuntimes();
+}
+
+async function updateGuildBatePontoPanelMessageId(guildId, panelMessageId) {
+  const result = await supabase
+    .from(BATE_PONTO_SETTINGS_TABLE)
+    .update({
+      panel_message_id: panelMessageId || null,
+    })
+    .eq("guild_id", guildId)
+    .select("guild_id, panel_message_id")
+    .single();
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(BATE_PONTO_SETTINGS_TABLE)) {
+      return null;
+    }
+    return unwrap(result, "updateGuildBatePontoPanelMessageId");
+  }
+
+  return result.data;
+}
+
+async function getActiveGuildBatePontoSession(guildId, userId) {
+  if (!guildId || !userId) {
+    return null;
+  }
+
+  const result = await supabase
+    .from(BATE_PONTO_SESSIONS_TABLE)
+    .select(BATE_PONTO_SESSION_SELECT)
+    .eq("guild_id", guildId)
+    .eq("user_id", userId)
+    .in("status", ["active", "on_break"])
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(BATE_PONTO_SESSIONS_TABLE)) {
+      return null;
+    }
+    return unwrap(result, "getActiveGuildBatePontoSession");
+  }
+
+  return result.data;
+}
+
+async function createGuildBatePontoSession(input) {
+  const now = input.startedAt || new Date().toISOString();
+  const result = await supabase
+    .from(BATE_PONTO_SESSIONS_TABLE)
+    .insert({
+      guild_id: input.guildId,
+      user_id: input.userId,
+      status: input.status || "active",
+      started_at: now,
+      last_action_at: now,
+      worked_seconds: 0,
+      break_seconds: 0,
+      break_started_at: null,
+    })
+    .select(BATE_PONTO_SESSION_SELECT)
+    .single();
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(BATE_PONTO_SESSIONS_TABLE)) {
+      return null;
+    }
+    return unwrap(result, "createGuildBatePontoSession");
+  }
+
+  return result.data;
+}
+
+async function updateGuildBatePontoSession(sessionId, input = {}) {
+  if (!sessionId) {
+    return null;
+  }
+
+  const patch = {};
+  if (input.status !== undefined) patch.status = input.status;
+  if (input.lastActionAt !== undefined) patch.last_action_at = input.lastActionAt;
+  if (input.workedSeconds !== undefined) patch.worked_seconds = input.workedSeconds;
+  if (input.breakSeconds !== undefined) patch.break_seconds = input.breakSeconds;
+  if (input.breakStartedAt !== undefined) patch.break_started_at = input.breakStartedAt;
+  if (input.endedAt !== undefined) patch.ended_at = input.endedAt;
+
+  if (!Object.keys(patch).length) {
+    return null;
+  }
+
+  const result = await supabase
+    .from(BATE_PONTO_SESSIONS_TABLE)
+    .update(patch)
+    .eq("id", sessionId)
+    .select(BATE_PONTO_SESSION_SELECT)
+    .single();
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(BATE_PONTO_SESSIONS_TABLE)) {
+      return null;
+    }
+    return unwrap(result, "updateGuildBatePontoSession");
+  }
+
+  return result.data;
+}
+
+async function finishGuildBatePontoSession(sessionId, input = {}) {
+  const now = input.endedAt || new Date().toISOString();
+  return updateGuildBatePontoSession(sessionId, {
+    status: "finished",
+    endedAt: now,
+    lastActionAt: now,
+    workedSeconds: input.workedSeconds,
+    breakSeconds: input.breakSeconds,
+    breakStartedAt: null,
+  });
+}
+
+async function createGuildBatePontoEvent(input) {
+  const result = await supabase
+    .from(BATE_PONTO_EVENTS_TABLE)
+    .insert({
+      guild_id: input.guildId,
+      user_id: input.userId,
+      session_id: input.sessionId || null,
+      action: input.action,
+      worked_seconds: Number(input.workedSeconds || 0),
+      break_seconds: Number(input.breakSeconds || 0),
+      hour_bank_delta_seconds: Number(input.hourBankDeltaSeconds || 0),
+      note: input.note || null,
+    })
+    .select(BATE_PONTO_EVENT_SELECT)
+    .single();
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(BATE_PONTO_EVENTS_TABLE)) {
+      return null;
+    }
+    return unwrap(result, "createGuildBatePontoEvent");
+  }
+
+  return result.data;
+}
+
+async function getGuildBatePontoHourBank(guildId, userId) {
+  if (!guildId || !userId) {
+    return null;
+  }
+
+  const result = await supabase
+    .from(BATE_PONTO_HOUR_BANK_TABLE)
+    .select("id, guild_id, user_id, balance_seconds, created_at, updated_at")
+    .eq("guild_id", guildId)
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(BATE_PONTO_HOUR_BANK_TABLE)) {
+      return null;
+    }
+    return unwrap(result, "getGuildBatePontoHourBank");
+  }
+
+  return result.data;
+}
+
+async function upsertGuildBatePontoHourBank(input) {
+  const result = await supabase
+    .from(BATE_PONTO_HOUR_BANK_TABLE)
+    .upsert(
+      {
+        guild_id: input.guildId,
+        user_id: input.userId,
+        balance_seconds: Number(input.balanceSeconds || 0),
+      },
+      { onConflict: "guild_id,user_id" },
+    )
+    .select("id, guild_id, user_id, balance_seconds, created_at, updated_at")
+    .single();
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(BATE_PONTO_HOUR_BANK_TABLE)) {
+      return null;
+    }
+    return unwrap(result, "upsertGuildBatePontoHourBank");
+  }
+
+  return result.data;
+}
+
+async function getGuildBatePontoRanking(guildId, options = {}) {
+  if (!guildId) {
+    return [];
+  }
+
+  const limit = Math.min(Math.max(Number(options.limit) || 10, 1), 100);
+  const periodDays = Math.max(Number(options.periodDays) || 30, 1);
+  const since = new Date(Date.now() - periodDays * 24 * 60 * 60 * 1000).toISOString();
+
+  const result = await supabase
+    .from(BATE_PONTO_SESSIONS_TABLE)
+    .select("user_id, worked_seconds")
+    .eq("guild_id", guildId)
+    .eq("status", "finished")
+    .gte("ended_at", since);
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(BATE_PONTO_SESSIONS_TABLE)) {
+      return [];
+    }
+    return unwrap(result, "getGuildBatePontoRanking");
+  }
+
+  const totalsByUser = new Map();
+  for (const row of result.data || []) {
+    const current = totalsByUser.get(row.user_id) || 0;
+    totalsByUser.set(row.user_id, current + Number(row.worked_seconds || 0));
+  }
+
+  return [...totalsByUser.entries()]
+    .map(([userId, workedSeconds]) => ({ userId, workedSeconds }))
+    .sort((a, b) => b.workedSeconds - a.workedSeconds)
+    .slice(0, limit);
+}
+
+async function getGuildBatePontoHistory(guildId, options = {}) {
+  if (!guildId) {
+    return [];
+  }
+
+  const limit = Math.min(Math.max(Number(options.limit) || 25, 1), 100);
+  const offset = Math.max(Number(options.offset) || 0, 0);
+
+  let query = supabase
+    .from(BATE_PONTO_EVENTS_TABLE)
+    .select(BATE_PONTO_EVENT_SELECT)
+    .eq("guild_id", guildId)
+    .order("created_at", { ascending: false })
+    .range(offset, offset + limit - 1);
+
+  if (options.userId) {
+    query = query.eq("user_id", options.userId);
+  }
+
+  const result = await query;
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(BATE_PONTO_EVENTS_TABLE)) {
+      return [];
+    }
+    return unwrap(result, "getGuildBatePontoHistory");
+  }
+
+  return result.data || [];
+}
+
 module.exports = {
   deleteSecurityLogQueueItem,
   enqueueSecurityLogQueueItem,
@@ -2424,6 +2803,19 @@ module.exports = {
   getGuildSuggestionVotes,
   getGuildSuggestionVoteCounts,
   createGuildSuggestionVoteLog,
+  getGuildBatePontoSettings,
+  getGuildBatePontoRuntime,
+  getConfiguredBatePontoGuildRuntimes,
+  updateGuildBatePontoPanelMessageId,
+  getActiveGuildBatePontoSession,
+  createGuildBatePontoSession,
+  updateGuildBatePontoSession,
+  finishGuildBatePontoSession,
+  createGuildBatePontoEvent,
+  getGuildBatePontoHourBank,
+  upsertGuildBatePontoHourBank,
+  getGuildBatePontoRanking,
+  getGuildBatePontoHistory,
   getLastTicketForUser,
   getOpenTicketByChannel,
   getOpenTicketCount,

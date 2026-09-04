@@ -1,6 +1,7 @@
 const { ensureOfficialLinkPanel } = require("../services/officialLinkPanelService");
 const { syncAllCaptchaPanels } = require("../services/captchaPanelService");
 const { syncAllSuggestionPanels } = require("../services/suggestionPanelService");
+const { syncAllBatePontoPanels } = require("../services/batePontoPanelService");
 const {
   syncAllTicketPanels,
   syncOpenTicketControlMessages,
@@ -192,6 +193,19 @@ module.exports = {
           }
         } catch (error) {
           console.error("[suggestion-panels]", error);
+        }
+      }, env.ticketPanelSyncIntervalMs);
+
+      setInterval(async () => {
+        try {
+          const result = await syncAllBatePontoPanels(client);
+          if (result.applied.length) {
+            console.log(
+              `[bate-ponto-panels] synced ${result.applied.length}/${result.total} paineis`,
+            );
+          }
+        } catch (error) {
+          console.error("[bate-ponto-panels]", error);
         }
       }, env.ticketPanelSyncIntervalMs);
 

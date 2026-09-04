@@ -1433,6 +1433,203 @@ function buildTicketIntroPayload({ ticket } = {}) {
   };
 }
 
+function buildBatePontoPanelPayload({ settings, title, description, buttonLabel }) {
+  const legacy = {
+    panelTitle:
+      trimText(settings?.panel_title) ||
+      trimText(title) ||
+      "Bate Ponto",
+    panelDescription:
+      trimText(settings?.panel_description) ||
+      trimText(description) ||
+      "Registre entrada, pausa e saida do seu expediente.",
+    panelButtonLabel:
+      trimText(settings?.panel_button_label) ||
+      trimText(buttonLabel) ||
+      "Bater Ponto",
+  };
+
+  const layout = normalizeTicketPanelLayout(settings?.panel_layout, legacy);
+  const derived = deriveLegacyFromLayout(layout, legacy);
+  const state = { hasInteractiveOpenAction: false };
+  const actionOptions = { customId: CUSTOM_IDS.startBatePonto };
+  const components = buildComponentList(layout, state, actionOptions);
+
+  if (!state.hasInteractiveOpenAction) {
+    components.push({
+      type: COMPONENT_TYPE.ACTION_ROW,
+      components: [
+        {
+          type: COMPONENT_TYPE.BUTTON,
+          custom_id: CUSTOM_IDS.startBatePonto,
+          style: BUTTON_STYLE.PRIMARY,
+          label: derived.panelButtonLabel || "Bater Ponto",
+        },
+      ],
+    });
+  }
+
+  return {
+    flags: MESSAGE_FLAG_IS_COMPONENTS_V2,
+    components,
+    allowedMentions: { parse: [] },
+  };
+}
+
+function formatBatePontoDuration(totalSeconds) {
+  const seconds = Math.max(0, Number(totalSeconds) || 0);
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const secs = seconds % 60;
+  const parts = [];
+  if (hours) parts.push(`${hours}h`);
+  if (minutes) parts.push(`${minutes}m`);
+  if (secs || !parts.length) parts.push(`${secs}s`);
+  return parts.join(" ");
+}
+
+const BATE_PONTO_ACTION_LABELS = {
+  start: "Ponto iniciado",
+  pause: "Pausa registrada",
+  resume: "Ponto retomado",
+  finish: "Ponto finalizado",
+};
+
+const BATE_PONTO_ACTION_COLORS = {
+  start: 0x2ecc71,
+  pause: 0xf39c12,
+  resume: 0x3498db,
+  finish: 0x5865f2,
+};
+
+function resolveBatePontoActionAccentColor(action) {
+  return BATE_PONTO_ACTION_COLORS[action] || resolveTicketMessageToneColor("neutral");
+}
+
+function buildBatePontoLogLines({ action, member, session, hourBankBalance }) {
+  const memberLabel = member?.toString?.() || `<@${member?.id || member?.user?.id || ""}>`;
+  const memberId = member?.id || member?.user?.id || "";
+  const timestamp = `<t:${Math.floor(Date.now() / 1000)}:F>`;
+  const lines = [
+    `**Usuario:** ${memberLabel} (\`${memberId}\`)`,
+    `**Acao:** ${BATE_PONTO_ACTION_LABELS[action] || action}`,
+    `**Horario:** ${timestamp}`,
+  ];
+
+  if (session?.id) {
+    lines.push(`**Sessao:** \`#${session.id}\``);
+  }
+
+  if (session?.worked_seconds !== undefined) {
+    lines.push(`**Tempo trabalhado:** ${formatBatePontoDuration(session.worked_seconds)}`);
+  }
+
+  if (session?.break_seconds !== undefined && Number(session.break_seconds) > 0) {
+    lines.push(`**Tempo em pausa:** ${formatBatePontoDuration(session.break_seconds)}`);
+  }
+
+  if (hourBankBalance !== undefined && hourBankBalance !== null) {
+    lines.push(`**Banco de horas:** ${formatBatePontoDuration(hourBankBalance)}`);
+  }
+
+  return lines;
+}
+
+function buildBatePontoLogPayload({
+  action,
+  member,
+  session,
+  settings,
+  hourBankBalance,
+}) {
+  const safeAction = trimText(action) || "start";
+  const title = BATE_PONTO_ACTION_LABELS[safeAction] || "Registro de ponto";
+  const lines = buildBatePontoLogLines({
+    action: safeAction,
+    member,
+    session,
+    hourBankBalance,
+  });
+
+  const logLayout = Array.isArray(settings?.log_layout) ? settings.log_layout : [];
+  if (logLayout.length) {
+    const tokenMap = {
+      "{{member}}": member?.toString?.() || "",
+      "{{member_id}}": member?.id || member?.user?.id || "",
+      "{{action}}": BATE_PONTO_ACTION_LABELS[safeAction] || safeAction,
+      "{{worked_time}}": formatBatePontoDuration(session?.worked_seconds || 0),
+      "{{break_time}}": formatBatePontoDuration(session?.break_seconds || 0),
+      "{{hour_bank}}": formatBatePontoDuration(hourBankBalance || 0),
+      "{{session_id}}": session?.id ? String(session.id) : "",
+      "{{timestamp}}": `<t:${Math.floor(Date.now() / 1000)}:F>`,
+    };
+
+    const legacy = {
+      panelTitle: title,
+      panelDescription: lines.join("\n"),
+      panelButtonLabel: "",
+    };
+    const layout = normalizeTicketPanelLayout(logLayout, legacy);
+    const state = { hasInteractiveOpenAction: false };
+    const components = buildComponentList(layout, state, {});
+
+    return {
+      flags: MessageFlags.IsComponentsV2,
+      components: components.map((component) => {
+        if (component.type !== COMPONENT_TYPE.CONTAINER) {
+          return component;
+        }
+
+        return {
+          ...component,
+          accent_color: resolveBatePontoActionAccentColor(safeAction),
+          components: (component.components || []).map((child) => {
+            if (child.type !== COMPONENT_TYPE.TEXT_DISPLAY || typeof child.content !== "string") {
+              return child;
+            }
+
+            let content = child.content;
+            for (const [token, value] of Object.entries(tokenMap)) {
+              content = content.split(token).join(value);
+            }
+
+            return { ...child, content };
+          }),
+        };
+      }),
+      allowedMentions: { parse: [] },
+    };
+  }
+
+  return buildLogPayload({
+    accentColor: resolveBatePontoActionAccentColor(safeAction),
+    title,
+    lines,
+  });
+}
+
+function buildBatePontoResultPayload({ title, message, tone = "neutral" }) {
+  const safeTitle = trimText(title) || "Bate Ponto";
+  const safeMessage =
+    trimText(message) ||
+    "Registro de ponto atualizado. Use o painel novamente se precisar.";
+
+  return withEphemeralComponentsV2({
+    components: [
+      {
+        type: COMPONENT_TYPE.CONTAINER,
+        accent_color: resolveTicketMessageToneColor(tone),
+        components: [
+          {
+            type: COMPONENT_TYPE.TEXT_DISPLAY,
+            content: [`### ${safeTitle}`, safeMessage].join("\n\n"),
+          },
+        ],
+      },
+    ],
+  });
+}
+
 function buildSuggestionPanelPayload({ settings, title, description, buttonLabel }) {
   const legacy = {
     panelTitle:
@@ -1974,6 +2171,9 @@ module.exports = {
   buildTicketPanelPayload,
   buildCaptchaPanelPayload,
   buildSuggestionPanelPayload,
+  buildBatePontoPanelPayload,
+  buildBatePontoLogPayload,
+  buildBatePontoResultPayload,
   buildPublishedSuggestionPayload,
   buildSuggestionVoteDetailsPayload,
   buildCaptchaChallengePayload,

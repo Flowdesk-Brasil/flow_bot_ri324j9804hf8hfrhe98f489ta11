@@ -28,6 +28,9 @@ const CUSTOM_IDS = {
   submitSuggestionModal: "suggestion:submit",
   suggestionTitleInput: "suggestion:title",
   suggestionBodyInput: "suggestion:body",
+  startBatePonto: "bateponto:start",
+  submitBatePontoModal: "bateponto:submit",
+  batePontoActionSelect: "bateponto:action",
 };
 
 module.exports = { CUSTOM_IDS };
