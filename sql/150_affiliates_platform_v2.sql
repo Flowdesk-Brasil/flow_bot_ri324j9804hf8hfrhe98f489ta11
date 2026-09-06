@@ -376,6 +376,48 @@ begin
 end;
 $$;
 
+-- Ranking mensal agregado no banco.
+--
+-- Sem isto, tanto o painel quanto o calculo do bonus de podio carregavam todas
+-- as conversoes aprovadas do mes para somar em memoria. O painel fazia isso a
+-- cada abertura; o bonus, a cada liquidacao de pedido, ou seja, dentro do
+-- caminho de pagamento. Agregar no banco e devolver so o topo mantem o custo
+-- constante conforme affiliate_conversions cresce.
+create or replace function public.affiliate_monthly_ranking(
+  month_start timestamptz,
+  max_rows integer default 10
+)
+returns table (
+  affiliate_row_id uuid,
+  sales_count bigint,
+  commission_total numeric
+)
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select
+    c.affiliate_id,
+    count(*)::bigint,
+    coalesce(sum(c.commission_amount), 0)
+  from public.affiliate_conversions c
+  where c.status = 'approved'
+    and c.reversed_at is null
+    and c.conversion_date >= month_start
+  group by c.affiliate_id
+  order by
+    coalesce(sum(c.commission_amount), 0) desc,
+    count(*) desc,
+    c.affiliate_id
+  limit greatest(coalesce(max_rows, 10), 1);
+$$;
+
+-- Indice que sustenta a agregacao acima.
+create index if not exists idx_affiliate_conversions_monthly_ranking
+  on public.affiliate_conversions (conversion_date desc, affiliate_id)
+  where status = 'approved' and reversed_at is null;
+
 -- Reconcilia todos os afiliados de uma vez (uso operacional/auditoria).
 create or replace function public.affiliate_recompute_all_balances()
 returns integer
@@ -458,3 +500,6 @@ revoke all on function public.affiliate_recompute_balances(uuid) from public, an
 revoke all on function public.affiliate_recompute_all_balances() from public, anon, authenticated;
 grant execute on function public.affiliate_recompute_balances(uuid) to service_role;
 grant execute on function public.affiliate_recompute_all_balances() to service_role;
+
+revoke all on function public.affiliate_monthly_ranking(timestamptz, integer) from public, anon, authenticated;
+grant execute on function public.affiliate_monthly_ranking(timestamptz, integer) to service_role;
