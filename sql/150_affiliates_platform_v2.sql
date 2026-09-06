@@ -13,6 +13,8 @@
 --   4. affiliate_terms_acceptances - registro de aceite (LGPD / contrato)
 --   5. Colunas novas em affiliates, conversions, withdrawals e settings
 --   6. Funcao de recalculo de saldo a partir do ledger
+--   7. Remove os checks de saldo >= 0 da v1, que impediam a divida gerada por
+--      reembolso posterior ao saque
 
 create extension if not exists pgcrypto;
 
@@ -82,6 +84,26 @@ alter table public.affiliates
 alter table public.affiliates
   add constraint affiliates_highest_level_check
   check (highest_level is null or highest_level in ('bronze', 'silver', 'gold', 'diamond'));
+
+-- Saldo negativo passa a ser permitido.
+--
+-- A v1 exigia balance_available >= 0 e balance_pending >= 0. Isso quebra o caso
+-- em que um reembolso chega depois de o afiliado ja ter sacado a comissao: o
+-- valor precisa virar divida, abatida pelas proximas comissoes. Com o check em
+-- vigor, affiliate_recompute_balances() falharia com violacao de constraint
+-- justamente nesse cenario, e como o lancamento de estorno ja estaria gravado
+-- (o ledger e imutavel), o saldo do afiliado ficaria congelado: todo recalculo
+-- seguinte quebraria.
+--
+-- Quem impede saque com saldo negativo e requestWithdrawal, na aplicacao.
+alter table public.affiliates
+  drop constraint if exists affiliates_balance_available_check;
+
+alter table public.affiliates
+  drop constraint if exists affiliates_balance_pending_check;
+
+-- total_earned continua nao-negativo: a funcao de recalculo aplica greatest(x, 0)
+-- antes de gravar, porque e uma metrica de vida, nao um saldo.
 
 create table if not exists public.affiliate_terms_acceptances (
   id uuid primary key default gen_random_uuid(),
