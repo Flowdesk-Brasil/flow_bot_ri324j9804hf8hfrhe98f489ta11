@@ -31,6 +31,9 @@ const CUSTOM_IDS = {
   startBatePonto: "bateponto:start",
   submitBatePontoModal: "bateponto:submit",
   batePontoActionSelect: "bateponto:action",
+  startWhitelist: "whitelist:request",
+  submitWhitelistModal: "whitelist:submit",
+  whitelistIdentifierInput: "whitelist:identifier",
 };
 
 module.exports = { CUSTOM_IDS };

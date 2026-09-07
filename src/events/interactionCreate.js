@@ -58,6 +58,12 @@ const {
   isSorteioModalSubmit,
 } = require("../services/sorteioService");
 const {
+  handleWhitelistButtonInteraction,
+  handleWhitelistModalSubmit,
+  isWhitelistButtonInteraction,
+  isWhitelistModalSubmit,
+} = require("../services/whitelistService");
+const {
   getGuildTicketRuntime,
 } = require("../services/supabaseService");
 const { isDiscordUserSuspended, isDiscordUserAtRisk } = require("../services/violationService");
@@ -164,6 +170,10 @@ module.exports = {
           await handleSorteioModalSubmit(interaction);
           return;
         }
+        if (isWhitelistModalSubmit(interaction)) {
+          await handleWhitelistModalSubmit(interaction);
+          return;
+        }
         if (isSalesComponentInteraction(interaction)) {
           await handleSalesInteraction(interaction, client);
           return;
@@ -223,6 +233,11 @@ module.exports = {
 
       if (isSorteioButtonInteraction(interaction)) {
         await handleSorteioButtonInteraction(interaction);
+        return;
+      }
+
+      if (isWhitelistButtonInteraction(interaction)) {
+        await handleWhitelistButtonInteraction(interaction);
         return;
       }
 

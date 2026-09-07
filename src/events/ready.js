@@ -1,5 +1,6 @@
 const { ensureOfficialLinkPanel } = require("../services/officialLinkPanelService");
 const { syncAllCaptchaPanels } = require("../services/captchaPanelService");
+const { syncAllWhitelistPanels } = require("../services/whitelistPanelService");
 const { syncAllSuggestionPanels } = require("../services/suggestionPanelService");
 const { syncAllBatePontoPanels } = require("../services/batePontoPanelService");
 const {
@@ -185,6 +186,19 @@ module.exports = {
           }
         } catch (error) {
           console.error("[captcha-panels]", error);
+        }
+      }, env.ticketPanelSyncIntervalMs);
+
+      setInterval(async () => {
+        try {
+          const result = await syncAllWhitelistPanels(client);
+          if (result.applied.length) {
+            console.log(
+              `[whitelist-panels] synced ${result.applied.length}/${result.total} paineis`,
+            );
+          }
+        } catch (error) {
+          console.error("[whitelist-panels]", error);
         }
       }, env.ticketPanelSyncIntervalMs);
 

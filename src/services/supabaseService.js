@@ -21,6 +21,7 @@ const ANTILINK_SETTINGS_TABLE = "guild_antilink_settings";
 const AUTOROLE_SETTINGS_TABLE = "guild_autorole_settings";
 const AUTOROLE_QUEUE_TABLE = "guild_autorole_queue";
 const SECURITY_LOGS_SETTINGS_TABLE = "guild_security_logs_settings";
+const WHITELIST_SETTINGS_TABLE = "guild_whitelist_settings";
 const SECURITY_LOG_QUEUE_TABLE = "guild_security_log_queue";
 const PLAN_GUILDS_TABLE = "auth_user_plan_guilds";
 const USER_PLAN_STATE_TABLE = "auth_user_plan_state";
@@ -47,6 +48,7 @@ const moduleRuntimeCache = {
   antiLink: new Map(),
   autoRole: new Map(),
   securityLogs: new Map(),
+  whitelist: new Map(),
 };
 const moduleRuntimeInflight = {
   ticket: new Map(),
@@ -57,6 +59,7 @@ const moduleRuntimeInflight = {
   antiLink: new Map(),
   autoRole: new Map(),
   securityLogs: new Map(),
+  whitelist: new Map(),
 };
 let configuredTicketGuildRuntimesCache = null;
 let configuredTicketGuildRuntimesInflight = null;
@@ -1818,6 +1821,123 @@ async function getGuildSecurityLogsRuntime(guildId) {
   );
 }
 
+const WHITELIST_RUNTIME_SELECT =
+  "guild_id, enabled, panel_channel_id, review_channel_id, logs_channel_id, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, approved_role_ids, denied_role_ids, review_role_ids, identifier_kind, identifier_label, identifier_placeholder, approval_mode, connection_mode, db_engine, db_host, db_port, db_name, db_user, db_ssl, db_password_cipher, mapping, mapping_status, last_health_ok, updated_at";
+
+async function getGuildWhitelistSettings(guildId) {
+  const result = await supabase
+    .from(WHITELIST_SETTINGS_TABLE)
+    .select(WHITELIST_RUNTIME_SELECT)
+    .eq("guild_id", guildId)
+    .maybeSingle();
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(WHITELIST_SETTINGS_TABLE)) {
+      return null;
+    }
+    return unwrap(result, "getGuildWhitelistSettings");
+  }
+
+  return result.data;
+}
+
+async function loadGuildWhitelistRuntime(guildId) {
+  const [settings, accountLicenseRuntime] = await Promise.all([
+    getGuildWhitelistSettings(guildId),
+    getGuildAccountLicenseRuntime(guildId),
+  ]);
+
+  return {
+    guildId,
+    settings: settings || null,
+    licenseStatus: accountLicenseRuntime.licenseStatus,
+    licenseUsable: accountLicenseRuntime.licenseUsable,
+    latestCoverage: accountLicenseRuntime.latestCoverage,
+    isConfigured: Boolean(settings?.enabled && settings?.panel_channel_id),
+  };
+}
+
+async function getGuildWhitelistRuntime(guildId) {
+  return await withCachedResult(
+    moduleRuntimeCache.whitelist,
+    moduleRuntimeInflight.whitelist,
+    guildId,
+    MODULE_RUNTIME_CACHE_TTL_MS,
+    () => loadGuildWhitelistRuntime(guildId),
+  );
+}
+
+async function updateGuildWhitelistPanelMessageId(guildId, panelMessageId) {
+  const result = await supabase
+    .from(WHITELIST_SETTINGS_TABLE)
+    .update({
+      panel_message_id: panelMessageId || null,
+    })
+    .eq("guild_id", guildId)
+    .select("guild_id, panel_message_id")
+    .single();
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(WHITELIST_SETTINGS_TABLE)) {
+      return null;
+    }
+    return unwrap(result, "updateGuildWhitelistPanelMessageId");
+  }
+
+  return result.data;
+}
+
+async function loadConfiguredWhitelistGuildRuntimes() {
+  const result = await supabase
+    .from(WHITELIST_SETTINGS_TABLE)
+    .select(
+      "guild_id, enabled, panel_channel_id, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, identifier_label, updated_at",
+    )
+    .eq("enabled", true);
+
+  if (result.error) {
+    const code = typeof result.error.code === "string" ? result.error.code : "";
+    const message = String(result.error.message || "").toLowerCase();
+    if (code === "42P01" || message.includes(WHITELIST_SETTINGS_TABLE)) {
+      return [];
+    }
+    return unwrap(result, "loadConfiguredWhitelistGuildRuntimes");
+  }
+
+  const settingsRows = result.data || [];
+  const accountLicenseRuntimeByGuild = await getGuildAccountLicenseRuntimeMap(
+    settingsRows.map((row) => row.guild_id),
+  );
+
+  return settingsRows
+    .map((settingsRow) => {
+      const accountLicenseRuntime =
+        accountLicenseRuntimeByGuild.get(settingsRow.guild_id) || {
+          licenseStatus: "not_paid",
+          licenseUsable: false,
+          latestCoverage: null,
+        };
+
+      return {
+        guildId: settingsRow.guild_id,
+        settings: settingsRow,
+        licenseStatus: accountLicenseRuntime.licenseStatus,
+        licenseUsable: accountLicenseRuntime.licenseUsable,
+        latestCoverage: accountLicenseRuntime.latestCoverage,
+        isConfigured: Boolean(settingsRow.panel_channel_id),
+      };
+    })
+    .filter((runtime) => runtime.settings);
+}
+
+async function getConfiguredWhitelistGuildRuntimes() {
+  return loadConfiguredWhitelistGuildRuntimes();
+}
+
 async function loadConfiguredTicketGuildRuntimes() {
   const [settingsResult, staffResult] = await Promise.all([
     supabase
@@ -2814,6 +2934,10 @@ module.exports = {
   getGuildWelcomeRuntime,
   getGuildCaptchaRuntime,
   getGuildCaptchaSettings,
+  getGuildWhitelistRuntime,
+  getGuildWhitelistSettings,
+  getConfiguredWhitelistGuildRuntimes,
+  updateGuildWhitelistPanelMessageId,
   createGuildCaptchaSession,
   getGuildCaptchaSession,
   deleteGuildCaptchaSession,

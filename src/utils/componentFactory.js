@@ -661,7 +661,13 @@ function buildTextDisplay(content) {
 }
 
 function buildButton(component, state, options = {}) {
-  const customId = trimText(options.customId) || CUSTOM_IDS.openTicket;
+  let customId = trimText(options.customId) || CUSTOM_IDS.openTicket;
+  if (typeof options.resolveButtonCustomId === "function") {
+    const resolved = options.resolveButtonCustomId(component);
+    if (trimText(resolved)) {
+      customId = trimText(resolved);
+    }
+  }
   const disableNonLink = Boolean(options.disableNonLink);
   const emoji = buildDiscordButtonEmojiPayload(component.emoji);
 
@@ -1021,6 +1027,81 @@ function buildCaptchaPanelPayload({ settings, title, description, buttonLabel })
           custom_id: CUSTOM_IDS.startCaptcha,
           style: BUTTON_STYLE.PRIMARY,
           label: derived.panelButtonLabel || "Iniciar captcha",
+        },
+      ],
+    });
+  }
+
+  return {
+    flags: MESSAGE_FLAG_IS_COMPONENTS_V2,
+    components,
+    allowedMentions: { parse: [] },
+  };
+}
+
+const WHITELIST_LOCKED_REQUEST_ID = "whitelist-lock-request";
+
+function buildWhitelistPanelPayload({ settings, guildName }) {
+  const identifierLabel =
+    trimText(settings?.identifier_label) || "ID / License";
+  const legacy = {
+    panelTitle:
+      trimText(settings?.panel_title) || "Whitelist da cidade",
+    panelDescription:
+      trimText(settings?.panel_description) ||
+      "Clique no botao abaixo e informe seu identificador para entrar na analise.",
+    panelButtonLabel:
+      trimText(settings?.panel_button_label) || "Solicitar whitelist",
+  };
+
+  let layout = normalizeTicketPanelLayout(settings?.panel_layout, legacy);
+  const tokenMap = {
+    guild_name: trimText(guildName) || "este servidor",
+    identifier_label: identifierLabel,
+  };
+  layout = (function applyWhitelistTokens(items) {
+    return (Array.isArray(items) ? items : []).map((component) => {
+      if (!component || typeof component !== "object") return component;
+      if (component.type === "container") {
+        return { ...component, children: applyWhitelistTokens(component.children || []) };
+      }
+      if (component.type === "content") {
+        let markdown = String(component.markdown || "");
+        markdown = markdown.split("{{guild_name}}").join(tokenMap.guild_name);
+        markdown = markdown.split("{{identifier_label}}").join(tokenMap.identifier_label);
+        return { ...component, markdown };
+      }
+      if (component.type === "button" || component.type === "link_button") {
+        let label = String(component.label || "");
+        label = label.split("{{guild_name}}").join(tokenMap.guild_name);
+        label = label.split("{{identifier_label}}").join(tokenMap.identifier_label);
+        return { ...component, label };
+      }
+      return component;
+    });
+  })(layout);
+
+  const state = { hasInteractiveOpenAction: false };
+  const actionOptions = {
+    customId: CUSTOM_IDS.startWhitelist,
+    resolveButtonCustomId(component) {
+      if (component.id === WHITELIST_LOCKED_REQUEST_ID) {
+        return CUSTOM_IDS.startWhitelist;
+      }
+      return trimText(component.customId || component.id) || CUSTOM_IDS.startWhitelist;
+    },
+  };
+  const components = buildComponentList(layout, state, actionOptions);
+
+  if (!state.hasInteractiveOpenAction) {
+    components.push({
+      type: COMPONENT_TYPE.ACTION_ROW,
+      components: [
+        {
+          type: COMPONENT_TYPE.BUTTON,
+          custom_id: CUSTOM_IDS.startWhitelist,
+          style: BUTTON_STYLE.PRIMARY,
+          label: legacy.panelButtonLabel || "Solicitar whitelist",
         },
       ],
     });
@@ -1698,6 +1779,94 @@ function buildBatePontoVoiceWarningDmPayload({
   };
 }
 
+const SORTEIO_LOCKED_ENTER_ID = "sorteio-lock-enter";
+const SORTEIO_LOCKED_GEAR_ID = "sorteio-lock-gear";
+
+function buildSorteioPublicPayload({ settings, sorteioId, tokenMap, ended = false }) {
+  const rawLayout = ended
+    ? Array.isArray(settings?.ended_layout)
+      ? settings.ended_layout
+      : []
+    : Array.isArray(settings?.active_layout)
+      ? settings.active_layout
+      : [];
+
+  if (!rawLayout.length) {
+    return null;
+  }
+
+  const legacy = {
+    panelTitle: "Sorteio",
+    panelDescription: "",
+    panelButtonLabel: ended ? "" : "Entrar no sorteio",
+  };
+
+  let layout = normalizeTicketPanelLayout(rawLayout, legacy);
+  if (tokenMap && typeof tokenMap === "object") {
+    layout = applyWelcomeTokensToLayout(layout, tokenMap);
+  }
+
+  const state = { hasInteractiveOpenAction: false };
+  const sorteioPrefix = "sorteio:";
+  const actionOptions = {
+    resolveButtonCustomId(component) {
+      if (component.id === SORTEIO_LOCKED_ENTER_ID) {
+        return `${sorteioPrefix}enter:${sorteioId}`;
+      }
+      if (component.id === SORTEIO_LOCKED_GEAR_ID) {
+        return `${sorteioPrefix}gear:${sorteioId}`;
+      }
+      return trimText(component.customId || component.id);
+    },
+  };
+
+  const components = buildComponentList(layout, state, actionOptions);
+
+  if (ended) {
+    components.push({
+      type: COMPONENT_TYPE.ACTION_ROW,
+      components: [
+        {
+          type: COMPONENT_TYPE.BUTTON,
+          style: BUTTON_STYLE.SECONDARY,
+          label: "Ver participantes",
+          custom_id: `${sorteioPrefix}participants:${sorteioId}:0`,
+        },
+        {
+          type: COMPONENT_TYPE.BUTTON,
+          style: BUTTON_STYLE.PRIMARY,
+          label: "Reroll",
+          custom_id: `${sorteioPrefix}reroll:${sorteioId}`,
+        },
+      ],
+    });
+  } else if (!state.hasInteractiveOpenAction) {
+    components.push({
+      type: COMPONENT_TYPE.ACTION_ROW,
+      components: [
+        {
+          type: COMPONENT_TYPE.BUTTON,
+          style: BUTTON_STYLE.SUCCESS,
+          label: "Entrar no sorteio",
+          custom_id: `${sorteioPrefix}enter:${sorteioId}`,
+        },
+        {
+          type: COMPONENT_TYPE.BUTTON,
+          style: BUTTON_STYLE.SECONDARY,
+          label: "⚙",
+          custom_id: `${sorteioPrefix}gear:${sorteioId}`,
+        },
+      ],
+    });
+  }
+
+  return {
+    flags: MESSAGE_FLAG_IS_COMPONENTS_V2,
+    components,
+    allowedMentions: { parse: ["users", "roles"] },
+  };
+}
+
 function buildSuggestionPanelPayload({ settings, title, description, buttonLabel }) {
   const legacy = {
     panelTitle:
@@ -2238,11 +2407,13 @@ function buildAiSuggestionPayload({ suggestion, guildName }) {
 module.exports = {
   buildTicketPanelPayload,
   buildCaptchaPanelPayload,
+  buildWhitelistPanelPayload,
   buildSuggestionPanelPayload,
   buildBatePontoPanelPayload,
   buildBatePontoLogPayload,
   buildBatePontoResultPayload,
   buildBatePontoVoiceWarningDmPayload,
+  buildSorteioPublicPayload,
   buildPublishedSuggestionPayload,
   buildSuggestionVoteDetailsPayload,
   buildCaptchaChallengePayload,

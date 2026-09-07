@@ -4,6 +4,10 @@ const { env } = require("../config/env");
 const SORTEIOS_TABLE = "guild_sorteios";
 const ENTRIES_TABLE = "guild_sorteio_entries";
 const BLACKLIST_TABLE = "guild_sorteio_blacklist";
+const SETTINGS_TABLE = "guild_sorteio_settings";
+
+const SORTEIO_SETTINGS_SELECT =
+  "guild_id, enabled, logs_channel_id, create_role_ids, reroll_role_ids, active_layout, ended_layout, default_winner_count, default_duration_minutes, updated_at";
 
 const supabase = createClient(env.supabaseUrl, env.supabaseServiceRoleKey, {
   auth: { autoRefreshToken: false, persistSession: false },
@@ -255,6 +259,23 @@ async function getBlacklistUserIds(sorteioId) {
   }
 }
 
+async function getGuildSorteioSettings(guildId) {
+  try {
+    const data = unwrap(
+      await supabase
+        .from(SETTINGS_TABLE)
+        .select(SORTEIO_SETTINGS_SELECT)
+        .eq("guild_id", guildId)
+        .maybeSingle(),
+      "getGuildSorteioSettings",
+    );
+    return data;
+  } catch (error) {
+    if (isMissingTableError(error)) return null;
+    throw error;
+  }
+}
+
 module.exports = {
   createSorteio,
   updateSorteio,
@@ -262,6 +283,7 @@ module.exports = {
   getSorteioByMessageId,
   getActiveSorteiosToEnd,
   getSorteioHistory,
+  getGuildSorteioSettings,
   addEntry,
   removeEntry,
   getEntries,

@@ -8,7 +8,7 @@ const {
   TextInputBuilder,
   TextInputStyle,
 } = require("discord.js");
-const { withEphemeralComponentsV2 } = require("../utils/componentFactory");
+const { withEphemeralComponentsV2, buildSorteioPublicPayload } = require("../utils/componentFactory");
 const sorteioDb = require("./sorteioDbService");
 
 const SORTEIO_PREFIX = "sorteio:";
@@ -101,14 +101,68 @@ function createDefaultDraft(guildId, userId) {
   };
 }
 
-function canManageSorteio(interaction, sorteio) {
+function memberHasAnyRole(member, roleIds) {
+  if (!Array.isArray(roleIds) || !roleIds.length) return false;
+  return roleIds.some((roleId) => member.roles.cache.has(roleId));
+}
+
+function hasManageGuild(member) {
+  return (
+    member.permissions.has(PermissionFlagsBits.Administrator) ||
+    member.permissions.has(PermissionFlagsBits.ManageGuild)
+  );
+}
+
+function canCreateSorteio(interaction, settings) {
+  const member = interaction.member;
+  if (!member) return false;
+  if (hasManageGuild(member)) return true;
+  const roleIds = settings?.create_role_ids || [];
+  if (roleIds.length) return memberHasAnyRole(member, roleIds);
+  return hasManageGuild(member);
+}
+
+function canManageSorteio(interaction, sorteio, settings) {
   if (!interaction.guild) return false;
   const member = interaction.member;
   if (!member) return false;
-  if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
-  if (member.permissions.has(PermissionFlagsBits.ManageGuild)) return true;
+  if (hasManageGuild(member)) return true;
   if (sorteio && sorteio.host_user_id === interaction.user.id) return true;
+  const rerollRoleIds = settings?.reroll_role_ids || [];
+  if (rerollRoleIds.length && memberHasAnyRole(member, rerollRoleIds)) return true;
   return false;
+}
+
+function buildSorteioTokenMap(sorteio, entryCount, { ended = false } = {}) {
+  const endsUnix = Math.floor(new Date(sorteio.ends_at).getTime() / 1000);
+  return {
+    "{{sorteio_header}}": ended ? "## 🏁 Sorteio encerrado" : "## 🎉 Sorteio ativo",
+    "{{sorteio_title}}": `### ${sorteio.title}`,
+    "{{sorteio_description}}": sorteio.description || "-# Sem descricao adicional.",
+    "{{sorteio_ends_at}}": ended
+      ? "-# Status: **Encerrado**"
+      : `-# ⏳ Termina: <t:${endsUnix}:R> (<t:${endsUnix}:f>)`,
+    "{{sorteio_participants}}": `-# 👥 Participantes: **${entryCount}**`,
+    "{{sorteio_winners_count}}": `-# 🏆 Vencedores: **${sorteio.winner_count}**`,
+    "{{sorteio_requirements}}": formatRequirements(sorteio),
+    "{{sorteio_host}}": `-# 🛡 Host: <@${sorteio.host_user_id}>`,
+    "{{sorteio_footer}}": ended
+      ? "-# Use **Ver participantes** ou **Reroll** abaixo."
+      : "-# Clique em **Entrar no sorteio** para participar. Boa sorte!",
+  };
+}
+
+async function buildSorteioMessagePayload(sorteio, entryCount, { ended = false } = {}) {
+  const settings = await sorteioDb.getGuildSorteioSettings(sorteio.guild_id);
+  const tokenMap = buildSorteioTokenMap(sorteio, entryCount, { ended });
+  const customPayload = buildSorteioPublicPayload({
+    settings,
+    sorteioId: sorteio.id,
+    tokenMap,
+    ended,
+  });
+  if (customPayload) return customPayload;
+  return buildActiveSorteioPayload(sorteio, entryCount, { ended });
 }
 
 function parseIdList(raw) {
@@ -592,7 +646,7 @@ async function updateSorteioMessage(client, sorteio) {
   if (!message) return;
 
   const entryCount = await sorteioDb.getEntryCount(sorteio.id);
-  const payload = buildActiveSorteioPayload(sorteio, entryCount, {
+  const payload = await buildSorteioMessagePayload(sorteio, entryCount, {
     ended: sorteio.status !== "active",
   });
   await message.edit(payload).catch(() => null);
@@ -748,7 +802,7 @@ async function publishSorteio(interaction) {
     );
   }
 
-  const payload = buildActiveSorteioPayload(created, 0);
+  const payload = await buildSorteioMessagePayload(created, 0);
   const message = await interaction.channel.send(payload);
 
   await sorteioDb.updateSorteio(created.id, { message_id: message.id });
@@ -1135,10 +1189,14 @@ async function handleReroll(interaction, sorteioId) {
     return;
   }
 
-  if (!canManageSorteio(interaction, sorteio)) {
+  const settings = await sorteioDb.getGuildSorteioSettings(sorteio.guild_id);
+  if (!canManageSorteio(interaction, sorteio, settings)) {
     await replySorteio(
       interaction,
-      buildFailurePayload("Sem permissao", "Apenas o host ou quem tem Gerenciar Servidor pode fazer reroll."),
+      buildFailurePayload(
+        "Sem permissao",
+        "Apenas o host, cargos autorizados no dashboard ou quem tem Gerenciar Servidor pode fazer reroll.",
+      ),
     );
     return;
   }
@@ -1342,17 +1400,34 @@ async function executeSorteioCommand(interaction) {
     return;
   }
 
-  if (!canManageSorteio(interaction)) {
+  const settings = await sorteioDb.getGuildSorteioSettings(interaction.guildId);
+  if (settings?.enabled === false) {
     await interaction.reply(
       buildFailurePayload(
-        "Sem permissao",
-        "Voce precisa da permissao **Gerenciar Servidor** para criar sorteios.",
+        "Modulo desativado",
+        "Ative **Sorteios** no dashboard FlowDesk para usar o comando /sorteio.",
       ),
     );
     return;
   }
 
-  const draft = getDraft(interaction.guildId, interaction.user.id);
+  if (!canCreateSorteio(interaction, settings)) {
+    await interaction.reply(
+      buildFailurePayload(
+        "Sem permissao",
+        "Voce precisa da permissao **Gerenciar Servidor** ou de um cargo autorizado no dashboard para criar sorteios.",
+      ),
+    );
+    return;
+  }
+
+  let draft = getDraft(interaction.guildId, interaction.user.id);
+  if (settings) {
+    draft = saveDraft(interaction.guildId, interaction.user.id, {
+      durationMinutes: Number(settings.default_duration_minutes) || draft.durationMinutes,
+      winnerCount: Number(settings.default_winner_count) || draft.winnerCount,
+    });
+  }
   const payload = buildSetupPanelPayload(draft, interaction.user.id);
 
   const message = await interaction.reply({
