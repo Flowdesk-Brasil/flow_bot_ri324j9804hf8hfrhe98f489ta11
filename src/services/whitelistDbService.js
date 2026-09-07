@@ -120,6 +120,39 @@ async function findQueuedAgentJob(guildId, requestId, operation) {
   return unwrap(result, "findQueuedAgentJob");
 }
 
+async function listDoneJobsForDiscordSync(limit = 25) {
+  const result = await supabase
+    .from(AGENT_JOBS_TABLE)
+    .select("id, guild_id, request_id, operation, result, error_message, status, discord_synced")
+    .eq("status", "done")
+    .eq("discord_synced", false)
+    .not("request_id", "is", null)
+    .order("completed_at", { ascending: true })
+    .limit(limit);
+  if (result.error && String(result.error.message || "").includes("discord_synced")) {
+    const fallback = await supabase
+      .from(AGENT_JOBS_TABLE)
+      .select("id, guild_id, request_id, operation, result, error_message, status")
+      .eq("status", "done")
+      .not("request_id", "is", null)
+      .order("id", { ascending: false })
+      .limit(limit);
+    return unwrap(fallback, "listDoneJobsForDiscordSync") || [];
+  }
+  return unwrap(result, "listDoneJobsForDiscordSync") || [];
+}
+
+async function markJobDiscordSynced(id) {
+  const result = await supabase
+    .from(AGENT_JOBS_TABLE)
+    .update({ discord_synced: true })
+    .eq("id", id);
+  if (result.error && String(result.error.message || "").includes("discord_synced")) {
+    return;
+  }
+  unwrap(result, "markJobDiscordSynced");
+}
+
 module.exports = {
   getGuildWhitelistSettings,
   updateGuildWhitelistPanelMessageId,
@@ -131,4 +164,6 @@ module.exports = {
   insertWhitelistAudit,
   enqueueAgentJob,
   findQueuedAgentJob,
+  listDoneJobsForDiscordSync,
+  markJobDiscordSynced,
 };

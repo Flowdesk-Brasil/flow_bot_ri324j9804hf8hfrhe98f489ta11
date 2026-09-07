@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; script-src 'self' 'unsafe-inline'; img-src 'self' https: data:;" />
+  <title>Flowdesk Launcher</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #050505;
+      --panel: #0a0a0a;
+      --line: rgba(255,255,255,.06);
+      --text: #f4f4f5;
+      --muted: #8a8a8e;
+      --soft: #5c5c60;
+      --ok: #86efac;
+      --wait: #f6d48a;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); font-family: Geist, Inter, Segoe UI, sans-serif; overflow: hidden; }
+    body { position: relative; }
+    .orb {
+      position: absolute; inset: auto; pointer-events: none; filter: blur(42px); opacity: .42;
+      animation: drift 9s ease-in-out infinite;
+    }
+    .orb-a { width: 220px; height: 220px; left: -70px; top: 70px; background: radial-gradient(circle, rgba(255,255,255,.18), transparent 68%); }
+    .orb-b { width: 180px; height: 180px; right: -50px; top: 280px; background: radial-gradient(circle, rgba(134,239,172,.12), transparent 70%); animation-delay: -3s; }
+    .grain {
+      pointer-events: none; position: absolute; inset: 0; opacity: .035;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+    }
+    @keyframes drift { 50% { transform: translate3d(12px, -16px, 0) scale(1.08); } }
+    .titlebar {
+      height: 48px; display: flex; align-items: center; justify-content: space-between;
+      padding: 0 16px; -webkit-app-region: drag; position: relative; z-index: 2;
+    }
+    .brand { display: flex; align-items: center; gap: 10px; font-size: 11px; letter-spacing: .18em; text-transform: uppercase; color: #9a9a9e; font-weight: 500; }
+    .mark {
+      width: 22px; height: 22px; border-radius: 7px; background: #fff; color: #111;
+      display: grid; place-items: center; font-size: 11px; font-weight: 700;
+      box-shadow: 0 0 0 4px rgba(255,255,255,.04);
+    }
+    .window-actions { display: flex; gap: 8px; -webkit-app-region: no-drag; }
+    .window-actions button {
+      width: 12px; height: 12px; border: 0; border-radius: 99px; background: #2a2a2a; cursor: pointer;
+      transition: transform .2s ease, background .2s ease;
+    }
+    .window-actions button:hover { transform: scale(1.12); }
+    .window-actions .close { background: #d4d4d4; }
+    main { position: relative; z-index: 1; padding: 8px 24px 28px; height: calc(100% - 48px); }
+    .view { display: none; animation: rise .55s cubic-bezier(.22,1,.36,1) both; }
+    .view.show { display: block; }
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(14px); }
+      to { opacity: 1; transform: none; }
+    }
+    .kicker { margin: 0 0 10px; font-size: 11px; letter-spacing: .2em; text-transform: uppercase; color: #6f6f74; font-weight: 500; }
+    h1 {
+      margin: 0; font-family: "Instrument Serif", Georgia, serif; font-size: 40px; line-height: .96;
+      letter-spacing: -.03em; font-weight: 400;
+    }
+    .sub { color: var(--muted); line-height: 1.6; font-size: 14px; margin: 14px 0 0; }
+    .hero-mark {
+      width: 72px; height: 72px; border-radius: 22px; margin: 18px 0 22px;
+      background:
+        radial-gradient(circle at 30% 28%, #fff, #8d8d8d 36%, #111 72%);
+      box-shadow: 0 18px 50px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.35);
+      animation: breathe 2.8s ease-in-out infinite;
+    }
+    @keyframes breathe { 50% { transform: scale(.96); filter: brightness(1.08); } }
+    .stack { display: grid; gap: 10px; margin-top: 24px; }
+    .row {
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+      min-height: 72px; padding: 14px 16px; border-radius: 18px;
+      border: 1px solid var(--line); background: linear-gradient(180deg, #101010 0%, #0b0b0b 100%);
+      animation: rise .6s cubic-bezier(.22,1,.36,1) both;
+    }
+    .row-left { display: flex; align-items: center; gap: 12px; min-width: 0; }
+    .ico {
+      width: 36px; height: 36px; border-radius: 12px; display: grid; place-items: center;
+      background: #141414; border: 1px solid var(--line); color: #ececec; flex: 0 0 auto;
+    }
+    .row strong { display: block; font-size: 14px; font-weight: 600; }
+    .row span.meta { display: block; margin-top: 3px; color: var(--muted); font-size: 12px; }
+    button.primary, button.ghost, button.mini {
+      border: 0; cursor: pointer; font-family: inherit; font-weight: 600;
+      transition: transform .2s ease, opacity .2s ease, background .2s ease;
+    }
+    button.primary, button.ghost { height: 48px; padding: 0 18px; }
+    button.primary {
+      width: 100%; margin-top: 22px; border-radius: 999px; background: #fff; color: #111;
+      box-shadow: 0 10px 30px rgba(255,255,255,.08);
+    }
+    button.primary:hover { transform: translateY(-1px) scale(1.01); }
+    button.primary:active { transform: scale(.985); }
+    button.primary[disabled] { opacity: .55; cursor: wait; }
+    button.ghost {
+      border-radius: 999px; background: #161616; color: #ececec; border: 1px solid var(--line);
+    }
+    button.mini {
+      height: 36px; padding: 0 14px; border-radius: 999px; background: #fff; color: #111; font-size: 12px;
+    }
+    .pill {
+      display: inline-flex; align-items: center; gap: 7px; height: 28px; padding: 0 10px;
+      border-radius: 999px; font-size: 12px; font-weight: 600;
+    }
+    .pill.ok { color: var(--ok); background: rgba(134,239,172,.08); }
+    .pill.wait { color: var(--wait); background: rgba(246,212,138,.08); }
+    .pill.off { color: #9a9a9e; background: #141414; }
+    .dot { width: 7px; height: 7px; border-radius: 99px; background: currentColor; }
+    .dot.live { box-shadow: 0 0 0 4px rgba(134,239,172,.12); animation: pulse 1.8s ease-in-out infinite; }
+    @keyframes pulse { 50% { opacity: .45; } }
+    .skel {
+      overflow: hidden; position: relative; background: #141414; border-radius: 10px;
+    }
+    .skel::after {
+      content: ""; position: absolute; inset: 0;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,.08), transparent);
+      animation: shine 1.3s ease-in-out infinite;
+    }
+    @keyframes shine { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+    .footer { margin-top: 22px; display: flex; justify-content: space-between; gap: 10px; }
+    .update-bar {
+      margin-top: 14px; display: none; align-items: center; justify-content: space-between; gap: 10px;
+      min-height: 46px; padding: 10px 14px; border-radius: 16px;
+      border: 1px solid var(--line); background: #101010;
+    }
+    .update-bar.show { display: flex; }
+    .update-bar p { margin: 0; font-size: 12px; color: var(--muted); line-height: 1.45; }
+    .hidden { display: none !important; }
+    .trust { display: flex; gap: 16px; margin-top: 18px; color: var(--soft); font-size: 12px; }
+    .trust b { color: #cfcfd2; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="orb orb-a"></div>
+  <div class="orb orb-b"></div>
+  <div class="grain"></div>
+  <div class="titlebar">
+    <div class="brand"><span class="mark">F</span> Flowdesk</div>
+    <div class="window-actions">
+      <button id="min" aria-label="Minimizar"></button>
+      <button id="close" class="close" aria-label="Fechar"></button>
+    </div>
+  </div>
+  <main>
+    <section id="boot" class="view">
+      <p class="kicker">Launcher</p>
+      <h1>Preparando<br>sua conexao.</h1>
+      <div class="stack" style="margin-top:28px">
+        <div class="skel" style="height:72px;border-radius:18px"></div>
+        <div class="skel" style="height:48px;border-radius:999px"></div>
+      </div>
+    </section>
+
+    <section id="login" class="view">
+      <p class="kicker">Acesso</p>
+      <div class="hero-mark"></div>
+      <h1>Entre e a cidade<br>reconhece sozinha.</h1>
+      <p class="sub" id="loginText">O mesmo login da Flowdesk. Sem codigo, sem IP, sem pairing. Autorizou no navegador, este computador ja fica vinculado.</p>
+      <button class="primary" id="loginBtn">
+        <span id="loginBtnLabel">Continuar com a Flowdesk</span>
+      </button>
+      <div class="trust">
+        <span><b>1</b> login</span>
+        <span><b>0</b> codigo</span>
+        <span><b>auto</b> bind</span>
+      </div>
+    </section>
+
+    <section id="waiting" class="view">
+      <p class="kicker">Autorizacao</p>
+      <div class="hero-mark"></div>
+      <h1>Confirme no<br>navegador.</h1>
+      <p class="sub" id="waitText">Abra a Flowdesk, entre na sua conta e este launcher valida sozinho.</p>
+      <div class="stack">
+        <div class="row">
+          <div class="row-left">
+            <div class="ico">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+            </div>
+            <div>
+              <strong>Validando sessao</strong>
+              <span class="meta">Sem codigo de pairing</span>
+            </div>
+          </div>
+          <span class="pill wait"><span class="dot"></span>Aguardando</span>
+        </div>
+        <div class="skel" style="height:10px;width:62%"></div>
+      </div>
+      <button class="primary" id="openLoginBtn">Abrir login da Flowdesk</button>
+    </section>
+
+    <section id="servers" class="view">
+      <p class="kicker">Servidores</p>
+      <h1>Escolha onde<br>este PC entra.</h1>
+      <p class="sub">Se so existir um servidor pago, o vinculo acontece sozinho depois do login.</p>
+      <div class="stack" id="serverList"></div>
+    </section>
+
+    <section id="home" class="view">
+      <div class="pill ok" id="statusPill"><span class="dot live"></span><span id="statusLabel">Online</span></div>
+      <h1 id="hello" style="margin-top:16px">Conectado.</h1>
+      <p class="sub" id="homeText">O painel ja enxerga este launcher. Configure so o banco da cidade por la.</p>
+      <div class="stack">
+        <div class="row">
+          <div class="row-left">
+            <div class="ico">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
+            </div>
+            <div>
+              <strong id="hostname">-</strong>
+              <span class="meta">Computador</span>
+            </div>
+          </div>
+          <span class="pill ok">Ativo</span>
+        </div>
+        <div class="row">
+          <div class="row-left">
+            <div class="ico">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+            </div>
+            <div>
+              <strong id="account">-</strong>
+              <span class="meta">Conta Flowdesk</span>
+            </div>
+          </div>
+          <span class="pill ok">Vinculada</span>
+        </div>
+      </div>
+      <div class="update-bar" id="updateBar">
+        <p id="updateText">Procurando atualizacao...</p>
+        <button class="mini hidden" id="installUpdate">Reiniciar</button>
+      </div>
+      <div class="footer">
+        <button class="ghost" id="firewall">Preparar conexao</button>
+        <button class="ghost" id="logout">Sair</button>
+      </div>
+    </section>
+  </main>
+  <script>
+    const views = ["boot", "login", "waiting", "servers", "home"];
+    function show(name) {
+      views.forEach((id) => document.getElementById(id).classList.toggle("show", id === name));
+    }
+    function esc(value) {
+      return String(value || "").replace(/[&<>"']/g, (char) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      }[char]));
+    }
+    function render(state) {
+      const view =
+        state.view === "waiting" ? "waiting"
+        : state.view === "servers" ? "servers"
+        : state.view === "home" ? "home"
+        : state.view === "boot" ? "boot"
+        : "login";
+      show(view);
+      const loggingIn = state.view === "login" && /abrindo|restaurando/i.test(state.message || "");
+      document.getElementById("loginText").textContent =
+        state.view === "login" && state.message
+          ? state.message
+          : "O mesmo login da Flowdesk. Sem codigo, sem IP, sem pairing. Autorizou no navegador, este computador ja fica vinculado.";
+      document.getElementById("loginBtnLabel").textContent = loggingIn ? "Abrindo a Flowdesk..." : "Continuar com a Flowdesk";
+      document.getElementById("loginBtn").disabled = loggingIn;
+      document.getElementById("waitText").textContent = state.message || "Abra a Flowdesk, entre na sua conta e este launcher valida sozinho.";
+      document.getElementById("openLoginBtn").classList.toggle("hidden", !state.canOpenLogin);
+      document.getElementById("hostname").textContent = state.hostname || "-";
+      document.getElementById("account").textContent = state.user?.displayName || "-";
+      const linked = Boolean(state.user && state.guildId);
+      const online = state.connection === "online";
+      document.getElementById("hello").textContent = online || linked ? "No ar." : "Reconectando.";
+      document.getElementById("homeText").textContent = state.message || "";
+      document.getElementById("statusLabel").textContent = online ? "Online" : linked ? "Sincronizando" : "Reconectando";
+      document.getElementById("statusPill").className = "pill " + (online ? "ok" : "wait");
+      const update = state.update || {};
+      const updateBar = document.getElementById("updateBar");
+      const installBtn = document.getElementById("installUpdate");
+      const showUpdate = update.status === "checking" || update.status === "available" || update.status === "ready";
+      updateBar.classList.toggle("show", showUpdate);
+      installBtn.classList.toggle("hidden", update.status !== "ready");
+      document.getElementById("updateText").textContent =
+        update.status === "ready"
+          ? ("Atualizacao " + (update.version || "") + " pronta. Reinicie para aplicar.").trim()
+          : update.status === "available"
+            ? "Baixando a nova versao do launcher..."
+            : "Procurando atualizacao...";
+      const list = document.getElementById("serverList");
+      list.innerHTML = "";
+      (state.servers || []).forEach((server, index) => {
+        const row = document.createElement("div");
+        row.className = "row";
+        row.style.animationDelay = (index * 70) + "ms";
+        row.innerHTML =
+          '<div class="row-left"><div class="ico"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15 15 0 0 1 0 20M12 2a15 15 0 0 0 0 20"/></svg></div><div><strong>' +
+          esc(server.guildName || "Servidor") +
+          '</strong><span class="meta">Vincular este computador</span></div></div>';
+        const button = document.createElement("button");
+        button.className = "mini";
+        button.textContent = "Conectar";
+        button.onclick = () => window.flowdesk.bindServer(server.guildId);
+        row.appendChild(button);
+        list.appendChild(row);
+      });
+    }
+    document.getElementById("loginBtn").onclick = () => window.flowdesk.startLogin();
+    document.getElementById("openLoginBtn").onclick = () => window.flowdesk.openLogin();
+    document.getElementById("logout").onclick = () => window.flowdesk.logout();
+    document.getElementById("firewall").onclick = () => window.flowdesk.openFirewall();
+    document.getElementById("installUpdate").onclick = () => window.flowdesk.installUpdate();
+    document.getElementById("min").onclick = () => window.flowdesk.minimize();
+    document.getElementById("close").onclick = () => window.flowdesk.close();
+    show("boot");
+    window.flowdesk.onState(render);
+    window.flowdesk.getState().then(render);
+  </script>
+</body>
+</html>

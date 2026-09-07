@@ -1,0 +1,44 @@
+name: Launcher release
+
+on:
+  push:
+    branches: [main, master, pr/muriloflow/site-dashboard]
+    paths:
+      - "tools/flowdesk-launcher/**"
+      - ".github/workflows/launcher-release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: tools/flowdesk-launcher
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: tools/flowdesk-launcher/package-lock.json
+
+      - name: Bump published version
+        shell: pwsh
+        run: |
+          $ver = "1.0.$([int]$env:GITHUB_RUN_NUMBER + 100)"
+          $env:VER = $ver
+          node -e "const fs=require('fs'); const p=JSON.parse(fs.readFileSync('package.json','utf8')); p.version=process.env.VER; fs.writeFileSync('package.json', JSON.stringify(p,null,2)+'\n');"
+          Write-Host "Launcher version $ver"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build and publish installer
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npx electron-builder --win nsis --x64 --publish always

@@ -117,8 +117,10 @@ function buildReviewPayload({ request, member, identifierKind, identifierValue, 
       ? "Aprovado e sincronizado"
       : status === "denied"
         ? "Reprovado"
-        : status === "apply_failed"
-          ? "Aprovado no Discord, falha no banco"
+          : status === "apply_failed"
+          ? String(request.apply_error || "").toLowerCase().includes("agent")
+            ? "Aguardando Agent da cidade"
+            : "Aprovado no Discord, falha no banco"
           : "Pendente";
   const mention = member ? `${member} (\`${request.user_id}\`)` : `\`${request.user_id}\``;
   const components = [
@@ -535,6 +537,7 @@ async function applyWhitelistChange({
           payload: {
             identifierKind: request.identifier_kind,
             identifierValue: request.identifier_value,
+            mapping: settings.mapping,
           },
           correlation_id: correlationId,
         });
@@ -887,4 +890,46 @@ module.exports = {
   isWhitelistModalSubmit,
   handleWhitelistButtonInteraction,
   handleWhitelistModalSubmit,
+  reconcileCompletedAgentJobs,
 };
+
+async function reconcileCompletedAgentJobs(client) {
+  const jobs = await whitelistDb.listDoneJobsForDiscordSync(25);
+  for (const job of jobs) {
+    try {
+      const request = await whitelistDb.getWhitelistRequestById(job.request_id);
+      if (!request) {
+        await whitelistDb.markJobDiscordSynced(job.id);
+        continue;
+      }
+      const settings = await whitelistDb.getGuildWhitelistSettings(request.guild_id);
+      const guild = await client.guilds.fetch(request.guild_id).catch(() => null);
+      if (!guild || !settings) continue;
+      const approve = String(job.operation) !== "REMOVE_WHITELIST";
+      const result = job.result && typeof job.result === "object" ? job.result : {};
+      if (request.status === "approved" || request.status === "denied") {
+        if (approve) {
+          await assignRoles(guild, request.user_id, settings.approved_role_ids, settings.denied_role_ids);
+        } else {
+          await assignRoles(guild, request.user_id, settings.denied_role_ids, settings.approved_role_ids);
+        }
+        await refreshReviewMessage(guild, request, settings);
+        await sendWhitelistLog({
+          guild,
+          settings,
+          title: approve ? "Whitelist aplicada pelo Agent" : "Whitelist removida pelo Agent",
+          color: approve ? 0x2ecc71 : 0xe74c3c,
+          lines: [
+            `**Pedido:** \`${request.id}\``,
+            `**Membro:** <@${request.user_id}>`,
+            `**Jogador:** \`${result.playerKey || request.player_key || "-"}\``,
+            `**Correlation:** \`${request.correlation_id || "-"}\``,
+          ],
+        });
+      }
+      await whitelistDb.markJobDiscordSynced(job.id);
+    } catch (error) {
+      console.error("[whitelist-agent-reconcile]", error);
+    }
+  }
+}

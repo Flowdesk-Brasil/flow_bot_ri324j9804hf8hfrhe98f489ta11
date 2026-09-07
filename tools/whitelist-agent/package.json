@@ -1,0 +1,67 @@
+{
+  "name": "flowdesk-whitelist-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Launcher Electron da whitelist FlowDesk",
+  "author": "FlowDesk",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder --win nsis --x64"
+  },
+  "dependencies": {
+    "mysql2": "^3.24.3",
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "electron": "^37.3.1",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.flowdesk.whitelist-agent",
+    "productName": "FlowDesk Whitelist Agent",
+    "copyright": "FlowDesk",
+    "asar": true,
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "executor.js",
+      "renderer/**/*"
+    ],
+    "extraMetadata": {
+      "main": "main.js"
+    },
+    "win": {
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowElevation": true,
+      "runAfterFinish": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "FlowDesk Whitelist Agent",
+      "uninstallDisplayName": "FlowDesk Whitelist Agent",
+      "artifactName": "FlowDesk-Installer.exe",
+      "deleteAppDataOnUninstall": false,
+      "include": "installer.nsh"
+    },
+    "protocols": [
+      {
+        "name": "FlowDesk Whitelist Agent",
+        "schemes": ["flowdesk-agent"]
+      }
+    ]
+  }
+}

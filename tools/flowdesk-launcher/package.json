@@ -1,0 +1,81 @@
+{
+  "name": "flowdesk-launcher",
+  "version": "1.0.3",
+  "private": true,
+  "description": "Flowdesk Launcher",
+  "author": "Flowdesk",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win nsis --x64 && node scripts/copy-dist.js"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9",
+    "mysql2": "^3.24.3",
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "electron": "^37.2.0",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.flowdesk.launcher",
+    "productName": "Flowdesk Launcher",
+    "copyright": "Flowdesk",
+    "artifactName": "FlowdeskLauncher-Setup.exe",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "executor.js",
+      "renderer/**/*"
+    ],
+    "asar": true,
+    "win": {
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Flowdesk Launcher",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false,
+      "installerLanguages": [
+        "pt_BR",
+        "en_US"
+      ],
+      "language": "1046",
+      "unicode": true,
+      "include": "installer.nsh"
+    },
+    "protocols": [
+      {
+        "name": "Flowdesk Launcher",
+        "schemes": [
+          "flowdesk-launcher"
+        ]
+      }
+    ],
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "Flowdesk-Brasil",
+        "repo": "flow_bot_ri324j9804hf8hfrhe98f489ta11",
+        "releaseType": "release"
+      }
+    ]
+  }
+}

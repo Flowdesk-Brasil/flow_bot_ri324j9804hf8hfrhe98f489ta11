@@ -1,6 +1,9 @@
 const { ensureOfficialLinkPanel } = require("../services/officialLinkPanelService");
 const { syncAllCaptchaPanels } = require("../services/captchaPanelService");
 const { syncAllWhitelistPanels } = require("../services/whitelistPanelService");
+const {
+  reconcileCompletedAgentJobs,
+} = require("../services/whitelistService");
 const { syncAllSuggestionPanels } = require("../services/suggestionPanelService");
 const { syncAllBatePontoPanels } = require("../services/batePontoPanelService");
 const {
@@ -108,6 +111,11 @@ module.exports = {
       startBatePontoVoiceAbsenceWorker(client);
       startSorteioWorker(client);
       console.log("[sorteio-worker] worker de encerramento iniciado (15s)");
+      setInterval(() => {
+        reconcileCompletedAgentJobs(client).catch((error) => {
+          console.error("[whitelist-agent-reconcile]", error);
+        });
+      }, 8000);
 
       if (env.clientRoleStartupSyncMode !== "off") {
         try {
