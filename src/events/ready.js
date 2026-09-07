@@ -95,6 +95,15 @@ module.exports = {
       }
 
       try {
+        const result = await syncAllWhitelistPanels(client);
+        console.log(
+          `[whitelist-panels] startup synced ${result.applied.length}/${result.total} paineis`,
+        );
+      } catch (error) {
+        console.error("[whitelist-panels]", error);
+      }
+
+      try {
         const result = await syncOpenTicketControlMessages(client);
         if (result.applied.length || result.total) {
           console.log(

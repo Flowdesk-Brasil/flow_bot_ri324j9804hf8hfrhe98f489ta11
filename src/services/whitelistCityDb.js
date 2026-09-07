@@ -80,9 +80,26 @@ function equivalent(valueType, left, right) {
   return String(left ?? "") === String(right ?? "");
 }
 
+function normalizeWhitelistValue(value) {
+  if (value == null) return null;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "bigint") return Number(value);
+  if (Buffer.isBuffer(value)) {
+    if (value.length === 0) return null;
+    if (value.length === 1) return value[0];
+    return value.toString("utf8").trim();
+  }
+  const text = String(value).trim();
+  if (!text || text === "[object Object]") return null;
+  return text;
+}
+
 function isWhitelistOffValue(value) {
-  if (value == null) return true;
-  const text = String(value).trim().toLowerCase();
+  const normalized = normalizeWhitelistValue(value);
+  if (normalized == null) return true;
+  if (normalized === false || normalized === 0) return true;
+  const text = String(normalized).trim().toLowerCase();
   return (
     text === "" ||
     text === "0" ||
@@ -95,19 +112,22 @@ function isWhitelistOffValue(value) {
 }
 
 function isWhitelistOnValue(value) {
-  if (value === true || value === 1) return true;
-  const text = String(value).trim().toLowerCase();
+  const normalized = normalizeWhitelistValue(value);
+  if (normalized == null) return false;
+  if (normalized === true || normalized === 1) return true;
+  const text = String(normalized).trim().toLowerCase();
   return text === "1" || text === "true" || text === "on" || text === "yes";
 }
 
 function classifyState(mapping, current) {
-  if (isWhitelistOnValue(current)) return "on";
-  if (isWhitelistOffValue(current)) return "off";
+  const normalized = normalizeWhitelistValue(current);
+  if (isWhitelistOnValue(normalized)) return "on";
+  if (isWhitelistOffValue(normalized)) return "off";
   try {
     const onValue = coerceValue(mapping.valueType, mapping.valueOn);
     const offValue = coerceValue(mapping.valueType, mapping.valueOff);
-    if (equivalent(mapping.valueType, current, onValue)) return "on";
-    if (equivalent(mapping.valueType, current, offValue)) return "off";
+    if (equivalent(mapping.valueType, normalized, onValue)) return "on";
+    if (equivalent(mapping.valueType, normalized, offValue)) return "off";
   } catch {
     return "off";
   }
@@ -221,6 +241,21 @@ function isUnusableCityHost(value) {
   );
 }
 
+function settingsToLauncherCityDb(settings, guildId) {
+  const user = String(settings?.db_user || "").trim();
+  const database = String(settings?.db_name || "").trim();
+  if (!user || !database) return null;
+  const password = decryptWhitelistSecret(settings?.db_password_cipher, guildId);
+  return {
+    engine: settings?.db_engine === "postgres" ? "postgres" : "mysql",
+    host: "127.0.0.1",
+    port: Number(settings?.db_port || 3306),
+    database,
+    user,
+    password: password || "",
+  };
+}
+
 function settingsToTarget(settings, guildId) {
   const host = !isUnusableCityHost(settings?.db_host)
     ? settings.db_host
@@ -278,61 +313,92 @@ async function executeWhitelistOperation(settings, operation, identifierValue) {
     }
   }
 
-  const queued = await require("./whitelistDbService").enqueueAgentJob({
-    guild_id: settings.guild_id,
-    operation,
-    payload: {
-      identifierValue,
-      mapping,
-      cityDb: cityTarget
-        ? {
-            engine: cityTarget.engine,
-            port: cityTarget.port,
-            database: cityTarget.database,
-            user: cityTarget.user,
-            password: cityTarget.password,
-          }
-        : undefined,
-    },
-  });
-  if (!queued?.id) {
-    return {
-      ok: false,
-      code: "offline",
-      message: "Nao foi possivel enfileirar o SQL no launcher da VPS.",
-    };
-  }
-  const finished = await require("./whitelistDbService").waitForAgentJob(queued.id, 8000);
-  if (finished.status !== "done") {
-    return {
-      ok: false,
-      code: "vps_timeout",
-      message:
-        finished.error_message ||
-        "O launcher na VPS nao concluiu a tempo. Deixe o app aberto na maquina da cidade.",
-    };
-  }
-  const result = finished.result && typeof finished.result === "object" ? finished.result : {};
-  if (result.ok === false) {
-    return {
-      ok: false,
-      code: result.code || "db_error",
-      message: result.message || "Falha no MySQL da VPS.",
-      playerKey: result.playerKey,
-      previousValue: result.previousValue,
-      nextValue: result.nextValue,
-    };
-  }
-  return {
-    ok: true,
-    code: result.code || "ok",
-    skipped: result.skipped === true,
-    playerKey: result.playerKey,
-    previousValue: result.previousValue ?? null,
-    nextValue: result.nextValue ?? result.currentValue ?? null,
-    currentValue: result.currentValue ?? null,
-    state: result.state,
+  const launcherCityDb = settingsToLauncherCityDb(settings, settings.guild_id) || (cityTarget
+    ? {
+        engine: cityTarget.engine,
+        port: cityTarget.port,
+        database: cityTarget.database,
+        user: cityTarget.user,
+        password: cityTarget.password,
+      }
+    : null);
+  return runViaLauncher(settings, operation, identifierValue, mapping, launcherCityDb);
+}
+
+async function runViaLauncher(settings, operation, identifierValue, mapping, cityDb) {
+  const db = require("./whitelistDbService");
+  const attempts = 3;
+  let last = {
+    ok: false,
+    code: "offline",
+    message: "Nao foi possivel enfileirar o SQL no launcher da VPS.",
   };
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const queued = await db.enqueueAgentJob({
+      guild_id: settings.guild_id,
+      operation,
+      payload: {
+        identifierValue,
+        mapping,
+        cityDb: cityDb || undefined,
+      },
+    });
+    if (!queued?.id) {
+      await sleep(300 * attempt);
+      continue;
+    }
+    const finished = await db.waitForAgentJob(queued.id, attempt === 1 ? 12000 : 18000);
+    if (finished.status !== "done") {
+      last = {
+        ok: false,
+        code: "vps_timeout",
+        message:
+          finished.error_message ||
+          "O launcher na VPS ainda esta sincronizando o banco. O pedido continua aberto.",
+      };
+      await sleep(400 * attempt);
+      continue;
+    }
+    const result = finished.result && typeof finished.result === "object" ? finished.result : {};
+    if (result.ok === false) {
+      last = {
+        ok: false,
+        code: result.code || "db_error",
+        message: result.message || "Falha no MySQL da VPS.",
+        playerKey: result.playerKey,
+        previousValue: result.previousValue,
+        nextValue: result.nextValue,
+      };
+      if (!isRetryableLauncherCode(last.code)) return last;
+      await sleep(400 * attempt);
+      continue;
+    }
+    return {
+      ok: true,
+      code: result.code || "ok",
+      skipped: result.skipped === true,
+      playerKey: result.playerKey,
+      previousValue: result.previousValue ?? null,
+      nextValue: result.nextValue ?? result.currentValue ?? null,
+      currentValue: result.currentValue ?? null,
+      state: result.state,
+    };
+  }
+  return last;
+}
+
+function isRetryableLauncherCode(code) {
+  return [
+    "offline",
+    "timeout",
+    "vps_timeout",
+    "missing_credentials",
+    "invalid_credentials",
+  ].includes(String(code || ""));
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function runDirectWhitelistOperation(settings, mapping, operation, identifierValue) {

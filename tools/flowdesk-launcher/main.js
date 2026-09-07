@@ -350,6 +350,7 @@ async function restoreSession() {
     return;
   }
   runtime.view = "home";
+  runtime.cityDb = vault.cityDb && typeof vault.cityDb === "object" ? vault.cityDb : runtime.cityDb;
   markOnline("Conectado ao painel.");
   startHeartbeatLoop();
   startSyncLoop();
@@ -443,18 +444,44 @@ async function bindServer(guildId) {
   return { ok: true };
 }
 
+function firstFilled(...values) {
+  for (const value of values) {
+    if (value == null) continue;
+    const text = String(value).trim();
+    if (text) return value;
+  }
+  return "";
+}
+
+function rememberCityDb(target) {
+  if (!target?.user || !target?.database) return;
+  const cityDb = {
+    engine: target.engine === "postgres" ? "postgres" : "mysql",
+    port: Number(target.port || 3306),
+    database: String(target.database),
+    user: String(target.user),
+    password: String(target.password || ""),
+    savedAt: new Date().toISOString(),
+  };
+  runtime.cityDb = cityDb;
+  writeVault({ ...readVault(), cityDb });
+}
+
 function dbTarget(payload) {
-  const config = runtime.config || {};
-  const cityDb = payload && typeof payload.cityDb === "object" && payload.cityDb ? payload.cityDb : {};
-  const user = String(cityDb.user || config.user || "usuariodeteste").trim() || "usuariodeteste";
-  const typed = cityDb.password || config.password || "";
+  const fromJob = payload && typeof payload.cityDb === "object" && payload.cityDb ? payload.cityDb : {};
+  const fromSync = runtime.config && typeof runtime.config === "object" ? runtime.config : {};
+  const fromSyncDb = fromSync.db && typeof fromSync.db === "object" ? fromSync.db : {};
+  const fromVault = (runtime.cityDb && typeof runtime.cityDb === "object" ? runtime.cityDb : null) ||
+    readVault().cityDb ||
+    {};
+  const engine = firstFilled(fromJob.engine, fromSync.engine, fromSyncDb.engine, fromVault.engine);
   return {
-    engine: cityDb.engine === "postgres" || config.engine === "postgres" ? "postgres" : "mysql",
-    host: "localhost",
-    port: Number(cityDb.port || config.port || 3306),
-    database: cityDb.database || config.database,
-    user,
-    password: typed || (user === "usuariodeteste" ? "12345" : ""),
+    engine: engine === "postgres" ? "postgres" : "mysql",
+    host: "127.0.0.1",
+    port: Number(firstFilled(fromJob.port, fromSync.port, fromSyncDb.port, fromVault.port, 3306)) || 3306,
+    database: String(firstFilled(fromJob.database, fromSync.database, fromSyncDb.database, fromVault.database)),
+    user: String(firstFilled(fromJob.user, fromSync.user, fromSyncDb.user, fromVault.user)).trim(),
+    password: String(firstFilled(fromJob.password, fromSync.password, fromSyncDb.password, fromVault.password)),
     ssl: false,
   };
 }
@@ -545,11 +572,24 @@ async function runSync() {
       emitState();
       return;
     }
-    if (synced.config) runtime.config = synced.config;
+    if (synced.config) {
+      runtime.config = synced.config;
+      if (synced.config.user && synced.config.database) {
+        rememberCityDb({
+          engine: synced.config.engine,
+          port: synced.config.port,
+          database: synced.config.database,
+          user: synced.config.user,
+          password: synced.config.password,
+        });
+      }
+    }
     const results = [];
     for (const job of synced.jobs || []) {
       try {
-        const result = await executeJob(dbTarget(job.payload || {}), String(job.operation || ""), job.payload || {});
+        const target = dbTarget(job.payload || {});
+        const result = await executeJob(target, String(job.operation || ""), job.payload || {});
+        if (result.ok !== false) rememberCityDb(target);
         results.push({
           id: job.id,
           ok: result.ok !== false,
@@ -574,6 +614,19 @@ async function runSync() {
         method: "POST",
         body: { action: "sync", results, observedIp: publicIp, appVersion: app.getVersion() },
       });
+    } else if (Date.now() - lastHealthAt > 20000) {
+      try {
+        const target = dbTarget({});
+        if (target.user && target.database) {
+          const health = await executeJob(target, "HEALTH_CHECK", {});
+          if (health.ok !== false) {
+            rememberCityDb(target);
+            lastHealthAt = Date.now();
+          }
+        }
+      } catch {
+        /* keep polling; the next whitelist job still retries */
+      }
     }
     backoffMs = results.length ? 250 : 400;
     markOnline(
@@ -673,6 +726,7 @@ function installReadyUpdate() {
   return { ok: true };
 }
 
+let lastHealthAt = 0;
 let lastFirewallAt = 0;
 
 function writeFallbackPortsCmd(dest) {
