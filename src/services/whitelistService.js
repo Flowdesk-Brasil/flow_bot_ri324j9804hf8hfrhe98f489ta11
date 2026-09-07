@@ -46,6 +46,14 @@ function isSnowflake(value) {
   return /^\d{15,25}$/.test(String(value || ""));
 }
 
+function isWhitelistModuleActive(settings) {
+  if (!settings || typeof settings !== "object") return false;
+  if (settings.enabled === true) return true;
+  if (settings.panel_message_id || settings.panel_channel_id) return true;
+  const mapping = settings.mapping && typeof settings.mapping === "object" ? settings.mapping : {};
+  return Boolean(mapping.playerTable && mapping.whitelistColumn);
+}
+
 function consumeAttempt(guildId, userId) {
   const key = `${guildId}:${userId}`;
   const now = Date.now();
@@ -314,7 +322,7 @@ async function showWhitelistModal(interaction) {
   if (!guildId) return;
 
   const runtime = await getGuildWhitelistRuntime(guildId);
-  const settings = runtime?.settings;
+  const settings = runtime?.settings || (await whitelistDb.getGuildWhitelistSettings(guildId));
 
   if (!runtime?.licenseUsable) {
     await replyEphemeral(
@@ -327,7 +335,7 @@ async function showWhitelistModal(interaction) {
     return;
   }
 
-  if (!settings?.enabled) {
+  if (!isWhitelistModuleActive(settings)) {
     await replyEphemeral(
       interaction,
       buildNoticePayload(
@@ -371,9 +379,9 @@ async function handleWhitelistModalSubmit(interaction) {
   if (!guildId || !interaction.guild) return;
 
   const runtime = await getGuildWhitelistRuntime(guildId);
-  const settings = runtime?.settings;
+  const settings = runtime?.settings || (await whitelistDb.getGuildWhitelistSettings(guildId));
 
-  if (!runtime?.licenseUsable || !settings?.enabled) {
+  if (!runtime?.licenseUsable || !isWhitelistModuleActive(settings)) {
     await replyEphemeral(
       interaction,
       buildNoticePayload(
@@ -414,31 +422,6 @@ async function handleWhitelistModalSubmit(interaction) {
 
   if (isAutomatic && !interaction.deferred && !interaction.replied) {
     await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => null);
-  }
-
-  const claim = await assertWhitelistClaim(guildId, interaction.user.id, identifierValue);
-  if (!claim.ok) {
-    if (claim.code === "already_released" && interaction.guild) {
-      void Promise.all([
-        applyApprovedNickname(
-          interaction.guild,
-          interaction.user.id,
-          settings,
-          identifierValue,
-        ),
-        assignRoles(
-          interaction.guild,
-          interaction.user.id,
-          settings.approved_role_ids,
-          settings.denied_role_ids,
-        ),
-      ]).catch(() => null);
-    }
-    await replyEphemeral(
-      interaction,
-      buildNoticePayload(claim.title, claim.message, "warning"),
-    );
-    return;
   }
 
   const cityPromise = isAutomatic
@@ -677,22 +660,25 @@ async function applyWhitelistChange({
       return;
     }
 
+    const alreadyOn = result.skipped === true || result.state === "on";
     await replyEphemeral(
       interaction,
       buildNoticePayload(
-        autoApproved
-          ? "Whitelist liberada"
-          : approve
-            ? "Whitelist sincronizada"
-            : "Whitelist removida",
-        autoApproved
-          ? result.skipped
-            ? "Seu ID ja estava liberado no banco. A conta Discord foi vinculada a este ID."
-            : "Seu ID foi localizado e a whitelist foi liberada."
-          : result.skipped
-            ? "O registro da cidade ja estava no estado desejado. O pedido foi concluido."
-            : "O banco da cidade foi atualizado e o Discord foi sincronizado.",
-        "ok",
+        alreadyOn && autoApproved
+          ? "Whitelist ja liberada"
+          : autoApproved
+            ? "Whitelist liberada"
+            : approve
+              ? "Whitelist sincronizada"
+              : "Whitelist removida",
+        alreadyOn && autoApproved
+          ? "Este ID ja esta liberado no banco da cidade (1 ou true). Nao e preciso validar de novo."
+          : autoApproved
+            ? "O ID existe e estava livre (0 ou vazio). A whitelist foi liberada."
+            : alreadyOn
+              ? "O registro da cidade ja estava liberado."
+              : "O banco da cidade foi atualizado e o Discord foi sincronizado.",
+        alreadyOn && autoApproved ? "warning" : "ok",
       ),
     );
 
@@ -846,7 +832,7 @@ async function handleWhitelistReviewInteraction(interaction) {
   const runtime = await getGuildWhitelistRuntime(interaction.guildId);
   const settings = runtime?.settings;
 
-  if (!runtime?.licenseUsable || !settings?.enabled) {
+  if (!runtime?.licenseUsable || !isWhitelistModuleActive(settings)) {
     await replyEphemeral(
       interaction,
       buildNoticePayload(
@@ -937,16 +923,6 @@ async function handleWhitelistReviewInteraction(interaction) {
       interaction,
       buildNoticePayload("Pedido encerrado", "Esta solicitacao ja foi concluida.", "warning"),
     );
-    return;
-  }
-
-  const claim = await assertWhitelistClaim(
-    request.guild_id,
-    request.user_id,
-    request.identifier_value,
-  );
-  if (!claim.ok && claim.code !== "already_released") {
-    await replyEphemeral(interaction, buildNoticePayload(claim.title, claim.message, "warning"));
     return;
   }
 

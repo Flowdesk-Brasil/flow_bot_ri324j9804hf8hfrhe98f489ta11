@@ -37,7 +37,7 @@ function normalizeMapping(value) {
     valueType: String(record.valueType || "integer"),
     valueOff: String(record.valueOff ?? "0"),
     valueOn: String(record.valueOn ?? "1"),
-    nullBehavior: String(record.nullBehavior || "off"),
+    nullBehavior: "off",
     joinTable: String(record.joinTable || "").trim(),
     joinFromColumn: String(record.joinFromColumn || "").trim(),
     joinToColumn: String(record.joinToColumn || "").trim(),
@@ -74,25 +74,44 @@ function coerceValue(valueType, raw) {
 }
 
 function equivalent(valueType, left, right) {
-  if (left == null && right == null) return true;
+  if (isWhitelistOffValue(left) && isWhitelistOffValue(right)) return true;
   if (valueType === "boolean") return Boolean(left) === Boolean(right);
   if (valueType === "integer") return Number(left) === Number(right);
   return String(left ?? "") === String(right ?? "");
 }
 
+function isWhitelistOffValue(value) {
+  if (value == null) return true;
+  const text = String(value).trim().toLowerCase();
+  return (
+    text === "" ||
+    text === "0" ||
+    text === "false" ||
+    text === "off" ||
+    text === "null" ||
+    text === "undefined" ||
+    text === "no"
+  );
+}
+
+function isWhitelistOnValue(value) {
+  if (value === true || value === 1) return true;
+  const text = String(value).trim().toLowerCase();
+  return text === "1" || text === "true" || text === "on" || text === "yes";
+}
+
 function classifyState(mapping, current) {
-  if (current == null) {
-    return mapping.nullBehavior === "unknown" ? "unknown" : mapping.nullBehavior;
-  }
+  if (isWhitelistOnValue(current)) return "on";
+  if (isWhitelistOffValue(current)) return "off";
   try {
     const onValue = coerceValue(mapping.valueType, mapping.valueOn);
     const offValue = coerceValue(mapping.valueType, mapping.valueOff);
     if (equivalent(mapping.valueType, current, onValue)) return "on";
     if (equivalent(mapping.valueType, current, offValue)) return "off";
   } catch {
-    return "unknown";
+    return "off";
   }
-  return "unknown";
+  return "off";
 }
 
 function buildSelectSql(engine, mapping) {
