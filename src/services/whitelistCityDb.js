@@ -3,8 +3,8 @@ const { Client } = require("pg");
 const { decryptWhitelistSecret } = require("../utils/whitelistSecret");
 
 const IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const QUERY_TIMEOUT_MS = 8000;
-const CONNECT_TIMEOUT_MS = 8000;
+const QUERY_TIMEOUT_MS = 12000;
+const CONNECT_TIMEOUT_MS = 12000;
 
 function isSafeSqlIdentifier(value) {
   return IDENTIFIER_RE.test(String(value || ""));
@@ -158,15 +158,38 @@ async function withCityDatabase(target, fn) {
   }
 }
 
+function isUnusableCityHost(value) {
+  const host = String(value || "").trim().toLowerCase();
+  return (
+    !host ||
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    host === "0.0.0.0" ||
+    host === "::1" ||
+    host.startsWith("127.") ||
+    host.startsWith("10.") ||
+    host.startsWith("192.168.") ||
+    host.startsWith("169.254.")
+  );
+}
+
 function settingsToTarget(settings, guildId) {
-  if (!settings?.db_host || !settings?.db_name || !settings?.db_user) {
+  const host = !isUnusableCityHost(settings?.db_host)
+    ? settings.db_host
+    : settings?.agent_public_ip;
+  if (!host || !settings?.db_name || !settings?.db_user) {
     throw new Error("Conexao do banco da cidade incompleta.");
+  }
+  if (isUnusableCityHost(host)) {
+    throw new Error(
+      "O host do banco ainda e local ou interno. Informe o IP publico da VPS no painel.",
+    );
   }
   const password = decryptWhitelistSecret(settings.db_password_cipher, guildId);
   if (!password) throw new Error("Senha do banco nao configurada.");
   return {
     engine: settings.db_engine === "postgres" ? "postgres" : "mysql",
-    host: settings.db_host,
+    host,
     port: Number(settings.db_port || 3306),
     database: settings.db_name,
     user: settings.db_user,
@@ -176,14 +199,6 @@ function settingsToTarget(settings, guildId) {
 }
 
 async function executeWhitelistOperation(settings, operation, identifierValue) {
-  if (settings.connection_mode === "agent") {
-    return {
-      ok: false,
-      queued: true,
-      code: "agent_queued",
-      message: "Operacao enfileirada para o Agent/Bridge da cidade.",
-    };
-  }
   if (settings.mapping_status !== "validated") {
     return {
       ok: false,
@@ -272,8 +287,11 @@ function sanitizeCityDbError(error) {
   if (message.includes("access denied") || message.includes("password") || message.includes("auth")) {
     return { code: "invalid_credentials", message: "Credencial do banco invalida." };
   }
-  if (message.includes("econnrefused") || message.includes("enotfound")) {
-    return { code: "offline", message: "Banco da cidade offline." };
+  if (message.includes("econnrefused") || message.includes("enotfound") || message.includes("etimedout")) {
+    return {
+      code: "offline",
+      message: "A Flowdesk nao alcanca o IP publico do banco. Liberar a porta na VPS e bind-address 0.0.0.0.",
+    };
   }
   return { code: "db_error", message: "Falha ao sincronizar a whitelist com o banco da cidade." };
 }

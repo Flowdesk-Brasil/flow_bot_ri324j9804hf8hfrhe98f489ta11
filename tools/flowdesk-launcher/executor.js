@@ -165,7 +165,7 @@ function sanitizeError(error) {
     return { code: "invalid_credentials", message: "Usuario ou senha do banco local invalidos." };
   }
   if (lowered.includes("econnrefused") || lowered.includes("enotfound")) {
-    return { code: "offline", message: "Nao foi possivel conectar em 127.0.0.1 / host local do banco." };
+    return { code: "offline", message: "Nao foi possivel conectar no banco desta VPS. Confira se o MySQL esta no ar e escutando a porta." };
   }
   return { code: "db_error", message: "Falha ao executar a operacao no banco local." };
 }

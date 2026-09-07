@@ -318,7 +318,7 @@ async function handleWhitelistModalSubmit(interaction) {
       await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => null);
     }
 
-    if (settings.mapping_status !== "validated" && settings.connection_mode !== "agent") {
+    if (settings.mapping_status !== "validated") {
       await replyEphemeral(
         interaction,
         buildNoticePayload(
@@ -523,84 +523,15 @@ async function applyWhitelistChange({
   const cityOperation = cityOperationFor(operation);
 
   try {
-    if (settings.connection_mode === "agent") {
-      const queued = await whitelistDb.findQueuedAgentJob(
-        request.guild_id,
-        request.id,
-        cityOperation,
-      );
-      if (!queued) {
-        await whitelistDb.enqueueAgentJob({
-          guild_id: request.guild_id,
-          request_id: request.id,
-          operation: cityOperation,
-          payload: {
-            identifierKind: request.identifier_kind,
-            identifierValue: request.identifier_value,
-            mapping: settings.mapping,
-          },
-          correlation_id: correlationId,
-        });
-      }
-
-      const nextRequest = await whitelistDb.updateWhitelistRequest(request.id, {
-        status: "apply_failed",
-        reviewed_by_user_id: interaction.user.id,
-        reviewed_at: new Date().toISOString(),
-        apply_error: "Enfileirado para o Agent/Bridge da cidade.",
-      });
-
-      await whitelistDb.insertWhitelistAudit({
-        guild_id: request.guild_id,
-        request_id: request.id,
-        user_id: request.user_id,
-        actor_user_id: interaction.user.id,
-        operation,
-        identifier_kind: request.identifier_kind,
-        identifier_value: request.identifier_value,
-        success: false,
-        error_code: "agent_queued",
-        error_message: "Operacao enfileirada para o Agent/Bridge.",
-        correlation_id: correlationId,
-        mapping_fingerprint: mappingFingerprint(settings.mapping),
-      });
-
-      await refreshReviewMessage(interaction.guild, nextRequest, settings);
-      await replyEphemeral(
-        interaction,
-        buildNoticePayload(
-          "Aguardando Agent",
-          autoApproved
-            ? "Seu pedido foi enviado ao Agent da cidade. Clique de novo no painel se a liberacao nao concluir."
-            : "A alteracao foi enfileirada para o Agent/Bridge da cidade. O pedido permanece aberto ate a confirmacao.",
-          "warning",
-        ),
-      );
-      return;
-    }
-
     let result;
     try {
       result = await executeWhitelistOperation(
         settings,
-        cityOperationFor(operation),
+        cityOperation,
         request.identifier_value,
       );
     } catch (error) {
       result = { ok: false, ...sanitizeCityDbError(error) };
-    }
-
-    if (!result.ok && result.queued) {
-      await whitelistDb.enqueueAgentJob({
-        guild_id: request.guild_id,
-        request_id: request.id,
-        operation,
-        payload: {
-          identifierKind: request.identifier_kind,
-          identifierValue: request.identifier_value,
-        },
-        correlation_id: correlationId,
-      });
     }
 
     if (!result.ok) {
@@ -850,7 +781,7 @@ async function handleWhitelistReviewInteraction(interaction) {
     return;
   }
 
-  if (settings.mapping_status !== "validated" && settings.connection_mode !== "agent") {
+  if (settings.mapping_status !== "validated") {
     await replyEphemeral(
       interaction,
       buildNoticePayload(

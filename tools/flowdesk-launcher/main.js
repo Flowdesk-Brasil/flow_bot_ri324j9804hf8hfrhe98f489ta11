@@ -38,6 +38,7 @@ const runtime = {
   hostname: os.hostname(),
   loginUrl: null,
   lastError: null,
+  publicIp: null,
   update: { status: "idle", version: null },
 };
 
@@ -90,6 +91,7 @@ function publicState() {
     hostname: runtime.hostname,
     canOpenLogin: Boolean(runtime.loginUrl),
     lastError: runtime.lastError,
+    publicIp: runtime.publicIp,
     update: runtime.update,
   };
 }
@@ -351,6 +353,10 @@ async function restoreSession() {
   markOnline("Conectado ao painel.");
   startHeartbeatLoop();
   startSyncLoop();
+  void observePublicIp().then((ip) => {
+    if (ip) markOnline(`VPS vinculada. IP publico ${ip}.`);
+  });
+  void prepareFirewall();
 }
 
 async function startLogin() {
@@ -412,9 +418,11 @@ async function pollLogin(pollToken) {
 }
 
 async function bindServer(guildId) {
+  const publicIp = await observePublicIp();
+  if (publicIp) runtime.publicIp = publicIp;
   const result = await api("/api/launcher/session", {
     method: "POST",
-    body: { action: "bind", guildId },
+    body: { action: "bind", guildId, observedIp: publicIp },
   });
   if (!result.ok) {
     runtime.message = result.message || "Nao foi possivel conectar este servidor.";
@@ -424,7 +432,11 @@ async function bindServer(guildId) {
   }
   runtime.guildId = guildId;
   runtime.view = "home";
-  markOnline("Conectado ao painel.");
+  markOnline(
+    publicIp
+      ? `VPS vinculada. IP publico ${publicIp}.`
+      : "VPS vinculada. Detectando IP publico...",
+  );
   startHeartbeatLoop();
   startSyncLoop();
   void prepareFirewall();
@@ -444,18 +456,44 @@ function dbTarget() {
   };
 }
 
+function looksLikeIpv4(value) {
+  return /^(?:\d{1,3}\.){3}\d{1,3}$/.test(String(value || "").trim());
+}
+
 async function observePublicIp() {
-  return fetch("https://api.ipify.org?format=json", {
-    signal: AbortSignal.timeout(4000),
-  })
-    .then((response) => response.json())
-    .then((payload) => String(payload.ip || ""))
-    .catch(() => "");
+  const endpoints = [
+    {
+      url: "https://api.ipify.org?format=json",
+      parse: (text) => {
+        try {
+          return String(JSON.parse(text).ip || "");
+        } catch {
+          return "";
+        }
+      },
+    },
+    { url: "https://ifconfig.me/ip", parse: (text) => text },
+    { url: "https://icanhazip.com", parse: (text) => text },
+  ];
+  for (const endpoint of endpoints) {
+    try {
+      const response = await fetch(endpoint.url, { signal: AbortSignal.timeout(4000) });
+      const ip = String(endpoint.parse((await response.text()).trim()) || "").trim();
+      if (looksLikeIpv4(ip) && !ip.startsWith("127.")) {
+        runtime.publicIp = ip;
+        return ip;
+      }
+    } catch {
+      /* try the next public-IP service */
+    }
+  }
+  return String(runtime.publicIp || "");
 }
 
 async function runHeartbeat() {
   if (!readVault().accessToken || runtime.view !== "home") return false;
   const publicIp = await observePublicIp();
+  if (publicIp) emitState();
   const heartbeat = await api("/api/launcher/session", {
     method: "POST",
     body: {
@@ -625,12 +663,28 @@ function installReadyUpdate() {
   return { ok: true };
 }
 
-function prepareFirewall() {
+function prepareFirewall(port) {
   if (process.platform !== "win32") return { ok: true };
+  const ports = [...new Set([3306, 5432, Number(port || runtime.config?.port || 0)].filter((value) => value >= 1 && value <= 65535))];
+  const scriptPath = userDataFile("open-db-ports.ps1");
+  const lines = [
+    'netsh advfirewall firewall delete rule name="Flowdesk Launcher HTTPS"',
+    'netsh advfirewall firewall add rule name="Flowdesk Launcher HTTPS" dir=out action=allow protocol=TCP remoteport=443 enable=yes',
+    ...ports.flatMap((value) => [
+      `netsh advfirewall firewall delete rule name="Flowdesk City DB ${value}"`,
+      `netsh advfirewall firewall add rule name="Flowdesk City DB ${value}" dir=in action=allow protocol=TCP localport=${value} enable=yes`,
+    ]),
+  ];
+  fs.writeFileSync(scriptPath, lines.join("\r\n"), "utf8");
+  const escaped = scriptPath.replace(/'/g, "''");
   exec(
-    `powershell -NoProfile -Command "Start-Process netsh -Verb RunAs -WindowStyle Hidden -ArgumentList 'advfirewall firewall add rule name=\\"Flowdesk Launcher HTTPS\\" dir=out action=allow protocol=TCP remoteport=443 enable=yes'"`,
+    `powershell -NoProfile -Command "Start-Process powershell -Verb RunAs -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','${escaped}')"`,
   );
-  return { ok: true, message: "Permissao do Windows solicitada para a conexao segura." };
+  runtime.message = runtime.publicIp
+    ? `IP ${runtime.publicIp} publicado. Liberando portas ${ports.join(", ")}.`
+    : `Liberando portas ${ports.join(", ")} nesta VPS.`;
+  emitState();
+  return { ok: true, message: runtime.message };
 }
 
 const gotLock = app.requestSingleInstanceLock();

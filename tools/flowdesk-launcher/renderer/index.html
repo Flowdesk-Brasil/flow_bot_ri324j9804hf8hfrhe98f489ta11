@@ -160,7 +160,7 @@
       <p class="kicker">Acesso</p>
       <div class="hero-mark"></div>
       <h1>Entre e a cidade<br>reconhece sozinha.</h1>
-      <p class="sub" id="loginText">O mesmo login da Flowdesk. Sem codigo, sem IP, sem pairing. Autorizou no navegador, este computador ja fica vinculado.</p>
+      <p class="sub" id="loginText">Instale na VPS da cidade. O launcher so vincula a maquina, publica o IP e abre as portas. O banco e configurado no painel, do seu PC.</p>
       <button class="primary" id="loginBtn">
         <span id="loginBtnLabel">Continuar com a Flowdesk</span>
       </button>
@@ -204,7 +204,7 @@
     <section id="home" class="view">
       <div class="pill ok" id="statusPill"><span class="dot live"></span><span id="statusLabel">Online</span></div>
       <h1 id="hello" style="margin-top:16px">Conectado.</h1>
-      <p class="sub" id="homeText">O painel ja enxerga este launcher. Configure so o banco da cidade por la.</p>
+      <p class="sub" id="homeText">A Flowdesk ja enxerga esta VPS. No painel, informe o banco e teste a conexao remota.</p>
       <div class="stack">
         <div class="row">
           <div class="row-left">
@@ -213,7 +213,7 @@
             </div>
             <div>
               <strong id="hostname">-</strong>
-              <span class="meta">Computador</span>
+              <span class="meta">VPS / maquina</span>
             </div>
           </div>
           <span class="pill ok">Ativo</span>
@@ -230,13 +230,25 @@
           </div>
           <span class="pill ok">Vinculada</span>
         </div>
+        <div class="row">
+          <div class="row-left">
+            <div class="ico">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15 15 0 0 1 0 20M12 2a15 15 0 0 0 0 20"/></svg>
+            </div>
+            <div>
+              <strong id="publicIp">Detectando...</strong>
+              <span class="meta">IP publico para o painel</span>
+            </div>
+          </div>
+          <span class="pill ok">Remoto</span>
+        </div>
       </div>
       <div class="update-bar" id="updateBar">
         <p id="updateText">Procurando atualizacao...</p>
         <button class="mini hidden" id="installUpdate">Reiniciar</button>
       </div>
       <div class="footer">
-        <button class="ghost" id="firewall">Preparar conexao</button>
+        <button class="ghost" id="firewall">Abrir portas</button>
         <button class="ghost" id="logout">Sair</button>
       </div>
     </section>
@@ -263,13 +275,14 @@
       document.getElementById("loginText").textContent =
         state.view === "login" && state.message
           ? state.message
-          : "O mesmo login da Flowdesk. Sem codigo, sem IP, sem pairing. Autorizou no navegador, este computador ja fica vinculado.";
+          : "Instale na VPS da cidade. O launcher so vincula a maquina, publica o IP e abre as portas. O banco e configurado no painel, do seu PC.";
       document.getElementById("loginBtnLabel").textContent = loggingIn ? "Abrindo a Flowdesk..." : "Continuar com a Flowdesk";
       document.getElementById("loginBtn").disabled = loggingIn;
       document.getElementById("waitText").textContent = state.message || "Abra a Flowdesk, entre na sua conta e este launcher valida sozinho.";
       document.getElementById("openLoginBtn").classList.toggle("hidden", !state.canOpenLogin);
       document.getElementById("hostname").textContent = state.hostname || "-";
       document.getElementById("account").textContent = state.user?.displayName || "-";
+      document.getElementById("publicIp").textContent = state.publicIp || "Detectando IP publico...";
       const linked = Boolean(state.user && state.guildId);
       const online = state.connection === "online";
       document.getElementById("hello").textContent = online || linked ? "No ar." : "Reconectando.";
