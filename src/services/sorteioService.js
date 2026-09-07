@@ -32,6 +32,30 @@ function clampText(value, maxLength) {
   return String(value || "").slice(0, maxLength);
 }
 
+/** Discord rejeita setValue vazio quando minLength > tamanho do valor. */
+function applyModalInputValue(builder, value, minLength = 1) {
+  const text = String(value ?? "").trim();
+  if (text.length >= minLength) {
+    builder.setValue(text);
+  }
+  return builder;
+}
+
+function buildModalField({ customId, label, style, required, minLength, maxLength, placeholder, value }) {
+  const input = new TextInputBuilder()
+    .setCustomId(customId)
+    .setLabel(clampText(label, 45))
+    .setStyle(style)
+    .setRequired(required);
+
+  if (maxLength) input.setMaxLength(maxLength);
+  if (minLength) input.setMinLength(minLength);
+  if (placeholder) input.setPlaceholder(clampText(placeholder, 100));
+  applyModalInputValue(input, value, minLength || 1);
+
+  return input;
+}
+
 function draftKey(guildId, userId) {
   return `${guildId}:${userId}`;
 }
@@ -71,6 +95,8 @@ function createDefaultDraft(guildId, userId) {
     minServerDays: 0,
     minAccountAgeDays: 0,
     blacklistUserIds: [],
+    setupChannelId: null,
+    setupMessageId: null,
     updatedAt: Date.now(),
   };
 }
@@ -186,9 +212,14 @@ function buildSetupSummary(draft) {
       ? draft.blacklistUserIds.map((id) => `<@${id}>`).join(", ")
       : "Nenhum";
 
+  const ready =
+    draft.title.length >= MIN_TITLE_LENGTH && draft.description.length >= 3;
+
   return [
-    "### Central de Sorteios",
-    "Configure o sorteio abaixo e clique em **Enviar Sorteio** quando estiver pronto.",
+    "## Central de Sorteios",
+    "-# Configure o sorteio e clique em **Enviar Sorteio** quando estiver pronto.",
+    "",
+    ready ? "-# Status: **Pronto para publicar**" : "-# Status: *pendente — defina titulo e premio*",
     "",
     titleLine,
     descLine,
@@ -309,6 +340,7 @@ function buildActiveSorteioPayload(sorteio, entryCount, { ended = false } = {}) 
   const content = [
     ended ? "## Sorteio encerrado" : "## Sorteio ativo",
     `### ${sorteio.title}`,
+    "",
     sorteio.description || "-# Sem descricao adicional.",
     "",
     statusLine,
@@ -322,7 +354,16 @@ function buildActiveSorteioPayload(sorteio, entryCount, { ended = false } = {}) 
     {
       type: COMPONENT_TYPE.CONTAINER,
       accent_color: ended ? 0x95a5a6 : 0xf1c40f,
-      components: [{ type: COMPONENT_TYPE.TEXT_DISPLAY, content }],
+      components: [
+        { type: COMPONENT_TYPE.TEXT_DISPLAY, content },
+        { type: COMPONENT_TYPE.SEPARATOR, divider: true, spacing: 1 },
+        {
+          type: COMPONENT_TYPE.TEXT_DISPLAY,
+          content: ended
+            ? "-# Clique em **Reroll** para sortear novamente (host ou staff)."
+            : "-# Clique em **Entrar no sorteio** para participar.",
+        },
+      ],
     },
   ];
 
@@ -729,24 +770,28 @@ function showBasicModal(interaction, draft) {
 
   modal.addComponents(
     new ActionRowBuilder().addComponents(
-      new TextInputBuilder()
-        .setCustomId(`${SORTEIO_PREFIX}field:title`)
-        .setLabel("Titulo")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setMinLength(MIN_TITLE_LENGTH)
-        .setMaxLength(MAX_TITLE_LENGTH)
-        .setValue(draft.title || ""),
+      buildModalField({
+        customId: `${SORTEIO_PREFIX}field:title`,
+        label: "Titulo",
+        style: TextInputStyle.Short,
+        required: true,
+        minLength: MIN_TITLE_LENGTH,
+        maxLength: MAX_TITLE_LENGTH,
+        placeholder: "Ex: Sorteio Nitro mensal",
+        value: draft.title,
+      }),
     ),
     new ActionRowBuilder().addComponents(
-      new TextInputBuilder()
-        .setCustomId(`${SORTEIO_PREFIX}field:description`)
-        .setLabel("Descricao do premio")
-        .setStyle(TextInputStyle.Paragraph)
-        .setRequired(true)
-        .setMinLength(3)
-        .setMaxLength(MAX_DESCRIPTION_LENGTH)
-        .setValue(draft.description || ""),
+      buildModalField({
+        customId: `${SORTEIO_PREFIX}field:description`,
+        label: "Descricao do premio",
+        style: TextInputStyle.Paragraph,
+        required: true,
+        minLength: 3,
+        maxLength: MAX_DESCRIPTION_LENGTH,
+        placeholder: "Descreva o que o ganhador vai receber.",
+        value: draft.description,
+      }),
     ),
   );
 
@@ -760,15 +805,16 @@ function showTimeModal(interaction, draft) {
 
   modal.addComponents(
     new ActionRowBuilder().addComponents(
-      new TextInputBuilder()
-        .setCustomId(`${SORTEIO_PREFIX}field:minutes`)
-        .setLabel("Duracao maxima (minutos)")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setMinLength(1)
-        .setMaxLength(5)
-        .setPlaceholder("Ex: 60")
-        .setValue(String(draft.durationMinutes || 60)),
+      buildModalField({
+        customId: `${SORTEIO_PREFIX}field:minutes`,
+        label: "Duracao (minutos)",
+        style: TextInputStyle.Short,
+        required: true,
+        minLength: 1,
+        maxLength: 5,
+        placeholder: "Ex: 60",
+        value: String(draft.durationMinutes || 60),
+      }),
     ),
   );
 
@@ -778,18 +824,20 @@ function showTimeModal(interaction, draft) {
 function showWinnersModal(interaction, draft) {
   const modal = new ModalBuilder()
     .setCustomId(`${SORTEIO_PREFIX}modal:winners:${interaction.user.id}`)
-    .setTitle("Quantidade de vencedores");
+    .setTitle("Vencedores");
 
   modal.addComponents(
     new ActionRowBuilder().addComponents(
-      new TextInputBuilder()
-        .setCustomId(`${SORTEIO_PREFIX}field:winners`)
-        .setLabel("Numero de vencedores (1-25)")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setMinLength(1)
-        .setMaxLength(2)
-        .setValue(String(draft.winnerCount || 1)),
+      buildModalField({
+        customId: `${SORTEIO_PREFIX}field:winners`,
+        label: "Quantidade (1-25)",
+        style: TextInputStyle.Short,
+        required: true,
+        minLength: 1,
+        maxLength: 2,
+        placeholder: "Ex: 1",
+        value: String(draft.winnerCount || 1),
+      }),
     ),
   );
 
@@ -803,18 +851,17 @@ function showRolesModal(interaction, draft) {
 
   modal.addComponents(
     new ActionRowBuilder().addComponents(
-      new TextInputBuilder()
-        .setCustomId(`${SORTEIO_PREFIX}field:roles`)
-        .setLabel("IDs ou mencoes de cargo (@cargo)")
-        .setStyle(TextInputStyle.Paragraph)
-        .setRequired(false)
-        .setMaxLength(500)
-        .setPlaceholder("Deixe vazio para nenhum. Ex: @VIP @Membro")
-        .setValue(
-          draft.requiredRoleIds.length
-            ? draft.requiredRoleIds.map((id) => `<@&${id}>`).join(" ")
-            : "",
-        ),
+      buildModalField({
+        customId: `${SORTEIO_PREFIX}field:roles`,
+        label: "Cargos (@cargo ou ID)",
+        style: TextInputStyle.Paragraph,
+        required: false,
+        maxLength: 500,
+        placeholder: "Vazio = todos podem. Ex: @VIP @Membro",
+        value: draft.requiredRoleIds.length
+          ? draft.requiredRoleIds.map((id) => `<@&${id}>`).join(" ")
+          : "",
+      }),
     ),
   );
 
@@ -824,17 +871,20 @@ function showRolesModal(interaction, draft) {
 function showServerDaysModal(interaction, draft) {
   const modal = new ModalBuilder()
     .setCustomId(`${SORTEIO_PREFIX}modal:serverdays:${interaction.user.id}`)
-    .setTitle("Tempo minimo no servidor");
+    .setTitle("Tempo no servidor");
 
   modal.addComponents(
     new ActionRowBuilder().addComponents(
-      new TextInputBuilder()
-        .setCustomId(`${SORTEIO_PREFIX}field:serverdays`)
-        .setLabel("Dias minimos no servidor (0 = sem limite)")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setMaxLength(4)
-        .setValue(String(draft.minServerDays || 0)),
+      buildModalField({
+        customId: `${SORTEIO_PREFIX}field:serverdays`,
+        label: "Dias minimos (0 = livre)",
+        style: TextInputStyle.Short,
+        required: true,
+        minLength: 1,
+        maxLength: 4,
+        placeholder: "Ex: 0",
+        value: String(draft.minServerDays ?? 0),
+      }),
     ),
   );
 
@@ -844,17 +894,20 @@ function showServerDaysModal(interaction, draft) {
 function showAccountDaysModal(interaction, draft) {
   const modal = new ModalBuilder()
     .setCustomId(`${SORTEIO_PREFIX}modal:accountdays:${interaction.user.id}`)
-    .setTitle("Idade minima da conta");
+    .setTitle("Idade da conta");
 
   modal.addComponents(
     new ActionRowBuilder().addComponents(
-      new TextInputBuilder()
-        .setCustomId(`${SORTEIO_PREFIX}field:accountdays`)
-        .setLabel("Dias minimos da conta Discord (0 = sem limite)")
-        .setStyle(TextInputStyle.Short)
-        .setRequired(true)
-        .setMaxLength(4)
-        .setValue(String(draft.minAccountAgeDays || 0)),
+      buildModalField({
+        customId: `${SORTEIO_PREFIX}field:accountdays`,
+        label: "Dias minimos (0 = livre)",
+        style: TextInputStyle.Short,
+        required: true,
+        minLength: 1,
+        maxLength: 4,
+        placeholder: "Ex: 0",
+        value: String(draft.minAccountAgeDays ?? 0),
+      }),
     ),
   );
 
@@ -864,26 +917,46 @@ function showAccountDaysModal(interaction, draft) {
 function showBlacklistModal(interaction, draft) {
   const modal = new ModalBuilder()
     .setCustomId(`${SORTEIO_PREFIX}modal:blacklist:${interaction.user.id}`)
-    .setTitle("Blacklist de participantes");
+    .setTitle("Blacklist");
 
   modal.addComponents(
     new ActionRowBuilder().addComponents(
-      new TextInputBuilder()
-        .setCustomId(`${SORTEIO_PREFIX}field:blacklist`)
-        .setLabel("Usuarios bloqueados (@user ou IDs)")
-        .setStyle(TextInputStyle.Paragraph)
-        .setRequired(false)
-        .setMaxLength(1000)
-        .setPlaceholder("Deixe vazio para nenhum")
-        .setValue(
-          draft.blacklistUserIds.length
-            ? draft.blacklistUserIds.map((id) => `<@${id}>`).join(" ")
-            : "",
-        ),
+      buildModalField({
+        customId: `${SORTEIO_PREFIX}field:blacklist`,
+        label: "Usuarios bloqueados",
+        style: TextInputStyle.Paragraph,
+        required: false,
+        maxLength: 1000,
+        placeholder: "@usuario ou ID. Vazio = nenhum",
+        value: draft.blacklistUserIds.length
+          ? draft.blacklistUserIds.map((id) => `<@${id}>`).join(" ")
+          : "",
+      }),
     ),
   );
 
   return interaction.showModal(modal);
+}
+
+async function refreshSetupPanelMessage(interaction, draft, ownerId) {
+  const payload = buildSetupPanelPayload(draft, ownerId);
+  const channelId = draft.setupChannelId || interaction.channelId;
+  const messageId = draft.setupMessageId;
+
+  if (messageId && channelId) {
+    try {
+      const channel = await interaction.client.channels.fetch(channelId);
+      if (channel?.isTextBased?.()) {
+        const message = await channel.messages.fetch(messageId);
+        await message.edit(payload);
+        return true;
+      }
+    } catch (error) {
+      console.warn("[sorteio] Falha ao atualizar painel de setup:", error?.message || error);
+    }
+  }
+
+  return false;
 }
 
 async function handleSetupButton(interaction, action, ownerId) {
@@ -1112,6 +1185,20 @@ async function handleSorteioModalSubmit(interaction) {
     const description = interaction.fields
       .getTextInputValue(`${SORTEIO_PREFIX}field:description`)
       .trim();
+    if (title.length < MIN_TITLE_LENGTH) {
+      await replySorteio(
+        interaction,
+        buildFailurePayload("Titulo invalido", `Use pelo menos ${MIN_TITLE_LENGTH} caracteres.`),
+      );
+      return;
+    }
+    if (description.length < 3) {
+      await replySorteio(
+        interaction,
+        buildFailurePayload("Descricao invalida", "Descreva o premio com pelo menos 3 caracteres."),
+      );
+      return;
+    }
     draft = saveDraft(guildId, ownerId, { title, description });
   } else if (modalType === "time") {
     const minutes = Number.parseInt(
@@ -1172,10 +1259,16 @@ async function handleSorteioModalSubmit(interaction) {
     draft = saveDraft(guildId, ownerId, { blacklistUserIds });
   }
 
-  await replySorteio(
-    interaction,
-    buildSetupPanelPayload(draft, ownerId),
-  );
+  const updated = await refreshSetupPanelMessage(interaction, draft, ownerId);
+  if (updated) {
+    await replySorteio(
+      interaction,
+      buildSuccessPayload("Configuracao salva", "Painel atualizado com as novas definicoes."),
+    );
+    return;
+  }
+
+  await replySorteio(interaction, buildSetupPanelPayload(draft, ownerId));
 }
 
 function parseSorteioButton(customId) {
@@ -1260,7 +1353,17 @@ async function executeSorteioCommand(interaction) {
   }
 
   const draft = getDraft(interaction.guildId, interaction.user.id);
-  await interaction.reply(buildSetupPanelPayload(draft, interaction.user.id));
+  const payload = buildSetupPanelPayload(draft, interaction.user.id);
+
+  const message = await interaction.reply({
+    ...payload,
+    fetchReply: true,
+  });
+
+  saveDraft(interaction.guildId, interaction.user.id, {
+    setupChannelId: interaction.channelId,
+    setupMessageId: message.id,
+  });
 }
 
 function startSorteioWorker(client) {
