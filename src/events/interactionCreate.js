@@ -52,6 +52,12 @@ const {
   isBatePontoModalSubmit,
 } = require("../services/batePontoService");
 const {
+  handleSorteioButtonInteraction,
+  handleSorteioModalSubmit,
+  isSorteioButtonInteraction,
+  isSorteioModalSubmit,
+} = require("../services/sorteioService");
+const {
   getGuildTicketRuntime,
 } = require("../services/supabaseService");
 const { isDiscordUserSuspended, isDiscordUserAtRisk } = require("../services/violationService");
@@ -154,6 +160,10 @@ module.exports = {
           await handleBatePontoModalSubmit(interaction);
           return;
         }
+        if (isSorteioModalSubmit(interaction)) {
+          await handleSorteioModalSubmit(interaction);
+          return;
+        }
         if (isSalesComponentInteraction(interaction)) {
           await handleSalesInteraction(interaction, client);
           return;
@@ -208,6 +218,11 @@ module.exports = {
 
       if (isBatePontoButtonInteraction(interaction)) {
         await showBatePontoModal(interaction);
+        return;
+      }
+
+      if (isSorteioButtonInteraction(interaction)) {
+        await handleSorteioButtonInteraction(interaction);
         return;
       }
 

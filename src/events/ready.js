@@ -21,6 +21,7 @@ const { syncAllViolationRoles } = require("../services/violationService");
 const { syncAllClientRoles } = require("../services/clientRoleService");
 const { initRealtimeListeners } = require("../services/realtimeService");
 const { verifySupabaseAdminConnection } = require("../services/supabaseConnectivityService");
+const { startSorteioWorker } = require("../services/sorteioService");
 const { env } = require("../config/env");
 
 module.exports = {
@@ -104,6 +105,8 @@ module.exports = {
       startSecurityLogQueueWorker(client);
       startAutoRoleWorker(client);
       startBatePontoVoiceAbsenceWorker(client);
+      startSorteioWorker(client);
+      console.log("[sorteio-worker] worker de encerramento iniciado (15s)");
 
       if (env.clientRoleStartupSyncMode !== "off") {
         try {
