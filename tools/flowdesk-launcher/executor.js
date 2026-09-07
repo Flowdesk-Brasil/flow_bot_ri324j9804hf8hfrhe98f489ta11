@@ -363,6 +363,7 @@ async function executeJob(target, operation, payload) {
       return {
         ok: true,
         skipped: true,
+        changed: false,
         code: "already_applied",
         playerKey,
         previousValue: current == null ? null : String(current),
@@ -377,7 +378,8 @@ async function executeJob(target, operation, payload) {
     return {
       ok: true,
       skipped: false,
-      code: "ok",
+      changed: true,
+      code: "applied",
       playerKey,
       previousValue: current == null ? null : String(current),
       nextValue: next == null ? null : String(next),

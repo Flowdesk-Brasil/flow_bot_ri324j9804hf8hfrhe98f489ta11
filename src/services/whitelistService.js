@@ -96,43 +96,56 @@ function validateIdentifier(kind, raw) {
   return { ok: true, value };
 }
 
-function wasWhitelistAlreadyApplied(result, approve = true) {
+function wasWhitelistAlreadyApplied(result) {
   if (!result?.ok) return false;
-  if (result.skipped === true || result.code === "already_applied") return true;
-  if (!approve) return false;
-  const previous = result.previousValue;
-  const next = result.nextValue ?? result.currentValue;
-  if (previous == null && next == null) return true;
-  return String(previous ?? "") === String(next ?? "");
+  if (result.changed === true) return false;
+  if (result.changed === false) return true;
+  return result.skipped === true || result.code === "already_applied";
 }
 
-async function assertWhitelistClaim(guildId, userId, identifierValue, settings = null) {
+function buildWhitelistApplyNotice({ result, approve, autoApproved }) {
+  const alreadyApplied = wasWhitelistAlreadyApplied(result);
+  const changed = result.changed === true;
+
+  if (!approve) {
+    return buildNoticePayload(
+      alreadyApplied ? "Whitelist ja estava removida" : "Whitelist removida",
+      alreadyApplied
+        ? "O registro da cidade ja estava desligado. Nada foi alterado."
+        : "A whitelist foi removida no banco da cidade e o Discord foi sincronizado.",
+      "ok",
+    );
+  }
+
+  if (autoApproved) {
+    if (changed) {
+      return buildNoticePayload(
+        "Whitelist liberada",
+        "Seu ID foi encontrado e liberado no banco da cidade. Cargos e nickname foram aplicados no Discord.",
+        "ok",
+      );
+    }
+    return buildNoticePayload(
+      "Whitelist confirmada",
+      "Seu ID ja estava liberado no banco da cidade. Cargos e nickname foram sincronizados no Discord.",
+      "ok",
+    );
+  }
+
+  return buildNoticePayload(
+    alreadyApplied ? "Whitelist ja estava liberada" : "Whitelist sincronizada",
+    alreadyApplied
+      ? "O registro da cidade ja estava liberado. O Discord foi sincronizado."
+      : "O banco da cidade foi atualizado e o Discord foi sincronizado.",
+    "ok",
+  );
+}
+
+async function assertWhitelistClaim(guildId, userId, identifierValue) {
   const [byUser, byId] = await Promise.all([
     whitelistDb.findApprovedRequestByUser(guildId, userId),
     whitelistDb.findBoundRequestByIdentifier(guildId, identifierValue),
   ]);
-  if (byUser && String(byUser.identifier_value) === String(identifierValue)) {
-    if (settings) {
-      try {
-        const check = await executeWhitelistOperation(
-          settings,
-          "CHECK_WHITELIST",
-          identifierValue,
-        );
-        if (check.ok && check.state !== "on") {
-          return { ok: true };
-        }
-      } catch {
-        // Se o banco nao responde, mantem o bloqueio pelo historico aprovado.
-      }
-    }
-    return {
-      ok: false,
-      code: "already_released",
-      title: "Whitelist ja liberada",
-      message: "Sua whitelist ja foi liberada uma vez. Nao e possivel validar de novo com o mesmo ID.",
-    };
-  }
   if (byUser && String(byUser.identifier_value) !== String(identifierValue)) {
     return {
       ok: false,
@@ -443,12 +456,21 @@ async function handleWhitelistModalSubmit(interaction) {
     return;
   }
 
-  const claim = await assertWhitelistClaim(
-    guildId,
-    interaction.user.id,
-    identifierValue,
-    settings,
-  );
+  const isAutomatic = String(settings.approval_mode || "manual") === "automatic";
+
+  if (isAutomatic && !interaction.deferred && !interaction.replied) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => null);
+    await replyEphemeral(
+      interaction,
+      buildNoticePayload(
+        "Validando whitelist",
+        "Consultando o banco da cidade. Aguarde alguns segundos...",
+        "ok",
+      ),
+    );
+  }
+
+  const claim = await assertWhitelistClaim(guildId, interaction.user.id, identifierValue);
   if (!claim.ok) {
     await replyEphemeral(
       interaction,
@@ -456,19 +478,6 @@ async function handleWhitelistModalSubmit(interaction) {
     );
     return;
   }
-
-  const isAutomatic = String(settings.approval_mode || "manual") === "automatic";
-
-  if (isAutomatic && !interaction.deferred && !interaction.replied) {
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => null);
-  }
-
-  const cityPromise = isAutomatic
-    ? executeWhitelistOperation(settings, "APPROVE_WHITELIST", identifierValue).catch((error) => ({
-        ok: false,
-        ...sanitizeCityDbError(error),
-      }))
-    : null;
 
   const openRequest = await whitelistDb.findOpenRequest(guildId, interaction.user.id);
 
@@ -487,7 +496,22 @@ async function handleWhitelistModalSubmit(interaction) {
   if (isAutomatic) {
     const correlationId = openRequest?.correlation_id || randomUUID();
     let request = openRequest;
-    if (request) {
+    if (!request) {
+      const existingApproved = await whitelistDb.findApprovedRequestByUser(guildId, interaction.user.id);
+      if (
+        existingApproved &&
+        String(existingApproved.identifier_value) === String(identifierValue)
+      ) {
+        request = existingApproved;
+      }
+    }
+    if (request && request.status === "approved") {
+      request = await whitelistDb.updateWhitelistRequest(request.id, {
+        identifier_kind: identifierKind,
+        identifier_value: identifierValue,
+        correlation_id: correlationId,
+      });
+    } else if (request) {
       request = await whitelistDb.updateWhitelistRequest(request.id, {
         identifier_kind: identifierKind,
         identifier_value: identifierValue,
@@ -523,7 +547,6 @@ async function handleWhitelistModalSubmit(interaction) {
       approve: true,
       operation: "APPROVE_WHITELIST",
       autoApproved: true,
-      prefetchedResult: await cityPromise,
     });
     return;
   }
@@ -646,7 +669,6 @@ async function applyWhitelistChange({
   approve,
   operation,
   autoApproved = false,
-  prefetchedResult = null,
 }) {
   const lockKey = `${request.guild_id}:${request.id}`;
   if (applyingLocks.has(lockKey)) {
@@ -662,17 +684,26 @@ async function applyWhitelistChange({
   const cityOperation = cityOperationFor(operation);
 
   try {
-    let result = prefetchedResult;
-    if (!result) {
-      try {
-        result = await executeWhitelistOperation(
-          settings,
-          cityOperation,
-          request.identifier_value,
-        );
-      } catch (error) {
-        result = { ok: false, ...sanitizeCityDbError(error) };
-      }
+    if (autoApproved && interaction.deferred && !interaction.replied) {
+      await replyEphemeral(
+        interaction,
+        buildNoticePayload(
+          "Validando whitelist",
+          "Sincronizando com o banco da cidade...",
+          "ok",
+        ),
+      );
+    }
+
+    let result;
+    try {
+      result = await executeWhitelistOperation(
+        settings,
+        cityOperation,
+        request.identifier_value,
+      );
+    } catch (error) {
+      result = { ok: false, ...sanitizeCityDbError(error) };
     }
 
     if (!result.ok) {
@@ -699,37 +730,7 @@ async function applyWhitelistChange({
       return;
     }
 
-    const alreadyApplied = wasWhitelistAlreadyApplied(result, approve);
-    await replyEphemeral(
-      interaction,
-      buildNoticePayload(
-        alreadyApplied && autoApproved && approve
-          ? "Whitelist ja liberada"
-          : autoApproved && approve
-            ? "Whitelist liberada"
-            : approve
-              ? alreadyApplied
-                ? "Whitelist ja estava liberada"
-                : "Whitelist sincronizada"
-              : alreadyApplied
-                ? "Whitelist ja estava removida"
-                : "Whitelist removida",
-        alreadyApplied && autoApproved && approve
-          ? "Este ID ja estava liberado no banco da cidade (1 ou true). Nao foi necessario alterar o registro."
-          : autoApproved && approve
-            ? "O ID existia e estava livre (0 ou vazio). A whitelist foi liberada no banco da cidade."
-            : approve
-              ? alreadyApplied
-                ? "O registro da cidade ja estava liberado. O Discord foi sincronizado."
-                : "O banco da cidade foi atualizado e o Discord foi sincronizado."
-              : alreadyApplied
-                ? "O registro da cidade ja estava desligado. Nada foi alterado."
-                : "A whitelist foi removida no banco da cidade e o Discord foi sincronizado.",
-        alreadyApplied && autoApproved && approve ? "warning" : "ok",
-      ),
-    );
-
-    void persistWhitelistSuccess({
+    await persistWhitelistSuccess({
       interaction,
       settings,
       request,
@@ -739,6 +740,11 @@ async function applyWhitelistChange({
       autoApproved,
       correlationId,
     });
+
+    await replyEphemeral(
+      interaction,
+      buildWhitelistApplyNotice({ result, approve, autoApproved }),
+    );
   } finally {
     applyingLocks.delete(lockKey);
   }

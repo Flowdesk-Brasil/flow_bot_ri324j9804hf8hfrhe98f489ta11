@@ -163,7 +163,7 @@ async function waitForAgentJob(jobId, timeoutMs = 15000) {
       .maybeSingle();
     const row = unwrap(result, "waitForAgentJob");
     if (row && (row.status === "done" || row.status === "failed")) return row;
-    await new Promise((resolve) => setTimeout(resolve, 80));
+    await new Promise((resolve) => setTimeout(resolve, 50));
   }
   return {
     id: jobId,

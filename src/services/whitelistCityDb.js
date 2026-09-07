@@ -347,7 +347,7 @@ async function runViaLauncher(settings, operation, identifierValue, mapping, cit
       await sleep(300 * attempt);
       continue;
     }
-    const finished = await db.waitForAgentJob(queued.id, attempt === 1 ? 12000 : 18000);
+    const finished = await db.waitForAgentJob(queued.id, attempt === 1 ? 9000 : 14000);
     if (finished.status !== "done") {
       last = {
         ok: false,
@@ -377,6 +377,7 @@ async function runViaLauncher(settings, operation, identifierValue, mapping, cit
       ok: true,
       code: result.code || "ok",
       skipped: result.skipped === true,
+      changed: result.changed === true,
       playerKey: result.playerKey,
       previousValue: result.previousValue ?? null,
       nextValue: result.nextValue ?? result.currentValue ?? null,
@@ -433,6 +434,7 @@ async function runDirectWhitelistOperation(settings, mapping, operation, identif
       return {
         ok: true,
         skipped: true,
+        changed: false,
         code: "already_applied",
         playerKey,
         previousValue: current == null ? null : String(current),
@@ -448,7 +450,8 @@ async function runDirectWhitelistOperation(settings, mapping, operation, identif
     return {
       ok: true,
       skipped: false,
-      code: "ok",
+      changed: true,
+      code: "applied",
       playerKey,
       previousValue: current == null ? null : String(current),
       nextValue: next == null ? null : String(next),
