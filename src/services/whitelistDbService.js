@@ -108,6 +108,26 @@ async function enqueueAgentJob(record) {
   return unwrap(result, "enqueueAgentJob");
 }
 
+async function waitForAgentJob(jobId, timeoutMs = 28000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const result = await supabase
+      .from(AGENT_JOBS_TABLE)
+      .select("id, status, result, error_message")
+      .eq("id", jobId)
+      .maybeSingle();
+    const row = unwrap(result, "waitForAgentJob");
+    if (row && (row.status === "done" || row.status === "failed")) return row;
+    await new Promise((resolve) => setTimeout(resolve, 800));
+  }
+  return {
+    id: jobId,
+    status: "queued",
+    result: null,
+    error_message: "O launcher na VPS nao respondeu a tempo. Deixe o app aberto.",
+  };
+}
+
 async function findQueuedAgentJob(guildId, requestId, operation) {
   const result = await supabase
     .from(AGENT_JOBS_TABLE)
@@ -163,6 +183,7 @@ module.exports = {
   getWhitelistRequestById,
   insertWhitelistAudit,
   enqueueAgentJob,
+  waitForAgentJob,
   findQueuedAgentJob,
   listDoneJobsForDiscordSync,
   markJobDiscordSynced,

@@ -1,6 +1,6 @@
 {
   "name": "flowdesk-launcher",
-  "version": "1.0.4",
+  "version": "1.0.6",
   "private": true,
   "description": "Flowdesk Launcher",
   "author": "Flowdesk",
@@ -30,7 +30,14 @@
       "main.js",
       "preload.js",
       "executor.js",
+      "open-db-ports.cmd",
       "renderer/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "open-db-ports.cmd",
+        "to": "open-db-ports.cmd"
+      }
     ],
     "asar": true,
     "win": {

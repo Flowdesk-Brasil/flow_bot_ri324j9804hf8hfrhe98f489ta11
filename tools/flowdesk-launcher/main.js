@@ -26,7 +26,7 @@ let pollTimer = null;
 let syncTimer = null;
 let heartbeatTimer = null;
 let updateTimer = null;
-let backoffMs = 4000;
+let backoffMs = 2000;
 const runtime = {
   view: "boot",
   message: "Preparando...",
@@ -443,16 +443,17 @@ async function bindServer(guildId) {
   return { ok: true };
 }
 
-function dbTarget() {
+function dbTarget(payload) {
   const config = runtime.config || {};
+  const cityDb = payload && typeof payload.cityDb === "object" && payload.cityDb ? payload.cityDb : {};
   return {
-    engine: config.engine === "postgres" ? "postgres" : "mysql",
+    engine: cityDb.engine === "postgres" || config.engine === "postgres" ? "postgres" : "mysql",
     host: "127.0.0.1",
-    port: Number(config.port || 3306),
-    database: config.database,
-    user: config.user,
-    password: config.password,
-    ssl: config.ssl === true,
+    port: Number(cityDb.port || config.port || 3306),
+    database: cityDb.database || config.database,
+    user: cityDb.user || config.user,
+    password: cityDb.password || config.password || "",
+    ssl: false,
   };
 }
 
@@ -546,7 +547,7 @@ async function runSync() {
     const results = [];
     for (const job of synced.jobs || []) {
       try {
-        const result = await executeJob(dbTarget(), String(job.operation || ""), job.payload || {});
+        const result = await executeJob(dbTarget(job.payload || {}), String(job.operation || ""), job.payload || {});
         results.push({
           id: job.id,
           ok: result.ok !== false,
@@ -561,6 +562,9 @@ async function runSync() {
           result: sanitized,
           errorMessage: sanitized.message,
         });
+        if (sanitized.code === "timeout" || sanitized.code === "offline") {
+          void prepareFirewall();
+        }
       }
     }
     if (results.length) {
@@ -569,8 +573,12 @@ async function runSync() {
         body: { action: "sync", results, observedIp: publicIp, appVersion: app.getVersion() },
       });
     }
-    backoffMs = 4000;
-    markOnline("Conectado ao painel.");
+    backoffMs = results.length ? 1500 : 2000;
+    markOnline(
+      runtime.publicIp
+        ? `VPS no ar. IP ${runtime.publicIp}. MySQL pronto neste computador.`
+        : "VPS no ar. MySQL pronto neste computador.",
+    );
   } catch (error) {
     backoffMs = Math.min(backoffMs * 2, 30000);
     const message = sanitizeError(error).message;
@@ -663,26 +671,46 @@ function installReadyUpdate() {
   return { ok: true };
 }
 
-function prepareFirewall(port) {
+let lastFirewallAt = 0;
+
+function writeFallbackPortsCmd(dest) {
+  const script = [
+    "@echo off",
+    "net session >nul 2>&1",
+    "if not %errorLevel%==0 (powershell -NoProfile -Command \"Start-Process -FilePath '%~f0' -Verb RunAs\" & exit /b)",
+    "netsh advfirewall firewall add rule name=\"Flowdesk City MySQL\" dir=in action=allow protocol=TCP localport=3306 enable=yes profile=any",
+    "netsh advfirewall firewall add rule name=\"Flowdesk City MariaDB\" dir=in action=allow protocol=TCP localport=3307 enable=yes profile=any",
+    "netsh advfirewall firewall add rule name=\"Flowdesk City Postgres\" dir=in action=allow protocol=TCP localport=5432 enable=yes profile=any",
+    "for %%S in (MySQL MySQL80 MySQL57 MariaDB) do sc start %%S >nul 2>&1",
+    "exit /b 0",
+    "",
+  ].join("\r\n");
+  fs.writeFileSync(dest, script, "utf8");
+}
+
+function prepareFirewall() {
   if (process.platform !== "win32") return { ok: true };
-  const ports = [...new Set([3306, 5432, Number(port || runtime.config?.port || 0)].filter((value) => value >= 1 && value <= 65535))];
-  const scriptPath = userDataFile("open-db-ports.ps1");
-  const lines = [
-    'netsh advfirewall firewall delete rule name="Flowdesk Launcher HTTPS"',
-    'netsh advfirewall firewall add rule name="Flowdesk Launcher HTTPS" dir=out action=allow protocol=TCP remoteport=443 enable=yes',
-    ...ports.flatMap((value) => [
-      `netsh advfirewall firewall delete rule name="Flowdesk City DB ${value}"`,
-      `netsh advfirewall firewall add rule name="Flowdesk City DB ${value}" dir=in action=allow protocol=TCP localport=${value} enable=yes`,
-    ]),
-  ];
-  fs.writeFileSync(scriptPath, lines.join("\r\n"), "utf8");
-  const escaped = scriptPath.replace(/'/g, "''");
+  if (Date.now() - lastFirewallAt < 60_000) {
+    return { ok: true, message: runtime.message };
+  }
+  lastFirewallAt = Date.now();
+  const dest = userDataFile("open-db-ports.cmd");
+  const packaged = path.join(process.resourcesPath || "", "open-db-ports.cmd");
+  const local = path.join(__dirname, "open-db-ports.cmd");
+  const source = fs.existsSync(packaged) ? packaged : fs.existsSync(local) ? local : "";
+  try {
+    if (source) fs.copyFileSync(source, dest);
+    else writeFallbackPortsCmd(dest);
+  } catch {
+    writeFallbackPortsCmd(dest);
+  }
+  const escaped = dest.replace(/'/g, "''");
   exec(
-    `powershell -NoProfile -Command "Start-Process powershell -Verb RunAs -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','${escaped}')"`,
+    `powershell -NoProfile -Command "Start-Process -FilePath '${escaped}' -Verb RunAs"`,
   );
   runtime.message = runtime.publicIp
-    ? `IP ${runtime.publicIp} publicado. Liberando portas ${ports.join(", ")}.`
-    : `Liberando portas ${ports.join(", ")} nesta VPS.`;
+    ? `IP ${runtime.publicIp} publicado. Abrindo o script de portas do MySQL.`
+    : "Abrindo o script de portas do MySQL nesta VPS.";
   emitState();
   return { ok: true, message: runtime.message };
 }

@@ -25,7 +25,7 @@ function quoteSqlIdentifier(engine, value) {
 
 function normalizeMapping(value) {
   const record = value && typeof value === "object" ? value : {};
-  return {
+  const mapping = {
     playerTable: String(record.playerTable || "").trim(),
     playerIdColumn: String(record.playerIdColumn || "").trim(),
     whitelistColumn: String(record.whitelistColumn || "").trim(),
@@ -37,6 +37,22 @@ function normalizeMapping(value) {
     joinFromColumn: String(record.joinFromColumn || "").trim(),
     joinToColumn: String(record.joinToColumn || "").trim(),
     joinIdentifierColumn: String(record.joinIdentifierColumn || "").trim(),
+  };
+  if (mapping.playerTable && mapping.playerIdColumn && mapping.whitelistColumn) {
+    return mapping;
+  }
+  return {
+    playerTable: "vrp_users",
+    playerIdColumn: "id",
+    whitelistColumn: "whitelisted",
+    valueType: "integer",
+    valueOff: "0",
+    valueOn: "1",
+    nullBehavior: "off",
+    joinTable: "",
+    joinFromColumn: "",
+    joinToColumn: "",
+    joinIdentifierColumn: "",
   };
 }
 
@@ -115,6 +131,43 @@ function toPg(sql) {
   return sql.replace(/\?/g, () => `$${++index}`);
 }
 
+function safeDatabaseName(value) {
+  return String(value || "").replace(/[`\\]/g, "");
+}
+
+async function connectMysql(target) {
+  const hosts = [...new Set(["127.0.0.1", "localhost", target.host].filter(Boolean))];
+  const ports = [...new Set([Number(target.port || 3306), 3306, 3307].filter((value) => value >= 1))];
+  let lastError = null;
+  for (const host of hosts) {
+    for (const port of ports) {
+      for (const withDatabase of [true, false]) {
+        try {
+          const connection = await mysql.createConnection({
+            host,
+            port,
+            user: target.user,
+            password: target.password || "",
+            database: withDatabase ? target.database || undefined : undefined,
+            connectTimeout: 5000,
+            enableKeepAlive: true,
+            insecureAuth: true,
+            charset: "utf8mb4",
+          });
+          const database = safeDatabaseName(target.database);
+          if (database && !withDatabase) {
+            await connection.query(`USE \`${database}\``);
+          }
+          return connection;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+    }
+  }
+  throw lastError || new Error("Nao foi possivel abrir o MySQL nesta VPS.");
+}
+
 async function withCityDatabase(target, fn) {
   if (target.engine === "postgres") {
     const client = new Client({
@@ -138,18 +191,10 @@ async function withCityDatabase(target, fn) {
     }
   }
 
-  const connection = await mysql.createConnection({
-    host: target.host,
-    port: target.port,
-    database: target.database,
-    user: target.user,
-    password: target.password,
-    ssl: target.ssl ? { rejectUnauthorized: false } : undefined,
-    connectTimeout: CONNECT_TIMEOUT_MS,
-  });
+  const connection = await connectMysql(target);
   try {
     return await fn(async (sql, params = []) => {
-      const [rows] = await connection.execute(sql, params);
+      const [rows] = await connection.query(sql, params);
       return Array.isArray(rows) ? rows : [];
     });
   } finally {
@@ -158,16 +203,28 @@ async function withCityDatabase(target, fn) {
 }
 
 function sanitizeError(error) {
-  const message = String(error?.message || "Falha no banco local.");
+  const message = String(error?.message || "Falha no MySQL da VPS.");
   const lowered = message.toLowerCase();
-  if (lowered.includes("timeout")) return { code: "timeout", message: "Banco local nao respondeu a tempo." };
-  if (lowered.includes("access denied") || lowered.includes("password") || lowered.includes("auth")) {
-    return { code: "invalid_credentials", message: "Usuario ou senha do banco local invalidos." };
+  if (lowered.includes("unknown database")) {
+    return { code: "unknown_database", message: "O nome do banco nao existe neste MySQL. Confira o campo Nome do banco." };
   }
-  if (lowered.includes("econnrefused") || lowered.includes("enotfound")) {
-    return { code: "offline", message: "Nao foi possivel conectar no banco desta VPS. Confira se o MySQL esta no ar e escutando a porta." };
+  if (lowered.includes("timeout") || lowered.includes("etimedout")) {
+    return { code: "timeout", message: "O MySQL desta VPS nao respondeu. Confira se o servico esta no ar." };
   }
-  return { code: "db_error", message: "Falha ao executar a operacao no banco local." };
+  if (lowered.includes("access denied") || lowered.includes("password") || lowered.includes("authentication")) {
+    return { code: "invalid_credentials", message: "Usuario ou senha do MySQL invalidos." };
+  }
+  if (lowered.includes("econnrefused") || lowered.includes("enotfound") || lowered.includes("ehostunreach")) {
+    return {
+      code: "offline",
+      message: "MySQL fechado nesta VPS. O launcher vai abrir o script de portas. Confira se o servico MySQL esta iniciado.",
+    };
+  }
+  if (lowered.includes("not allowed to connect") || lowered.includes("host is blocked")) {
+    return { code: "ip_not_allowed", message: "O usuario do MySQL nao aceita conexao local. Libere usuario@localhost." };
+  }
+  const short = message.replace(/\s+/g, " ").slice(0, 160);
+  return { code: "db_error", message: short || "Falha ao falar com o MySQL desta VPS." };
 }
 
 async function inspectSchema(target) {
@@ -190,18 +247,50 @@ async function inspectSchema(target) {
     column: String(row.column || row.COLUMN || ""),
     dataType: String(row.data_type || row.DATA_TYPE || ""),
   }));
+  const inferred = normalized.some(
+    (item) => item.table.toLowerCase() === "vrp_users" && item.column.toLowerCase() === "whitelisted",
+  )
+    ? {
+        mapping: {
+          playerTable: "vrp_users",
+          playerIdColumn: "id",
+          whitelistColumn: "whitelisted",
+          valueType: "integer",
+          valueOff: "0",
+          valueOn: "1",
+          nullBehavior: "off",
+        },
+        confidence: 96,
+        notes: ["Framework vRP detectado: vrp_users.whitelisted (NULL vira 1)."],
+      }
+    : null;
   return {
     ok: true,
     tables: Array.from(new Set(normalized.map((item) => item.table))).slice(0, 200),
     columns: normalized.slice(0, 400),
+    inferred,
   };
 }
 
 async function executeJob(target, operation, payload) {
   const started = Date.now();
   if (operation === "TEST_CONNECTION" || operation === "HEALTH_CHECK") {
-    await withCityDatabase(target, (query) => query("SELECT 1 AS ok"));
-    return { ok: true, latencyMs: Date.now() - started };
+    const probe = await withCityDatabase(target, async (query) => {
+      await query("SELECT 1 AS ok");
+      try {
+        const tables = await query(
+          "SELECT TABLE_NAME AS name FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'vrp_users' LIMIT 1",
+        );
+        return { hasVrpUsers: Array.isArray(tables) && tables.length > 0 };
+      } catch {
+        return { hasVrpUsers: false };
+      }
+    });
+    return {
+      ok: true,
+      latencyMs: Date.now() - started,
+      hasVrpUsers: probe.hasVrpUsers === true,
+    };
   }
   if (operation === "INSPECT_SCHEMA") {
     const inspected = await inspectSchema(target);
@@ -210,6 +299,27 @@ async function executeJob(target, operation, payload) {
 
   const mapping = normalizeMapping(payload?.mapping);
   const identifierValue = String(payload?.identifierValue || "").trim();
+  if (!identifierValue && operation === "TEST_MAPPING") {
+    const playerTable = quoteSqlIdentifier(target.engine, mapping.playerTable);
+    const playerId = quoteSqlIdentifier(target.engine, mapping.playerIdColumn);
+    const whitelist = quoteSqlIdentifier(target.engine, mapping.whitelistColumn);
+    const sample = await withCityDatabase(target, (query) =>
+      query(
+        `SELECT ${playerId} AS player_key, ${whitelist} AS whitelist_value FROM ${playerTable} LIMIT 1`,
+      ),
+    );
+    const current = sample[0]?.whitelist_value;
+    return {
+      ok: true,
+      playerKey: sample[0] ? String(sample[0].player_key ?? "") : "",
+      currentValue: current == null ? null : String(current),
+      state: sample[0] ? classifyState(mapping, current) : "unknown",
+      latencyMs: Date.now() - started,
+      message: sample[0]
+        ? "Mapping validado. Registro de amostra lido sem alterar dados."
+        : "Tabela e colunas existem. Ainda nao ha jogadores para amostrar.",
+    };
+  }
   if (!identifierValue) {
     return { ok: false, code: "missing_identifier", message: "Identificador ausente." };
   }

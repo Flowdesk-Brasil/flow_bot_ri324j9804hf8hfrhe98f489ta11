@@ -26,7 +26,7 @@ function quoteSqlIdentifier(engine, value) {
 
 function normalizeMapping(value) {
   const record = value && typeof value === "object" ? value : {};
-  return {
+  const mapping = {
     playerTable: String(record.playerTable || "").trim(),
     playerIdColumn: String(record.playerIdColumn || "").trim(),
     whitelistColumn: String(record.whitelistColumn || "").trim(),
@@ -38,6 +38,22 @@ function normalizeMapping(value) {
     joinFromColumn: String(record.joinFromColumn || "").trim(),
     joinToColumn: String(record.joinToColumn || "").trim(),
     joinIdentifierColumn: String(record.joinIdentifierColumn || "").trim(),
+  };
+  if (mapping.playerTable && mapping.playerIdColumn && mapping.whitelistColumn) {
+    return mapping;
+  }
+  return {
+    playerTable: "vrp_users",
+    playerIdColumn: "id",
+    whitelistColumn: "whitelisted",
+    valueType: "integer",
+    valueOff: "0",
+    valueOn: "1",
+    nullBehavior: "off",
+    joinTable: "",
+    joinFromColumn: "",
+    joinToColumn: "",
+    joinIdentifierColumn: "",
   };
 }
 
@@ -199,15 +215,75 @@ function settingsToTarget(settings, guildId) {
 }
 
 async function executeWhitelistOperation(settings, operation, identifierValue) {
-  if (settings.mapping_status !== "validated") {
+  const mapping = normalizeMapping(settings.mapping);
+  let cityTarget = null;
+  try {
+    cityTarget = settingsToTarget(settings, settings.guild_id);
+  } catch {
+    cityTarget = null;
+  }
+  try {
+    return await runDirectWhitelistOperation(settings, mapping, operation, identifierValue);
+  } catch (error) {
+    const sanitized = sanitizeCityDbError(error);
+    if (sanitized.code !== "offline" && sanitized.code !== "timeout") {
+      throw error;
+    }
+    const queued = await require("./whitelistDbService").enqueueAgentJob({
+      guild_id: settings.guild_id,
+      operation,
+      payload: {
+        identifierValue,
+        mapping,
+        cityDb: cityTarget
+          ? {
+              engine: cityTarget.engine,
+              port: cityTarget.port,
+              database: cityTarget.database,
+              user: cityTarget.user,
+              password: cityTarget.password,
+            }
+          : undefined,
+      },
+    });
+    if (!queued?.id) {
+      return { ok: false, ...sanitized };
+    }
+    const finished = await require("./whitelistDbService").waitForAgentJob(queued.id, 28000);
+    if (finished.status !== "done") {
+      return {
+        ok: false,
+        code: "vps_timeout",
+        message:
+          finished.error_message ||
+          "O launcher na VPS nao concluiu a tempo. Deixe o app aberto na maquina da cidade.",
+      };
+    }
+    const result = finished.result && typeof finished.result === "object" ? finished.result : {};
+    if (result.ok === false) {
+      return {
+        ok: false,
+        code: result.code || "db_error",
+        message: result.message || "Falha no MySQL da VPS.",
+        playerKey: result.playerKey,
+        previousValue: result.previousValue,
+        nextValue: result.nextValue,
+      };
+    }
     return {
-      ok: false,
-      code: "mapping_invalid",
-      message: "Mapping da whitelist ainda nao foi validado no dashboard.",
+      ok: true,
+      code: result.code || "ok",
+      skipped: result.skipped === true,
+      playerKey: result.playerKey,
+      previousValue: result.previousValue ?? null,
+      nextValue: result.nextValue ?? result.currentValue ?? null,
+      currentValue: result.currentValue ?? null,
+      state: result.state,
     };
   }
+}
 
-  const mapping = normalizeMapping(settings.mapping);
+async function runDirectWhitelistOperation(settings, mapping, operation, identifierValue) {
   const target = settingsToTarget(settings, settings.guild_id);
   const selectSql = buildSelectSql(target.engine, mapping);
   const rows = await withCityDatabase(target, (query) => query(selectSql, [identifierValue]));
