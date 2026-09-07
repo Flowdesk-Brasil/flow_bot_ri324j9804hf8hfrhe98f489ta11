@@ -1,5 +1,5 @@
-const mysql = require("mysql2/promise");
 const { Client } = require("pg");
+const { connectCityMysql, releaseCityMysql } = require("./cityMysql");
 
 const IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const CONNECT_TIMEOUT_MS = 8000;
@@ -38,22 +38,7 @@ function normalizeMapping(value) {
     joinToColumn: String(record.joinToColumn || "").trim(),
     joinIdentifierColumn: String(record.joinIdentifierColumn || "").trim(),
   };
-  if (mapping.playerTable && mapping.playerIdColumn && mapping.whitelistColumn) {
-    return mapping;
-  }
-  return {
-    playerTable: "vrp_users",
-    playerIdColumn: "id",
-    whitelistColumn: "whitelisted",
-    valueType: "integer",
-    valueOff: "0",
-    valueOn: "1",
-    nullBehavior: "off",
-    joinTable: "",
-    joinFromColumn: "",
-    joinToColumn: "",
-    joinIdentifierColumn: "",
-  };
+  return mapping;
 }
 
 function mappingUsesJoin(mapping) {
@@ -135,39 +120,6 @@ function safeDatabaseName(value) {
   return String(value || "").replace(/[`\\]/g, "");
 }
 
-async function connectMysql(target) {
-  const hosts = [...new Set(["127.0.0.1", "localhost", target.host].filter(Boolean))];
-  const ports = [...new Set([Number(target.port || 3306), 3306, 3307].filter((value) => value >= 1))];
-  let lastError = null;
-  for (const host of hosts) {
-    for (const port of ports) {
-      for (const withDatabase of [true, false]) {
-        try {
-          const connection = await mysql.createConnection({
-            host,
-            port,
-            user: target.user,
-            password: target.password || "",
-            database: withDatabase ? target.database || undefined : undefined,
-            connectTimeout: 5000,
-            enableKeepAlive: true,
-            insecureAuth: true,
-            charset: "utf8mb4",
-          });
-          const database = safeDatabaseName(target.database);
-          if (database && !withDatabase) {
-            await connection.query(`USE \`${database}\``);
-          }
-          return connection;
-        } catch (error) {
-          lastError = error;
-        }
-      }
-    }
-  }
-  throw lastError || new Error("Nao foi possivel abrir o MySQL nesta VPS.");
-}
-
 async function withCityDatabase(target, fn) {
   if (target.engine === "postgres") {
     const client = new Client({
@@ -191,28 +143,45 @@ async function withCityDatabase(target, fn) {
     }
   }
 
-  const connection = await connectMysql(target);
+  const connection = await connectCityMysql(target);
   try {
     return await fn(async (sql, params = []) => {
       const [rows] = await connection.query(sql, params);
       return Array.isArray(rows) ? rows : [];
     });
   } finally {
-    await connection.end().catch(() => null);
+    await releaseCityMysql(connection);
   }
 }
 
 function sanitizeError(error) {
   const message = String(error?.message || "Falha no MySQL da VPS.");
   const lowered = message.toLowerCase();
+  if (error?.code === "missing_credentials" || lowered.includes("nao chegaram no launcher")) {
+    return {
+      code: "missing_credentials",
+      message: "Usuario e senha do MySQL nao chegaram no launcher. Digite no painel e clique em Conectar banco.",
+    };
+  }
   if (lowered.includes("unknown database")) {
     return { code: "unknown_database", message: "O nome do banco nao existe neste MySQL. Confira o campo Nome do banco." };
   }
   if (lowered.includes("timeout") || lowered.includes("etimedout")) {
     return { code: "timeout", message: "O MySQL desta VPS nao respondeu. Confira se o servico esta no ar." };
   }
-  if (lowered.includes("access denied") || lowered.includes("password") || lowered.includes("authentication")) {
-    return { code: "invalid_credentials", message: "Usuario ou senha do MySQL invalidos." };
+  if (lowered.includes("plugin") || lowered.includes("caching_sha2") || lowered.includes("not supported auth")) {
+    return {
+      code: "auth_plugin",
+      message: "O MySQL recusou o plugin de autenticacao. No HeidiSQL, altere o usuario para mysql_native_password.",
+    };
+  }
+  if (error?.errno === 1045 || lowered.includes("access denied") || lowered.includes("er_access_denied")) {
+    const who = message.match(/['`]([^'`]+)['`]@['`]([^'`]+)['`]/);
+    const account = who ? `${who[1]}@${who[2]}` : "usuario@localhost";
+    return {
+      code: "invalid_credentials",
+      message: `MariaDB recusou ${account}. Rode o SQL do painel (usuariodeteste / 12345) na aba Consulta do HeidiSQL, como root.`,
+    };
   }
   if (lowered.includes("econnrefused") || lowered.includes("enotfound") || lowered.includes("ehostunreach")) {
     return {
@@ -324,54 +293,56 @@ async function executeJob(target, operation, payload) {
     return { ok: false, code: "missing_identifier", message: "Identificador ausente." };
   }
   const selectSql = buildSelectSql(target.engine, mapping);
-  const rows = await withCityDatabase(target, (query) => query(selectSql, [identifierValue]));
-  if (rows.length > 1) {
-    return { ok: false, code: "multiple_players", message: "Mais de um jogador encontrado." };
-  }
-  if (!rows.length) {
-    return { ok: false, code: "player_not_found", message: "Jogador nao encontrado no banco da cidade." };
-  }
-  const current = rows[0].whitelist_value;
-  const playerKey = String(rows[0].player_key ?? "");
-  const state = classifyState(mapping, current);
-  if (
-    operation === "GET_PLAYER" ||
-    operation === "CHECK_WHITELIST" ||
-    operation === "TEST_MAPPING"
-  ) {
-    return {
-      ok: true,
-      playerKey,
-      currentValue: current == null ? null : String(current),
-      state,
-      latencyMs: Date.now() - started,
-    };
-  }
+  const updateSql = buildUpdateSql(target.engine, mapping);
+  return withCityDatabase(target, async (query) => {
+    const rows = await query(selectSql, [identifierValue]);
+    if (rows.length > 1) {
+      return { ok: false, code: "multiple_players", message: "Mais de um jogador encontrado." };
+    }
+    if (!rows.length) {
+      return { ok: false, code: "player_not_found", message: "Jogador nao encontrado no banco da cidade." };
+    }
+    const current = rows[0].whitelist_value;
+    const playerKey = String(rows[0].player_key ?? "");
+    const state = classifyState(mapping, current);
+    if (
+      operation === "GET_PLAYER" ||
+      operation === "CHECK_WHITELIST" ||
+      operation === "TEST_MAPPING"
+    ) {
+      return {
+        ok: true,
+        playerKey,
+        currentValue: current == null ? null : String(current),
+        state,
+        latencyMs: Date.now() - started,
+      };
+    }
 
-  const approve = operation === "APPROVE_WHITELIST";
-  if ((approve && state === "on") || (!approve && state === "off")) {
+    const approve = operation === "APPROVE_WHITELIST";
+    if ((approve && state === "on") || (!approve && state === "off")) {
+      return {
+        ok: true,
+        skipped: true,
+        playerKey,
+        previousValue: current == null ? null : String(current),
+        nextValue: current == null ? null : String(current),
+        state,
+      };
+    }
+    const desired = coerceValue(mapping.valueType, approve ? mapping.valueOn : mapping.valueOff);
+    await query(updateSql, [desired, playerKey]);
+    const confirmRows = await query(selectSql, [identifierValue]);
+    const next = confirmRows[0]?.whitelist_value;
     return {
       ok: true,
-      skipped: true,
+      skipped: false,
       playerKey,
       previousValue: current == null ? null : String(current),
-      nextValue: current == null ? null : String(current),
-      state,
+      nextValue: next == null ? null : String(next),
+      state: classifyState(mapping, next),
     };
-  }
-  const desired = coerceValue(mapping.valueType, approve ? mapping.valueOn : mapping.valueOff);
-  const updateSql = buildUpdateSql(target.engine, mapping);
-  await withCityDatabase(target, (query) => query(updateSql, [desired, playerKey]));
-  const confirmRows = await withCityDatabase(target, (query) => query(selectSql, [identifierValue]));
-  const next = confirmRows[0]?.whitelist_value;
-  return {
-    ok: true,
-    skipped: false,
-    playerKey,
-    previousValue: current == null ? null : String(current),
-    nextValue: next == null ? null : String(next),
-    state: classifyState(mapping, next),
-  };
+  });
 }
 
 module.exports = {

@@ -1,6 +1,6 @@
 {
   "name": "flowdesk-launcher",
-  "version": "1.0.6",
+  "version": "1.0.9",
   "private": true,
   "description": "Flowdesk Launcher",
   "author": "Flowdesk",
@@ -30,6 +30,7 @@
       "main.js",
       "preload.js",
       "executor.js",
+      "cityMysql.js",
       "open-db-ports.cmd",
       "renderer/**/*"
     ],

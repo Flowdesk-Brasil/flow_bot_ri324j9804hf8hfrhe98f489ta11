@@ -19,10 +19,17 @@ const {
   sanitizeCityDbError,
   mappingFingerprint,
 } = require("./whitelistCityDb");
+const {
+  applyNicknameFormat,
+  resolveNicknameFormat,
+} = require("../utils/whitelistNickname");
 
 const WHITELIST_REVIEW_PREFIX = "whitelist:";
 const COMPONENT_TYPE = { ACTION_ROW: 1, BUTTON: 2, TEXT_DISPLAY: 10, CONTAINER: 17 };
 const applyingLocks = new Set();
+const attemptWindow = new Map();
+const ATTEMPT_WINDOW_MS = 120_000;
+const ATTEMPT_LIMIT = 5;
 
 function clampText(value, maxLength) {
   return String(value || "").slice(0, maxLength);
@@ -37,6 +44,102 @@ function sanitizeIdentifier(value) {
 
 function isSnowflake(value) {
   return /^\d{15,25}$/.test(String(value || ""));
+}
+
+function consumeAttempt(guildId, userId) {
+  const key = `${guildId}:${userId}`;
+  const now = Date.now();
+  const current = attemptWindow.get(key);
+  if (!current || now > current.resetAt) {
+    attemptWindow.set(key, { count: 1, resetAt: now + ATTEMPT_WINDOW_MS });
+    return { ok: true };
+  }
+  if (current.count >= ATTEMPT_LIMIT) {
+    return { ok: false };
+  }
+  current.count += 1;
+  return { ok: true };
+}
+
+function validateIdentifier(kind, raw) {
+  const value = sanitizeIdentifier(raw);
+  if (!value) {
+    return { ok: false, message: "Informe um identificador valido." };
+  }
+  if (/<@!?\d+>/.test(value) || /https?:\/\//i.test(value) || /[\s;'"\\]/.test(value)) {
+    return { ok: false, message: "Identificador invalido." };
+  }
+  if (kind === "discord_id" && !isSnowflake(value)) {
+    return { ok: false, message: "O Discord ID informado nao e valido." };
+  }
+  if ((kind === "character_id" || kind === "internal_id") && !/^\d{1,18}$/.test(value)) {
+    return { ok: false, message: "Informe apenas o numero do ID. Esse formato nao existe." };
+  }
+  if ((kind === "character_id" || kind === "internal_id") && Number(value) <= 0) {
+    return { ok: false, message: "Esse ID nao existe." };
+  }
+  if ((kind === "license" || kind === "license2") && !/^(license2?:)?[a-f0-9]{32,80}$/i.test(value)) {
+    return { ok: false, message: "A license informada nao e valida." };
+  }
+  if (kind === "steam" && !/^(steam:)?[a-z0-9]{10,40}$/i.test(value)) {
+    return { ok: false, message: "O Steam ID informado nao e valido." };
+  }
+  return { ok: true, value };
+}
+
+async function assertWhitelistClaim(guildId, userId, identifierValue) {
+  const [byUser, byId] = await Promise.all([
+    whitelistDb.findApprovedRequestByUser(guildId, userId),
+    whitelistDb.findBoundRequestByIdentifier(guildId, identifierValue),
+  ]);
+  if (byUser && String(byUser.identifier_value) === String(identifierValue)) {
+    return {
+      ok: false,
+      code: "already_released",
+      title: "Whitelist ja liberada",
+      message: "Sua whitelist ja foi liberada uma vez. Nao e possivel validar de novo com o mesmo ID.",
+    };
+  }
+  if (byUser && String(byUser.identifier_value) !== String(identifierValue)) {
+    return {
+      ok: false,
+      code: "already_has_id",
+      title: "ID ja vinculado",
+      message: "Sua conta Discord ja possui um ID liberado neste servidor.",
+    };
+  }
+  if (byId && String(byId.user_id) !== String(userId) && byId.status === "approved") {
+    return {
+      ok: false,
+      code: "id_taken",
+      title: "ID indisponivel",
+      message: "Este ID ja foi liberado para outro membro e nao pode ser usado de novo.",
+    };
+  }
+  if (byId && String(byId.user_id) !== String(userId) && byId.status !== "approved") {
+    return {
+      ok: false,
+      code: "id_busy",
+      title: "ID em uso",
+      message: "Este ID ja esta em analise por outro membro.",
+    };
+  }
+  return { ok: true };
+}
+
+async function applyApprovedNickname(guild, userId, settings, identifierValue) {
+  const member =
+    guild.members.cache.get(userId) || (await guild.members.fetch(userId).catch(() => null));
+  if (!member) return;
+  const displayName =
+    member.displayName || member.user?.globalName || member.user?.username || "Jogador";
+  const nextNick = applyNicknameFormat(
+    resolveNicknameFormat(settings),
+    displayName,
+    identifierValue,
+  );
+  if (!nextNick || member.nickname === nextNick || member.displayName === nextNick) return;
+  await member.setNickname(nextNick).catch(() => null);
 }
 
 function buildNoticePayload(title, message, tone = "error") {
@@ -58,7 +161,11 @@ function buildNoticePayload(title, message, tone = "error") {
 }
 
 async function replyEphemeral(interaction, payload) {
-  if (interaction.deferred || interaction.replied) {
+  if (interaction.deferred && !interaction.replied) {
+    await interaction.editReply(payload).catch(() => interaction.followUp(payload).catch(() => null));
+    return;
+  }
+  if (interaction.replied) {
     await interaction.followUp(payload).catch(() => null);
     return;
   }
@@ -277,29 +384,71 @@ async function handleWhitelistModalSubmit(interaction) {
     return;
   }
 
-  const identifierValue = sanitizeIdentifier(
+  const identifierKind = String(settings.identifier_kind || "discord_id");
+  const parsedIdentifier = validateIdentifier(
+    identifierKind,
     interaction.fields.getTextInputValue(CUSTOM_IDS.whitelistIdentifierInput),
   );
-  const identifierKind = String(settings.identifier_kind || "discord_id");
-
-  if (!identifierValue) {
+  if (!parsedIdentifier.ok) {
     await replyEphemeral(
       interaction,
-      buildNoticePayload("Identificador invalido", "Informe um identificador valido."),
+      buildNoticePayload("Identificador invalido", parsedIdentifier.message),
+    );
+    return;
+  }
+  const identifierValue = parsedIdentifier.value;
+
+  if (!consumeAttempt(guildId, interaction.user.id).ok) {
+    await replyEphemeral(
+      interaction,
+      buildNoticePayload(
+        "Aguarde um momento",
+        "Muitas tentativas em pouco tempo. Tente novamente em alguns minutos.",
+        "warning",
+      ),
     );
     return;
   }
 
-  if (identifierKind === "discord_id" && !isSnowflake(identifierValue)) {
+  const isAutomatic = String(settings.approval_mode || "manual") === "automatic";
+
+  if (isAutomatic && !interaction.deferred && !interaction.replied) {
+    await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => null);
+  }
+
+  const claim = await assertWhitelistClaim(guildId, interaction.user.id, identifierValue);
+  if (!claim.ok) {
+    if (claim.code === "already_released" && interaction.guild) {
+      void Promise.all([
+        applyApprovedNickname(
+          interaction.guild,
+          interaction.user.id,
+          settings,
+          identifierValue,
+        ),
+        assignRoles(
+          interaction.guild,
+          interaction.user.id,
+          settings.approved_role_ids,
+          settings.denied_role_ids,
+        ),
+      ]).catch(() => null);
+    }
     await replyEphemeral(
       interaction,
-      buildNoticePayload("Discord ID invalido", "O Discord ID informado nao e valido."),
+      buildNoticePayload(claim.title, claim.message, "warning"),
     );
     return;
   }
+
+  const cityPromise = isAutomatic
+    ? executeWhitelistOperation(settings, "APPROVE_WHITELIST", identifierValue).catch((error) => ({
+        ok: false,
+        ...sanitizeCityDbError(error),
+      }))
+    : null;
 
   const openRequest = await whitelistDb.findOpenRequest(guildId, interaction.user.id);
-  const isAutomatic = String(settings.approval_mode || "manual") === "automatic";
 
   if (openRequest && !isAutomatic) {
     await replyEphemeral(
@@ -314,21 +463,6 @@ async function handleWhitelistModalSubmit(interaction) {
   }
 
   if (isAutomatic) {
-    if (!interaction.deferred && !interaction.replied) {
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => null);
-    }
-
-    if (settings.mapping_status !== "validated") {
-      await replyEphemeral(
-        interaction,
-        buildNoticePayload(
-          "Integracao nao validada",
-          "A whitelist automatica so libera depois que o mapping do banco for validado no dashboard.",
-        ),
-      );
-      return;
-    }
-
     const correlationId = openRequest?.correlation_id || randomUUID();
     let request = openRequest;
     if (request) {
@@ -360,25 +494,6 @@ async function handleWhitelistModalSubmit(interaction) {
       }
     }
 
-    const reviewChannel = await resolveTextChannel(interaction.guild, settings.review_channel_id);
-    if (reviewChannel && !request.review_message_id) {
-      const reviewMessage = await reviewChannel.send(
-        buildReviewPayload({
-          request,
-          member: interaction.member || interaction.user,
-          identifierKind,
-          identifierValue,
-          status: "pending",
-        }),
-      ).catch(() => null);
-      if (reviewMessage) {
-        request = await whitelistDb.updateWhitelistRequest(request.id, {
-          review_message_id: reviewMessage.id,
-          review_channel_id: reviewChannel.id,
-        });
-      }
-    }
-
     await applyWhitelistChange({
       interaction,
       settings,
@@ -386,6 +501,7 @@ async function handleWhitelistModalSubmit(interaction) {
       approve: true,
       operation: "APPROVE_WHITELIST",
       autoApproved: true,
+      prefetchedResult: await cityPromise,
     });
     return;
   }
@@ -508,6 +624,7 @@ async function applyWhitelistChange({
   approve,
   operation,
   autoApproved = false,
+  prefetchedResult = null,
 }) {
   const lockKey = `${request.guild_id}:${request.id}`;
   if (applyingLocks.has(lockKey)) {
@@ -523,83 +640,149 @@ async function applyWhitelistChange({
   const cityOperation = cityOperationFor(operation);
 
   try {
-    let result;
-    try {
-      result = await executeWhitelistOperation(
-        settings,
-        cityOperation,
-        request.identifier_value,
-      );
-    } catch (error) {
-      result = { ok: false, ...sanitizeCityDbError(error) };
+    let result = prefetchedResult;
+    if (!result) {
+      try {
+        result = await executeWhitelistOperation(
+          settings,
+          cityOperation,
+          request.identifier_value,
+        );
+      } catch (error) {
+        result = { ok: false, ...sanitizeCityDbError(error) };
+      }
     }
 
     if (!result.ok) {
-      const nextRequest = await whitelistDb.updateWhitelistRequest(request.id, {
-        status: "apply_failed",
-        reviewed_by_user_id: interaction.user.id,
-        reviewed_at: new Date().toISOString(),
-        apply_error: result.message || "Falha ao sincronizar com o banco da cidade.",
-        player_key: result.playerKey || request.player_key || null,
-        previous_whitelist_value:
-          result.previousValue ?? request.previous_whitelist_value ?? null,
-      });
-
-      await whitelistDb.insertWhitelistAudit({
-        guild_id: request.guild_id,
-        request_id: request.id,
-        user_id: request.user_id,
-        actor_user_id: interaction.user.id,
-        operation,
-        identifier_kind: request.identifier_kind,
-        identifier_value: request.identifier_value,
-        player_key: result.playerKey || null,
-        previous_value: result.previousValue || null,
-        next_value: result.nextValue || null,
-        success: false,
-        error_code: result.code || "db_error",
-        error_message: result.message || "Falha ao sincronizar.",
-        correlation_id: correlationId,
-        mapping_fingerprint: mappingFingerprint(settings.mapping),
-      });
-
-      await refreshReviewMessage(interaction.guild, nextRequest, settings);
-      await sendWhitelistLog({
-        guild: interaction.guild,
-        settings,
-        title: "Falha ao sincronizar whitelist",
-        color: 0xe74c3c,
-        lines: [
-          `**Pedido:** \`${request.id}\``,
-          `**Membro:** <@${request.user_id}>`,
-          `**Erro:** ${clampText(result.message || "Falha no banco da cidade.", 180)}`,
-          `**Correlation:** \`${correlationId}\``,
-        ],
-      });
+      const missingPlayer = result.code === "player_not_found";
       await replyEphemeral(
         interaction,
         buildNoticePayload(
-          "Banco nao sincronizado",
-          autoApproved
-            ? `${result.message || "Nao foi possivel liberar no banco da cidade."} Clique novamente no painel para tentar de novo.`
-            : `${result.message || "Nao foi possivel aplicar a whitelist no banco da cidade."} O pedido permanece aberto para retry.`,
+          missingPlayer ? "ID nao encontrado" : "Banco nao sincronizado",
+          missingPlayer
+            ? "Esse ID nao existe no banco da cidade. A whitelist so e liberada para um ID cadastrado."
+            : autoApproved
+              ? `${result.message || "Nao foi possivel liberar no banco da cidade."} Clique novamente no painel para tentar de novo.`
+              : `${result.message || "Nao foi possivel aplicar a whitelist no banco da cidade."} O pedido permanece aberto para retry.`,
         ),
       );
+      void persistWhitelistFailure({
+        interaction,
+        settings,
+        request,
+        result,
+        operation,
+        correlationId,
+      });
       return;
     }
 
-    const nextRequest = await whitelistDb.updateWhitelistRequest(request.id, {
-      status: approve ? "approved" : "denied",
-      reviewed_by_user_id: interaction.user.id,
-      reviewed_at: new Date().toISOString(),
-      applied_at: new Date().toISOString(),
-      apply_error: null,
-      player_key: result.playerKey || null,
-      previous_whitelist_value: result.previousValue ?? null,
-      next_whitelist_value: result.nextValue ?? null,
-    });
+    await replyEphemeral(
+      interaction,
+      buildNoticePayload(
+        autoApproved
+          ? "Whitelist liberada"
+          : approve
+            ? "Whitelist sincronizada"
+            : "Whitelist removida",
+        autoApproved
+          ? result.skipped
+            ? "Seu ID ja estava liberado no banco. A conta Discord foi vinculada a este ID."
+            : "Seu ID foi localizado e a whitelist foi liberada."
+          : result.skipped
+            ? "O registro da cidade ja estava no estado desejado. O pedido foi concluido."
+            : "O banco da cidade foi atualizado e o Discord foi sincronizado.",
+        "ok",
+      ),
+    );
 
-    await whitelistDb.insertWhitelistAudit({
+    void persistWhitelistSuccess({
+      interaction,
+      settings,
+      request,
+      result,
+      approve,
+      operation,
+      autoApproved,
+      correlationId,
+    });
+  } finally {
+    applyingLocks.delete(lockKey);
+  }
+}
+
+async function persistWhitelistFailure({
+  interaction,
+  settings,
+  request,
+  result,
+  operation,
+  correlationId,
+}) {
+  const nextRequest = await whitelistDb.updateWhitelistRequest(request.id, {
+    status: "apply_failed",
+    reviewed_by_user_id: interaction.user.id,
+    reviewed_at: new Date().toISOString(),
+    apply_error: result.message || "Falha ao sincronizar com o banco da cidade.",
+    player_key: result.playerKey || request.player_key || null,
+    previous_whitelist_value: result.previousValue ?? request.previous_whitelist_value ?? null,
+  });
+  await Promise.all([
+    whitelistDb.insertWhitelistAudit({
+      guild_id: request.guild_id,
+      request_id: request.id,
+      user_id: request.user_id,
+      actor_user_id: interaction.user.id,
+      operation,
+      identifier_kind: request.identifier_kind,
+      identifier_value: request.identifier_value,
+      player_key: result.playerKey || null,
+      previous_value: result.previousValue || null,
+      next_value: result.nextValue || null,
+      success: false,
+      error_code: result.code || "db_error",
+      error_message: result.message || "Falha ao sincronizar.",
+      correlation_id: correlationId,
+      mapping_fingerprint: mappingFingerprint(settings.mapping),
+    }),
+    refreshReviewMessage(interaction.guild, nextRequest, settings),
+    sendWhitelistLog({
+      guild: interaction.guild,
+      settings,
+      title: "Falha ao sincronizar whitelist",
+      color: 0xe74c3c,
+      lines: [
+        `**Pedido:** \`${request.id}\``,
+        `**Membro:** <@${request.user_id}>`,
+        `**Erro:** ${clampText(result.message || "Falha no banco da cidade.", 180)}`,
+        `**Correlation:** \`${correlationId}\``,
+      ],
+    }),
+  ]).catch(() => null);
+}
+
+async function persistWhitelistSuccess({
+  interaction,
+  settings,
+  request,
+  result,
+  approve,
+  operation,
+  autoApproved,
+  correlationId,
+}) {
+  const nextRequest = await whitelistDb.updateWhitelistRequest(request.id, {
+    status: approve ? "approved" : "denied",
+    reviewed_by_user_id: interaction.user.id,
+    reviewed_at: new Date().toISOString(),
+    applied_at: new Date().toISOString(),
+    apply_error: null,
+    player_key: result.playerKey || null,
+    previous_whitelist_value: result.previousValue ?? null,
+    next_whitelist_value: result.nextValue ?? null,
+  });
+  await Promise.all([
+    whitelistDb.insertWhitelistAudit({
       guild_id: request.guild_id,
       request_id: request.id,
       user_id: request.user_id,
@@ -613,26 +796,23 @@ async function applyWhitelistChange({
       success: true,
       correlation_id: correlationId,
       mapping_fingerprint: mappingFingerprint(settings.mapping),
-    });
-
-    if (approve) {
-      await assignRoles(
-        interaction.guild,
-        request.user_id,
-        settings.approved_role_ids,
-        settings.denied_role_ids,
-      );
-    } else {
-      await assignRoles(
-        interaction.guild,
-        request.user_id,
-        settings.denied_role_ids,
-        settings.approved_role_ids,
-      );
-    }
-
-    await refreshReviewMessage(interaction.guild, nextRequest, settings);
-    await sendWhitelistLog({
+    }),
+    assignRoles(
+      interaction.guild,
+      request.user_id,
+      approve ? settings.approved_role_ids : settings.denied_role_ids,
+      approve ? settings.denied_role_ids : settings.approved_role_ids,
+    ),
+    approve
+      ? applyApprovedNickname(
+          interaction.guild,
+          request.user_id,
+          settings,
+          request.identifier_value,
+        )
+      : Promise.resolve(),
+    refreshReviewMessage(interaction.guild, nextRequest, settings),
+    sendWhitelistLog({
       guild: interaction.guild,
       settings,
       title: autoApproved
@@ -651,29 +831,8 @@ async function applyWhitelistChange({
         `**Staff:** ${autoApproved ? "Automatico" : `${interaction.user} (\`${interaction.user.id}\`)`}`,
         `**Correlation:** \`${correlationId}\``,
       ],
-    });
-
-    await replyEphemeral(
-      interaction,
-      buildNoticePayload(
-        autoApproved
-          ? "Whitelist liberada"
-          : approve
-            ? "Whitelist sincronizada"
-            : "Whitelist removida",
-        autoApproved
-          ? result.skipped
-            ? "Seu ID ja estava liberado no banco da cidade. O Discord foi sincronizado."
-            : "Seu ID foi localizado e a whitelist foi liberada automaticamente."
-          : result.skipped
-            ? "O registro da cidade ja estava no estado desejado. O pedido foi concluido."
-            : "O banco da cidade foi atualizado e o Discord foi sincronizado.",
-        "ok",
-      ),
-    );
-  } finally {
-    applyingLocks.delete(lockKey);
-  }
+    }),
+  ]).catch(() => null);
 }
 
 async function handleWhitelistReviewInteraction(interaction) {
@@ -781,14 +940,13 @@ async function handleWhitelistReviewInteraction(interaction) {
     return;
   }
 
-  if (settings.mapping_status !== "validated") {
-    await replyEphemeral(
-      interaction,
-      buildNoticePayload(
-        "Mapping nao validado",
-        "Valide a integracao no dashboard antes de sincronizar o banco da cidade.",
-      ),
-    );
+  const claim = await assertWhitelistClaim(
+    request.guild_id,
+    request.user_id,
+    request.identifier_value,
+  );
+  if (!claim.ok && claim.code !== "already_released") {
+    await replyEphemeral(interaction, buildNoticePayload(claim.title, claim.message, "warning"));
     return;
   }
 

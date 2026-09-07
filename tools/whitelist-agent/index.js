@@ -68,15 +68,16 @@ function localAddresses() {
   return found;
 }
 
-function dbTarget() {
+function dbTarget(payload) {
+  const cityDb = payload && typeof payload.cityDb === "object" ? payload.cityDb : {};
   return {
-    engine: config.db.engine === "postgres" ? "postgres" : "mysql",
-    host: config.db.host || "127.0.0.1",
-    port: Number(config.db.port || 3306),
-    database: config.db.database,
-    user: config.db.user,
-    password: config.db.password,
-    ssl: config.db.ssl === true,
+    engine: cityDb.engine === "postgres" || config.db.engine === "postgres" ? "postgres" : "mysql",
+    host: "localhost",
+    port: Number(cityDb.port || config.db.port || 3306),
+    database: cityDb.database || config.db.database,
+    user: String(cityDb.user || config.db.user || "").trim(),
+    password: cityDb.password || config.db.password || "",
+    ssl: false,
   };
 }
 
@@ -117,7 +118,7 @@ async function syncWithFlowDesk() {
   const jobs = Array.isArray(first.jobs) ? first.jobs : [];
   for (const job of jobs) {
     try {
-      const result = await executeJob(dbTarget(), String(job.operation || ""), job.payload || {});
+      const result = await executeJob(dbTarget(job.payload || {}), String(job.operation || ""), job.payload || {});
       results.push({
         id: job.id,
         ok: result.ok !== false,

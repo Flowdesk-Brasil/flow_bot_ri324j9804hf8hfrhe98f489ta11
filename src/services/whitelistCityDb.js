@@ -1,10 +1,14 @@
+const net = require("net");
 const mysql = require("mysql2/promise");
 const { Client } = require("pg");
 const { decryptWhitelistSecret } = require("../utils/whitelistSecret");
 
 const IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const QUERY_TIMEOUT_MS = 12000;
-const CONNECT_TIMEOUT_MS = 12000;
+const QUERY_TIMEOUT_MS = 4000;
+const CONNECT_TIMEOUT_MS = 2000;
+const PORT_PROBE_MS = 700;
+const PORT_CACHE_MS = 90_000;
+const portProbeCache = new Map();
 
 function isSafeSqlIdentifier(value) {
   return IDENTIFIER_RE.test(String(value || ""));
@@ -39,22 +43,7 @@ function normalizeMapping(value) {
     joinToColumn: String(record.joinToColumn || "").trim(),
     joinIdentifierColumn: String(record.joinIdentifierColumn || "").trim(),
   };
-  if (mapping.playerTable && mapping.playerIdColumn && mapping.whitelistColumn) {
-    return mapping;
-  }
-  return {
-    playerTable: "vrp_users",
-    playerIdColumn: "id",
-    whitelistColumn: "whitelisted",
-    valueType: "integer",
-    valueOff: "0",
-    valueOn: "1",
-    nullBehavior: "off",
-    joinTable: "",
-    joinFromColumn: "",
-    joinToColumn: "",
-    joinIdentifierColumn: "",
-  };
+  return mapping;
 }
 
 function mappingUsesJoin(mapping) {
@@ -130,6 +119,30 @@ function buildUpdateSql(engine, mapping) {
 function toPg(sql) {
   let index = 0;
   return sql.replace(/\?/g, () => `$${++index}`);
+}
+
+function rememberPortState(host, port, open) {
+  portProbeCache.set(`${host}:${port}`, { open, at: Date.now() });
+}
+
+function probeCityPort(host, port) {
+  const key = `${host}:${Number(port || 3306)}`;
+  const cached = portProbeCache.get(key);
+  if (cached && Date.now() - cached.at < PORT_CACHE_MS) {
+    return Promise.resolve(cached.open);
+  }
+  return new Promise((resolve) => {
+    const socket = net.connect({ host, port: Number(port || 3306), timeout: PORT_PROBE_MS });
+    const finish = (open) => {
+      socket.removeAllListeners();
+      socket.destroy();
+      rememberPortState(host, port, open);
+      resolve(open);
+    };
+    socket.once("connect", () => finish(true));
+    socket.once("timeout", () => finish(false));
+    socket.once("error", () => finish(false));
+  });
 }
 
 async function withCityDatabase(target, fn) {
@@ -216,128 +229,147 @@ function settingsToTarget(settings, guildId) {
 
 async function executeWhitelistOperation(settings, operation, identifierValue) {
   const mapping = normalizeMapping(settings.mapping);
+  if (!mapping.playerTable || !mapping.playerIdColumn || !mapping.whitelistColumn) {
+    throw new Error("Configure a tabela e as colunas da whitelist no painel.");
+  }
   let cityTarget = null;
   try {
     cityTarget = settingsToTarget(settings, settings.guild_id);
   } catch {
     cityTarget = null;
   }
-  try {
-    return await runDirectWhitelistOperation(settings, mapping, operation, identifierValue);
-  } catch (error) {
-    const sanitized = sanitizeCityDbError(error);
-    if (sanitized.code !== "offline" && sanitized.code !== "timeout") {
-      throw error;
+  const forceDirect = String(settings?.connection_mode || "").toLowerCase() === "direct";
+  const cachedOpen = cityTarget
+    ? portProbeCache.get(`${cityTarget.host}:${Number(cityTarget.port || 3306)}`)
+    : null;
+  const shouldProbe =
+    Boolean(cityTarget) &&
+    (forceDirect || (cachedOpen?.open === true && Date.now() - cachedOpen.at < PORT_CACHE_MS));
+  const portOpen = shouldProbe ? await probeCityPort(cityTarget.host, cityTarget.port) : false;
+
+  if (portOpen) {
+    try {
+      return await runDirectWhitelistOperation(settings, mapping, operation, identifierValue);
+    } catch (error) {
+      const sanitized = sanitizeCityDbError(error);
+      if (sanitized.code !== "offline" && sanitized.code !== "timeout") {
+        throw error;
+      }
+      if (cityTarget) rememberPortState(cityTarget.host, cityTarget.port, false);
     }
-    const queued = await require("./whitelistDbService").enqueueAgentJob({
-      guild_id: settings.guild_id,
-      operation,
-      payload: {
-        identifierValue,
-        mapping,
-        cityDb: cityTarget
-          ? {
-              engine: cityTarget.engine,
-              port: cityTarget.port,
-              database: cityTarget.database,
-              user: cityTarget.user,
-              password: cityTarget.password,
-            }
-          : undefined,
-      },
-    });
-    if (!queued?.id) {
-      return { ok: false, ...sanitized };
-    }
-    const finished = await require("./whitelistDbService").waitForAgentJob(queued.id, 28000);
-    if (finished.status !== "done") {
-      return {
-        ok: false,
-        code: "vps_timeout",
-        message:
-          finished.error_message ||
-          "O launcher na VPS nao concluiu a tempo. Deixe o app aberto na maquina da cidade.",
-      };
-    }
-    const result = finished.result && typeof finished.result === "object" ? finished.result : {};
-    if (result.ok === false) {
-      return {
-        ok: false,
-        code: result.code || "db_error",
-        message: result.message || "Falha no MySQL da VPS.",
-        playerKey: result.playerKey,
-        previousValue: result.previousValue,
-        nextValue: result.nextValue,
-      };
-    }
+  }
+
+  const queued = await require("./whitelistDbService").enqueueAgentJob({
+    guild_id: settings.guild_id,
+    operation,
+    payload: {
+      identifierValue,
+      mapping,
+      cityDb: cityTarget
+        ? {
+            engine: cityTarget.engine,
+            port: cityTarget.port,
+            database: cityTarget.database,
+            user: cityTarget.user,
+            password: cityTarget.password,
+          }
+        : undefined,
+    },
+  });
+  if (!queued?.id) {
     return {
-      ok: true,
-      code: result.code || "ok",
-      skipped: result.skipped === true,
-      playerKey: result.playerKey,
-      previousValue: result.previousValue ?? null,
-      nextValue: result.nextValue ?? result.currentValue ?? null,
-      currentValue: result.currentValue ?? null,
-      state: result.state,
+      ok: false,
+      code: "offline",
+      message: "Nao foi possivel enfileirar o SQL no launcher da VPS.",
     };
   }
+  const finished = await require("./whitelistDbService").waitForAgentJob(queued.id, 8000);
+  if (finished.status !== "done") {
+    return {
+      ok: false,
+      code: "vps_timeout",
+      message:
+        finished.error_message ||
+        "O launcher na VPS nao concluiu a tempo. Deixe o app aberto na maquina da cidade.",
+    };
+  }
+  const result = finished.result && typeof finished.result === "object" ? finished.result : {};
+  if (result.ok === false) {
+    return {
+      ok: false,
+      code: result.code || "db_error",
+      message: result.message || "Falha no MySQL da VPS.",
+      playerKey: result.playerKey,
+      previousValue: result.previousValue,
+      nextValue: result.nextValue,
+    };
+  }
+  return {
+    ok: true,
+    code: result.code || "ok",
+    skipped: result.skipped === true,
+    playerKey: result.playerKey,
+    previousValue: result.previousValue ?? null,
+    nextValue: result.nextValue ?? result.currentValue ?? null,
+    currentValue: result.currentValue ?? null,
+    state: result.state,
+  };
 }
 
 async function runDirectWhitelistOperation(settings, mapping, operation, identifierValue) {
   const target = settingsToTarget(settings, settings.guild_id);
   const selectSql = buildSelectSql(target.engine, mapping);
-  const rows = await withCityDatabase(target, (query) => query(selectSql, [identifierValue]));
+  const updateSql = buildUpdateSql(target.engine, mapping);
+  return withCityDatabase(target, async (query) => {
+    const rows = await query(selectSql, [identifierValue]);
+    if (rows.length > 1) {
+      return { ok: false, code: "multiple_players", message: "Mais de um jogador encontrado." };
+    }
+    if (!rows.length) {
+      return { ok: false, code: "player_not_found", message: "Jogador nao encontrado no banco da cidade." };
+    }
 
-  if (rows.length > 1) {
-    return { ok: false, code: "multiple_players", message: "Mais de um jogador encontrado." };
-  }
-  if (!rows.length) {
-    return { ok: false, code: "player_not_found", message: "Jogador nao encontrado no banco da cidade." };
-  }
+    const current = rows[0].whitelist_value;
+    const playerKey = String(rows[0].player_key ?? "");
+    const state = classifyState(mapping, current);
 
-  const current = rows[0].whitelist_value;
-  const playerKey = String(rows[0].player_key ?? "");
-  const state = classifyState(mapping, current);
+    if (operation === "GET_PLAYER" || operation === "CHECK_WHITELIST" || operation === "TEST_MAPPING") {
+      return {
+        ok: true,
+        code: "ok",
+        playerKey,
+        currentValue: current == null ? null : String(current),
+        state,
+      };
+    }
 
-  if (operation === "GET_PLAYER" || operation === "CHECK_WHITELIST" || operation === "TEST_MAPPING") {
+    const approve = operation === "APPROVE_WHITELIST";
+    if ((approve && state === "on") || (!approve && state === "off")) {
+      return {
+        ok: true,
+        skipped: true,
+        code: "already_applied",
+        playerKey,
+        previousValue: current == null ? null : String(current),
+        nextValue: current == null ? null : String(current),
+        state,
+      };
+    }
+
+    const desired = coerceValue(mapping.valueType, approve ? mapping.valueOn : mapping.valueOff);
+    await query(updateSql, [desired, playerKey]);
+    const confirmRows = await query(selectSql, [identifierValue]);
+    const next = confirmRows[0]?.whitelist_value;
     return {
       ok: true,
+      skipped: false,
       code: "ok",
       playerKey,
-      currentValue: current == null ? null : String(current),
-      state,
-    };
-  }
-
-  const approve = operation === "APPROVE_WHITELIST";
-  if ((approve && state === "on") || (!approve && state === "off")) {
-    return {
-      ok: true,
-      skipped: true,
-      code: "already_applied",
-      playerKey,
       previousValue: current == null ? null : String(current),
-      nextValue: current == null ? null : String(current),
-      state,
+      nextValue: next == null ? null : String(next),
+      state: classifyState(mapping, next),
     };
-  }
-
-  const desired = coerceValue(mapping.valueType, approve ? mapping.valueOn : mapping.valueOff);
-  const updateSql = buildUpdateSql(target.engine, mapping);
-  await withCityDatabase(target, (query) => query(updateSql, [desired, playerKey]));
-  const confirmRows = await withCityDatabase(target, (query) =>
-    query(selectSql, [identifierValue]),
-  );
-  const next = confirmRows[0]?.whitelist_value;
-  return {
-    ok: true,
-    skipped: false,
-    code: "ok",
-    playerKey,
-    previousValue: current == null ? null : String(current),
-    nextValue: next == null ? null : String(next),
-    state: classifyState(mapping, next),
-  };
+  });
 }
 
 function mappingFingerprint(mapping) {

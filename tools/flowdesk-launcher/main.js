@@ -26,7 +26,7 @@ let pollTimer = null;
 let syncTimer = null;
 let heartbeatTimer = null;
 let updateTimer = null;
-let backoffMs = 2000;
+let backoffMs = 400;
 const runtime = {
   view: "boot",
   message: "Preparando...",
@@ -446,13 +446,15 @@ async function bindServer(guildId) {
 function dbTarget(payload) {
   const config = runtime.config || {};
   const cityDb = payload && typeof payload.cityDb === "object" && payload.cityDb ? payload.cityDb : {};
+  const user = String(cityDb.user || config.user || "usuariodeteste").trim() || "usuariodeteste";
+  const typed = cityDb.password || config.password || "";
   return {
     engine: cityDb.engine === "postgres" || config.engine === "postgres" ? "postgres" : "mysql",
-    host: "127.0.0.1",
+    host: "localhost",
     port: Number(cityDb.port || config.port || 3306),
     database: cityDb.database || config.database,
-    user: cityDb.user || config.user,
-    password: cityDb.password || config.password || "",
+    user,
+    password: typed || (user === "usuariodeteste" ? "12345" : ""),
     ssl: false,
   };
 }
@@ -573,7 +575,7 @@ async function runSync() {
         body: { action: "sync", results, observedIp: publicIp, appVersion: app.getVersion() },
       });
     }
-    backoffMs = results.length ? 1500 : 2000;
+    backoffMs = results.length ? 250 : 400;
     markOnline(
       runtime.publicIp
         ? `VPS no ar. IP ${runtime.publicIp}. MySQL pronto neste computador.`

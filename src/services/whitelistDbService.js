@@ -49,6 +49,32 @@ async function listEnabledWhitelistSettings() {
   return unwrap(result, "listEnabledWhitelistSettings") || [];
 }
 
+async function findApprovedRequestByUser(guildId, userId) {
+  const result = await supabase
+    .from(REQUESTS_TABLE)
+    .select("id, guild_id, user_id, identifier_value, status")
+    .eq("guild_id", guildId)
+    .eq("user_id", userId)
+    .eq("status", "approved")
+    .order("id", { ascending: false })
+    .limit(1);
+  const rows = unwrap(result, "findApprovedRequestByUser") || [];
+  return rows[0] || null;
+}
+
+async function findBoundRequestByIdentifier(guildId, identifierValue) {
+  const result = await supabase
+    .from(REQUESTS_TABLE)
+    .select("id, guild_id, user_id, identifier_value, status")
+    .eq("guild_id", guildId)
+    .eq("identifier_value", identifierValue)
+    .in("status", ["approved", "pending", "apply_failed"])
+    .order("id", { ascending: false })
+    .limit(8);
+  const rows = unwrap(result, "findBoundRequestByIdentifier") || [];
+  return rows.find((row) => row.status === "approved") || rows[0] || null;
+}
+
 async function findOpenRequest(guildId, userId) {
   const result = await supabase
     .from(REQUESTS_TABLE)
@@ -108,7 +134,7 @@ async function enqueueAgentJob(record) {
   return unwrap(result, "enqueueAgentJob");
 }
 
-async function waitForAgentJob(jobId, timeoutMs = 28000) {
+async function waitForAgentJob(jobId, timeoutMs = 8000) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     const result = await supabase
@@ -118,7 +144,7 @@ async function waitForAgentJob(jobId, timeoutMs = 28000) {
       .maybeSingle();
     const row = unwrap(result, "waitForAgentJob");
     if (row && (row.status === "done" || row.status === "failed")) return row;
-    await new Promise((resolve) => setTimeout(resolve, 800));
+    await new Promise((resolve) => setTimeout(resolve, 80));
   }
   return {
     id: jobId,
@@ -177,6 +203,8 @@ module.exports = {
   getGuildWhitelistSettings,
   updateGuildWhitelistPanelMessageId,
   listEnabledWhitelistSettings,
+  findApprovedRequestByUser,
+  findBoundRequestByIdentifier,
   findOpenRequest,
   createWhitelistRequest,
   updateWhitelistRequest,

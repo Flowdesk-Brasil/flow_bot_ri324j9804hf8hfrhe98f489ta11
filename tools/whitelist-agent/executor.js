@@ -1,5 +1,5 @@
-const mysql = require("mysql2/promise");
 const { Client } = require("pg");
+const { connectCityMysql } = require("../flowdesk-launcher/cityMysql");
 
 const IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const CONNECT_TIMEOUT_MS = 8000;
@@ -138,18 +138,10 @@ async function withCityDatabase(target, fn) {
     }
   }
 
-  const connection = await mysql.createConnection({
-    host: target.host,
-    port: target.port,
-    database: target.database,
-    user: target.user,
-    password: target.password,
-    ssl: target.ssl ? { rejectUnauthorized: false } : undefined,
-    connectTimeout: CONNECT_TIMEOUT_MS,
-  });
+  const connection = await connectCityMysql(target);
   try {
     return await fn(async (sql, params = []) => {
-      const [rows] = await connection.execute(sql, params);
+      const [rows] = await connection.query(sql, params);
       return Array.isArray(rows) ? rows : [];
     });
   } finally {
@@ -161,11 +153,18 @@ function sanitizeError(error) {
   const message = String(error?.message || "Falha no banco local.");
   const lowered = message.toLowerCase();
   if (lowered.includes("timeout")) return { code: "timeout", message: "Banco local nao respondeu a tempo." };
+  if (lowered.includes("unknown database")) {
+    return { code: "unknown_database", message: "O nome do banco nao existe neste MySQL." };
+  }
   if (lowered.includes("access denied") || lowered.includes("password") || lowered.includes("auth")) {
-    return { code: "invalid_credentials", message: "Usuario ou senha do banco local invalidos." };
+    return {
+      code: "invalid_credentials",
+      message:
+        "MariaDB recusou o usuario. Rode o SQL do painel (usuariodeteste / 12345) na aba Consulta do HeidiSQL, como root.",
+    };
   }
   if (lowered.includes("econnrefused") || lowered.includes("enotfound")) {
-    return { code: "offline", message: "Nao foi possivel conectar em 127.0.0.1 / host local do banco." };
+    return { code: "offline", message: "Nao foi possivel conectar em localhost / 127.0.0.1." };
   }
   return { code: "db_error", message: "Falha ao executar a operacao no banco local." };
 }
