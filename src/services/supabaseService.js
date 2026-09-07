@@ -1837,6 +1837,16 @@ async function getGuildWhitelistSettings(guildId) {
     if (code === "42P01" || message.includes(WHITELIST_SETTINGS_TABLE)) {
       return null;
     }
+    if (code === "42703") {
+      const fallback = await supabase
+        .from(WHITELIST_SETTINGS_TABLE)
+        .select(
+          "guild_id, enabled, panel_channel_id, review_channel_id, logs_channel_id, panel_layout, panel_message_id, approved_role_ids, denied_role_ids, review_role_ids, identifier_kind, identifier_label, identifier_placeholder, approval_mode, db_engine, db_host, db_port, db_name, db_user, db_ssl, db_password_cipher, mapping, mapping_status, last_health_ok, agent_public_ip, updated_at",
+        )
+        .eq("guild_id", guildId)
+        .maybeSingle();
+      if (!fallback.error) return fallback.data;
+    }
     return unwrap(result, "getGuildWhitelistSettings");
   }
 
