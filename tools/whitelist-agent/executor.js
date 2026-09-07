@@ -68,25 +68,64 @@ function coerceValue(valueType, raw) {
 }
 
 function equivalent(valueType, left, right) {
-  if (left == null && right == null) return true;
+  if (isWhitelistOffValue(left) && isWhitelistOffValue(right)) return true;
   if (valueType === "boolean") return Boolean(left) === Boolean(right);
   if (valueType === "integer") return Number(left) === Number(right);
   return String(left ?? "") === String(right ?? "");
 }
 
-function classifyState(mapping, current) {
-  if (current == null) {
-    return mapping.nullBehavior === "unknown" ? "unknown" : mapping.nullBehavior;
+function normalizeWhitelistValue(value) {
+  if (value == null) return null;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "bigint") return Number(value);
+  if (Buffer.isBuffer(value)) {
+    if (value.length === 0) return null;
+    if (value.length === 1) return value[0];
+    return value.toString("utf8").trim();
   }
+  const text = String(value).trim();
+  if (!text || text === "[object Object]") return null;
+  return text;
+}
+
+function isWhitelistOffValue(value) {
+  const normalized = normalizeWhitelistValue(value);
+  if (normalized == null) return true;
+  if (normalized === false || normalized === 0) return true;
+  const text = String(normalized).trim().toLowerCase();
+  return (
+    text === "" ||
+    text === "0" ||
+    text === "false" ||
+    text === "off" ||
+    text === "null" ||
+    text === "undefined" ||
+    text === "no"
+  );
+}
+
+function isWhitelistOnValue(value) {
+  const normalized = normalizeWhitelistValue(value);
+  if (normalized == null) return false;
+  if (normalized === true || normalized === 1) return true;
+  const text = String(normalized).trim().toLowerCase();
+  return text === "1" || text === "true" || text === "on" || text === "yes";
+}
+
+function classifyState(mapping, current) {
+  const normalized = normalizeWhitelistValue(current);
+  if (isWhitelistOnValue(normalized)) return "on";
+  if (isWhitelistOffValue(normalized)) return "off";
   try {
     const onValue = coerceValue(mapping.valueType, mapping.valueOn);
     const offValue = coerceValue(mapping.valueType, mapping.valueOff);
-    if (equivalent(mapping.valueType, current, onValue)) return "on";
-    if (equivalent(mapping.valueType, current, offValue)) return "off";
+    if (equivalent(mapping.valueType, normalized, onValue)) return "on";
+    if (equivalent(mapping.valueType, normalized, offValue)) return "off";
   } catch {
-    return "unknown";
+    return "off";
   }
-  return "unknown";
+  return "off";
 }
 
 function buildSelectSql(engine, mapping) {
@@ -242,6 +281,8 @@ async function executeJob(target, operation, payload) {
     return {
       ok: true,
       skipped: true,
+      changed: false,
+      code: "already_applied",
       playerKey,
       previousValue: current == null ? null : String(current),
       nextValue: current == null ? null : String(current),
@@ -256,6 +297,8 @@ async function executeJob(target, operation, payload) {
   return {
     ok: true,
     skipped: false,
+    changed: true,
+    code: "applied",
     playerKey,
     previousValue: current == null ? null : String(current),
     nextValue: next == null ? null : String(next),

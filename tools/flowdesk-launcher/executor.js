@@ -75,9 +75,26 @@ function equivalent(valueType, left, right) {
   return String(left ?? "") === String(right ?? "");
 }
 
+function normalizeWhitelistValue(value) {
+  if (value == null) return null;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "bigint") return Number(value);
+  if (Buffer.isBuffer(value)) {
+    if (value.length === 0) return null;
+    if (value.length === 1) return value[0];
+    return value.toString("utf8").trim();
+  }
+  const text = String(value).trim();
+  if (!text || text === "[object Object]") return null;
+  return text;
+}
+
 function isWhitelistOffValue(value) {
-  if (value == null) return true;
-  const text = String(value).trim().toLowerCase();
+  const normalized = normalizeWhitelistValue(value);
+  if (normalized == null) return true;
+  if (normalized === false || normalized === 0) return true;
+  const text = String(normalized).trim().toLowerCase();
   return (
     text === "" ||
     text === "0" ||
@@ -90,19 +107,22 @@ function isWhitelistOffValue(value) {
 }
 
 function isWhitelistOnValue(value) {
-  if (value === true || value === 1) return true;
-  const text = String(value).trim().toLowerCase();
+  const normalized = normalizeWhitelistValue(value);
+  if (normalized == null) return false;
+  if (normalized === true || normalized === 1) return true;
+  const text = String(normalized).trim().toLowerCase();
   return text === "1" || text === "true" || text === "on" || text === "yes";
 }
 
 function classifyState(mapping, current) {
-  if (isWhitelistOnValue(current)) return "on";
-  if (isWhitelistOffValue(current)) return "off";
+  const normalized = normalizeWhitelistValue(current);
+  if (isWhitelistOnValue(normalized)) return "on";
+  if (isWhitelistOffValue(normalized)) return "off";
   try {
     const onValue = coerceValue(mapping.valueType, mapping.valueOn);
     const offValue = coerceValue(mapping.valueType, mapping.valueOff);
-    if (equivalent(mapping.valueType, current, onValue)) return "on";
-    if (equivalent(mapping.valueType, current, offValue)) return "off";
+    if (equivalent(mapping.valueType, normalized, onValue)) return "on";
+    if (equivalent(mapping.valueType, normalized, offValue)) return "off";
   } catch {
     return "off";
   }
@@ -199,7 +219,7 @@ function sanitizeError(error) {
     const account = who ? `${who[1]}@${who[2]}` : "usuario@localhost";
     return {
       code: "invalid_credentials",
-      message: `MariaDB recusou ${account}. Rode o SQL do painel (usuariodeteste / 12345) na aba Consulta do HeidiSQL, como root.`,
+      message: `Usuario ou senha do banco local invalidos (${account}). O launcher tenta de novo com as credenciais salvas na primeira conexao.`,
     };
   }
   if (lowered.includes("econnrefused") || lowered.includes("enotfound") || lowered.includes("ehostunreach")) {
@@ -343,6 +363,8 @@ async function executeJob(target, operation, payload) {
       return {
         ok: true,
         skipped: true,
+        changed: false,
+        code: "already_applied",
         playerKey,
         previousValue: current == null ? null : String(current),
         nextValue: current == null ? null : String(current),
@@ -356,6 +378,8 @@ async function executeJob(target, operation, payload) {
     return {
       ok: true,
       skipped: false,
+      changed: true,
+      code: "applied",
       playerKey,
       previousValue: current == null ? null : String(current),
       nextValue: next == null ? null : String(next),

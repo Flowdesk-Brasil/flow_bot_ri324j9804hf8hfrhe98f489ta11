@@ -11,11 +11,19 @@ function safeDatabaseName(value) {
 }
 
 function resolveCityLogin(target) {
-  const user = String(target?.user || "").trim() || DEFAULT_CITY_USER;
+  const user = String(target?.user || "").trim();
   const typed = target?.password == null ? "" : String(target.password);
+  if (user && typed) {
+    return {
+      user,
+      password: typed,
+      database: safeDatabaseName(target?.database),
+      port: Number(target?.port || 3306),
+    };
+  }
   return {
-    user,
-    password: typed || (user === DEFAULT_CITY_USER ? DEFAULT_CITY_PASSWORD : ""),
+    user: user || DEFAULT_CITY_USER,
+    password: typed || DEFAULT_CITY_PASSWORD,
     database: safeDatabaseName(target?.database),
     port: Number(target?.port || 3306),
   };

@@ -682,13 +682,18 @@ function buildButton(component, state, options = {}) {
   }
 
   state.hasInteractiveOpenAction = true;
+  const label =
+    trimText(component.label) ||
+    trimText(options.defaultButtonLabel) ||
+    DEFAULT_TICKET_PANEL_BUTTON_LABEL;
+  const safeEmoji = label ? emoji : null;
   return {
     type: COMPONENT_TYPE.BUTTON,
     custom_id: customId,
     style: resolveButtonStyle(component.style),
-    label: trimText(component.label) || DEFAULT_TICKET_PANEL_BUTTON_LABEL,
+    label,
     disabled: disableNonLink || Boolean(component.disabled),
-    ...(emoji ? { emoji } : {}),
+    ...(safeEmoji ? { emoji: safeEmoji } : {}),
   };
 }
 
@@ -1084,6 +1089,7 @@ function buildWhitelistPanelPayload({ settings, guildName }) {
   const state = { hasInteractiveOpenAction: false };
   const actionOptions = {
     customId: CUSTOM_IDS.startWhitelist,
+    defaultButtonLabel: legacy.panelButtonLabel || "Solicitar whitelist",
     resolveButtonCustomId(component) {
       if (component.id === WHITELIST_LOCKED_REQUEST_ID) {
         return CUSTOM_IDS.startWhitelist;

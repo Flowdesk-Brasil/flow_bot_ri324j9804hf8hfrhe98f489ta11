@@ -134,7 +134,26 @@ async function enqueueAgentJob(record) {
   return unwrap(result, "enqueueAgentJob");
 }
 
-async function waitForAgentJob(jobId, timeoutMs = 8000) {
+async function listApplyFailedRequests(limit = 15) {
+  const result = await supabase
+    .from(REQUESTS_TABLE)
+    .select("*")
+    .eq("status", "apply_failed")
+    .order("updated_at", { ascending: false })
+    .limit(limit);
+  if (result.error && String(result.error.message || "").toLowerCase().includes("updated_at")) {
+    const fallback = await supabase
+      .from(REQUESTS_TABLE)
+      .select("*")
+      .eq("status", "apply_failed")
+      .order("id", { ascending: false })
+      .limit(limit);
+    return unwrap(fallback, "listApplyFailedRequests") || [];
+  }
+  return unwrap(result, "listApplyFailedRequests") || [];
+}
+
+async function waitForAgentJob(jobId, timeoutMs = 15000) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     const result = await supabase
@@ -144,7 +163,7 @@ async function waitForAgentJob(jobId, timeoutMs = 8000) {
       .maybeSingle();
     const row = unwrap(result, "waitForAgentJob");
     if (row && (row.status === "done" || row.status === "failed")) return row;
-    await new Promise((resolve) => setTimeout(resolve, 80));
+    await new Promise((resolve) => setTimeout(resolve, 50));
   }
   return {
     id: jobId,
@@ -211,6 +230,7 @@ module.exports = {
   getWhitelistRequestById,
   insertWhitelistAudit,
   enqueueAgentJob,
+  listApplyFailedRequests,
   waitForAgentJob,
   findQueuedAgentJob,
   listDoneJobsForDiscordSync,

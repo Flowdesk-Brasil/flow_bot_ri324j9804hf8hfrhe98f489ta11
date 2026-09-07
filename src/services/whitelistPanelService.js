@@ -100,11 +100,7 @@ async function fetchExistingWhitelistPanelMessage(channel, storedMessageId = nul
       .fetch(storedMessageId)
       .catch(() => null);
 
-    if (
-      storedMessage &&
-      storedMessage.author?.bot &&
-      storedMessage.author.id === storedMessage.client.user.id
-    ) {
+    if (storedMessage && messageLooksLikeWhitelistPanel(storedMessage)) {
       return storedMessage;
     }
   }
