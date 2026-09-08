@@ -1,3 +1,10 @@
+function settleMaybePromise(value) {
+  if (value == null || typeof value.then !== "function") {
+    return Promise.resolve();
+  }
+  return value.catch(() => null);
+}
+
 const mysql = require("mysql2/promise");
 
 const DEFAULT_CITY_USER = "usuariodeteste";
@@ -77,7 +84,7 @@ async function openMysql(attempt, database, timeoutMs = CONNECT_TIMEOUT_MS) {
     try {
       await connection.query(`USE \`${database}\``);
     } catch (error) {
-      await connection.end().catch(() => null);
+      await settleMaybePromise(connection.end?.());
       throw error;
     }
   }
@@ -111,12 +118,12 @@ async function ensureAccount(connection, user, password, database) {
       `GRANT ALL PRIVILEGES ON *.* TO ${ident} IDENTIFIED VIA mysql_native_password USING PASSWORD(${pwd}) WITH GRANT OPTION`,
     ]);
     if (database) {
-      await connection
-        .query(`GRANT ALL PRIVILEGES ON \`${safeDatabaseName(database)}\`.* TO ${ident}`)
-        .catch(() => null);
+      await settleMaybePromise(
+        connection.query(`GRANT ALL PRIVILEGES ON \`${safeDatabaseName(database)}\`.* TO ${ident}`),
+      );
     }
   }
-  await connection.query("FLUSH PRIVILEGES").catch(() => null);
+  await settleMaybePromise(connection.query("FLUSH PRIVILEGES"));
 }
 
 async function provisionCityAccounts(connection, login) {
@@ -222,11 +229,11 @@ async function connectCityMysql(target) {
       try {
         await provisionCityAccounts(connection, login);
       } finally {
-        await connection.end().catch(() => null);
+        await settleMaybePromise(connection.end?.());
       }
       return tryReconnect(login, { port });
     }
-    await connection.end().catch(() => null);
+    await settleMaybePromise(connection.end?.());
     return null;
   }
 
@@ -276,9 +283,9 @@ async function connectCityMysql(target) {
 
 function releaseCityMysql(connection) {
   if (connection?._flowdeskPooled) {
-    return connection.release?.().catch?.(() => null) || Promise.resolve();
+    return settleMaybePromise(connection.release?.());
   }
-  return connection?.end?.().catch(() => null);
+  return settleMaybePromise(connection?.end?.());
 }
 
 module.exports = {

@@ -244,7 +244,7 @@ async function waitForAgentJob(jobId, timeoutMs = 15000, pollMs = 50, options = 
         id: jobId,
         status: "timeout",
         result: null,
-        error_message: "O launcher na VPS nao respondeu a tempo. Deixe o app aberto.",
+        error_message: "O launcher na VPS nao respondeu a tempo. Na primeira configuracao, abra o app. Depois a whitelist usa o banco direto.",
       });
     };
 

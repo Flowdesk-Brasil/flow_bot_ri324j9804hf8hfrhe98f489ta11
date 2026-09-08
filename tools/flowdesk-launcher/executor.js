@@ -178,7 +178,7 @@ async function withCityDatabase(target, fn) {
         return result.rows || [];
       });
     } finally {
-      await client.end().catch(() => null);
+      await Promise.resolve(client.end?.()).catch(() => null);
     }
   }
 
