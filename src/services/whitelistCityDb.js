@@ -1,15 +1,15 @@
 const net = require("net");
-const mysql = require("mysql2/promise");
-const { Client } = require("pg");
 const { decryptWhitelistSecret } = require("../utils/whitelistSecret");
+const {
+  executeWithCityDb,
+  healthCheckCityDb,
+  classifyDbError,
+} = require("./cityDbRuntime");
 
 const IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const QUERY_TIMEOUT_MS = 2500;
-const CONNECT_TIMEOUT_MS = 1200;
 const PORT_PROBE_MS = 300;
 const PORT_CACHE_MS = 120_000;
 const portProbeCache = new Map();
-const cityPoolCache = new Map();
 
 function isSafeSqlIdentifier(value) {
   return IDENTIFIER_RE.test(String(value || ""));
@@ -156,11 +156,6 @@ function buildUpdateSql(engine, mapping) {
   return `UPDATE ${playerTable} SET ${whitelist} = ? WHERE ${playerId} = ?`;
 }
 
-function toPg(sql) {
-  let index = 0;
-  return sql.replace(/\?/g, () => `$${++index}`);
-}
-
 function rememberPortState(host, port, open) {
   portProbeCache.set(`${host}:${port}`, { open, at: Date.now() });
 }
@@ -185,60 +180,8 @@ function probeCityPort(host, port) {
   });
 }
 
-function poolKey(target) {
-  return `${target.engine}|${target.host}|${target.port}|${target.database}|${target.user}`;
-}
-
-function getMysqlPool(target) {
-  const key = poolKey(target);
-  const existing = cityPoolCache.get(key);
-  if (existing) return existing;
-  const pool = mysql.createPool({
-    host: target.host,
-    port: target.port,
-    database: target.database,
-    user: target.user,
-    password: target.password,
-    ssl: target.ssl ? { rejectUnauthorized: false } : undefined,
-    connectTimeout: CONNECT_TIMEOUT_MS,
-    connectionLimit: 4,
-    maxIdle: 3,
-    idleTimeout: 90_000,
-    enableKeepAlive: true,
-    keepAliveInitialDelay: 0,
-  });
-  cityPoolCache.set(key, pool);
-  return pool;
-}
-
-async function withCityDatabase(target, fn) {
-  if (target.engine === "postgres") {
-    const client = new Client({
-      host: target.host,
-      port: target.port,
-      database: target.database,
-      user: target.user,
-      password: target.password,
-      ssl: target.ssl ? { rejectUnauthorized: false } : undefined,
-      connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
-      statement_timeout: QUERY_TIMEOUT_MS,
-    });
-    await client.connect();
-    try {
-      return await fn(async (sql, params = []) => {
-        const result = await client.query(toPg(sql), params);
-        return result.rows || [];
-      });
-    } finally {
-      await client.end().catch(() => null);
-    }
-  }
-
-  const pool = getMysqlPool(target);
-  return fn(async (sql, params = []) => {
-    const [rows] = await pool.execute(sql, params);
-    return Array.isArray(rows) ? rows : [];
-  });
+async function withCityDatabase(target, fn, options = {}) {
+  return executeWithCityDb(target, async ({ query, withTransaction }) => fn(query, withTransaction), options);
 }
 
 function isUnusableCityHost(value) {
@@ -443,7 +386,9 @@ async function raceCityOperations(
       return { ok: false, code: "port_closed", message: "Porta do banco fechada." };
     }
     try {
-      return await runDirectWhitelistOperation(settings, mapping, operation, identifierValue);
+      return await runDirectWhitelistOperation(settings, mapping, operation, identifierValue, {
+        interactive: Boolean(options.interactive),
+      });
     } catch (error) {
       const sanitized = sanitizeCityDbError(error);
       if (sanitized.code !== "offline" && sanitized.code !== "timeout") {
@@ -575,6 +520,7 @@ function isRetryableLauncherCode(code) {
     "offline",
     "timeout",
     "vps_timeout",
+    "pool_exhausted",
     "missing_credentials",
     "invalid_credentials",
   ].includes(String(code || ""));
@@ -584,61 +530,90 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function runDirectWhitelistOperation(settings, mapping, operation, identifierValue) {
+async function runDirectWhitelistOperation(
+  settings,
+  mapping,
+  operation,
+  identifierValue,
+  runtimeOptions = {},
+) {
   const target = settingsToTarget(settings, settings.guild_id);
   const selectSql = buildSelectSql(target.engine, mapping);
   const updateSql = buildUpdateSql(target.engine, mapping);
-  return withCityDatabase(target, async (query) => {
-    const rows = await query(selectSql, [identifierValue]);
-    if (rows.length > 1) {
-      return { ok: false, code: "multiple_players", message: "Mais de um jogador encontrado." };
-    }
-    if (!rows.length) {
-      return { ok: false, code: "player_not_found", message: "Jogador nao encontrado no banco da cidade." };
-    }
+  const dbOptions = { interactive: runtimeOptions.interactive === true };
 
-    const current = rows[0].whitelist_value;
-    const playerKey = String(rows[0].player_key ?? "");
-    const state = classifyState(mapping, current);
+  return withCityDatabase(
+    target,
+    async (query, withTransaction) => {
+      const readAndMaybeWrite = async (runQuery) => {
+        const rows = await runQuery(selectSql, [identifierValue]);
+        if (rows.length > 1) {
+          return { ok: false, code: "multiple_players", message: "Mais de um jogador encontrado." };
+        }
+        if (!rows.length) {
+          return {
+            ok: false,
+            code: "player_not_found",
+            message: "Jogador nao encontrado no banco da cidade.",
+          };
+        }
 
-    if (operation === "GET_PLAYER" || operation === "CHECK_WHITELIST" || operation === "TEST_MAPPING") {
-      return {
-        ok: true,
-        code: "ok",
-        playerKey,
-        currentValue: current == null ? null : String(current),
-        state,
+        const current = rows[0].whitelist_value;
+        const playerKey = String(rows[0].player_key ?? "");
+        const state = classifyState(mapping, current);
+
+        if (
+          operation === "GET_PLAYER" ||
+          operation === "CHECK_WHITELIST" ||
+          operation === "TEST_MAPPING"
+        ) {
+          return {
+            ok: true,
+            code: "ok",
+            playerKey,
+            currentValue: current == null ? null : String(current),
+            state,
+          };
+        }
+
+        const approve = operation === "APPROVE_WHITELIST";
+        if ((approve && state === "on") || (!approve && state === "off")) {
+          return normalizeWhitelistResult({
+            ok: true,
+            skipped: true,
+            changed: false,
+            code: "already_applied",
+            playerKey,
+            previousValue: current == null ? null : String(current),
+            nextValue: current == null ? null : String(current),
+            state,
+          });
+        }
+
+        const desired = coerceValue(mapping.valueType, approve ? mapping.valueOn : mapping.valueOff);
+        await runQuery(updateSql, [desired, playerKey]);
+        const nextState = classifyState(mapping, desired);
+        return normalizeWhitelistResult({
+          ok: true,
+          skipped: false,
+          changed: true,
+          code: "applied",
+          playerKey,
+          previousValue: current == null ? null : String(current),
+          nextValue: String(desired),
+          state: nextState,
+        });
       };
-    }
 
-    const approve = operation === "APPROVE_WHITELIST";
-    if ((approve && state === "on") || (!approve && state === "off")) {
-      return normalizeWhitelistResult({
-        ok: true,
-        skipped: true,
-        changed: false,
-        code: "already_applied",
-        playerKey,
-        previousValue: current == null ? null : String(current),
-        nextValue: current == null ? null : String(current),
-        state,
-      });
-    }
-
-    const desired = coerceValue(mapping.valueType, approve ? mapping.valueOn : mapping.valueOff);
-    await query(updateSql, [desired, playerKey]);
-    const nextState = classifyState(mapping, desired);
-    return normalizeWhitelistResult({
-      ok: true,
-      skipped: false,
-      changed: true,
-      code: "applied",
-      playerKey,
-      previousValue: current == null ? null : String(current),
-      nextValue: String(desired),
-      state: nextState,
-    });
-  });
+      const mutating =
+        operation === "APPROVE_WHITELIST" || operation === "REMOVE_WHITELIST";
+      if (mutating && typeof withTransaction === "function") {
+        return withTransaction(readAndMaybeWrite);
+      }
+      return readAndMaybeWrite(query);
+    },
+    dbOptions,
+  );
 }
 
 function mappingFingerprint(mapping) {
@@ -659,18 +634,14 @@ function mappingFingerprint(mapping) {
 }
 
 function sanitizeCityDbError(error) {
-  const message = String(error?.message || "").toLowerCase();
-  if (message.includes("timeout")) return { code: "timeout", message: "Banco da cidade nao respondeu a tempo." };
-  if (message.includes("access denied") || message.includes("password") || message.includes("auth")) {
-    return { code: "invalid_credentials", message: "Credencial do banco invalida." };
-  }
-  if (message.includes("econnrefused") || message.includes("enotfound") || message.includes("etimedout")) {
+  if (error?.code === "circuit_open") {
     return {
       code: "offline",
-      message: "A Flowdesk nao alcanca o IP publico do banco. Liberar a porta na VPS e bind-address 0.0.0.0.",
+      message: "Banco da cidade temporariamente indisponivel. Tente novamente em instantes.",
     };
   }
-  return { code: "db_error", message: "Falha ao sincronizar a whitelist com o banco da cidade." };
+  const classified = classifyDbError(error);
+  return { code: classified.code, message: classified.message };
 }
 
 module.exports = {
@@ -680,4 +651,5 @@ module.exports = {
   mappingFingerprint,
   inferWhitelistChanged,
   normalizeWhitelistResult,
+  healthCheckCityDb,
 };

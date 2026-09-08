@@ -2,9 +2,13 @@ const mysql = require("mysql2/promise");
 
 const DEFAULT_CITY_USER = "usuariodeteste";
 const DEFAULT_CITY_PASSWORD = "12345";
-const CONNECT_TIMEOUT_MS = 1200;
-const FALLBACK_TIMEOUT_MS = 600;
-let liveConnection = null;
+const CONNECT_TIMEOUT_MS = 3000;
+const FALLBACK_TIMEOUT_MS = 800;
+const POOL_CONNECTION_LIMIT = 4;
+const POOL_IDLE_TIMEOUT_MS = 60_000;
+const HEALTH_CHECK_MS = 30_000;
+
+const poolRegistry = new Map();
 
 function safeDatabaseName(value) {
   return String(value || "").replace(/[`\\]/g, "");
@@ -52,6 +56,10 @@ function credentialList(login) {
   ]);
 }
 
+function cacheKey(login) {
+  return `${login.user}\0${login.password}\0${login.database}\0${login.port}`;
+}
+
 async function openMysql(attempt, database, timeoutMs = CONNECT_TIMEOUT_MS) {
   const connection = await mysql.createConnection({
     host: attempt.socketPath ? undefined : attempt.host,
@@ -61,6 +69,7 @@ async function openMysql(attempt, database, timeoutMs = CONNECT_TIMEOUT_MS) {
     password: attempt.password,
     connectTimeout: timeoutMs,
     enableKeepAlive: true,
+    keepAliveInitialDelay: 0,
     insecureAuth: true,
     charset: "utf8mb4",
   });
@@ -136,28 +145,47 @@ async function tryReconnect(login, preferred) {
   throw lastError || new Error("Conta criada, mas a reconexao falhou.");
 }
 
-function cacheKey(login) {
-  return `${login.user}\0${login.password}\0${login.database}\0${login.port}`;
+function createLocalPool(login) {
+  const key = cacheKey(login);
+  const existing = poolRegistry.get(key);
+  if (existing) return existing;
+
+  const pool = mysql.createPool({
+    host: "127.0.0.1",
+    port: login.port,
+    database: login.database || undefined,
+    user: login.user,
+    password: login.password,
+    waitForConnections: true,
+    connectionLimit: POOL_CONNECTION_LIMIT,
+    maxIdle: 3,
+    idleTimeout: POOL_IDLE_TIMEOUT_MS,
+    queueLimit: 8,
+    connectTimeout: CONNECT_TIMEOUT_MS,
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 0,
+    insecureAuth: true,
+    charset: "utf8mb4",
+  });
+  pool.on("connection", (connection) => {
+    connection.on("error", () => null);
+  });
+
+  const entry = { pool, lastHealthAt: 0, key };
+  poolRegistry.set(key, entry);
+  return entry;
 }
 
-async function reuseLiveConnection(login) {
-  if (!liveConnection || liveConnection.key !== cacheKey(login) || !liveConnection.connection) {
-    return null;
-  }
+async function ensurePoolHealth(entry) {
+  const now = Date.now();
+  if (now - entry.lastHealthAt < HEALTH_CHECK_MS) return;
+  const conn = await entry.pool.getConnection();
   try {
-    await liveConnection.connection.ping();
-    return liveConnection.connection;
-  } catch {
-    await liveConnection.connection.end().catch(() => null);
-    liveConnection = null;
-    return null;
+    await conn.ping();
+    entry.lastHealthAt = now;
+  } finally {
+    conn.release();
   }
-}
-
-function rememberConnection(login, connection) {
-  connection._flowdeskPooled = true;
-  liveConnection = { key: cacheKey(login), connection };
-  return connection;
 }
 
 async function connectPreferred(login) {
@@ -170,13 +198,17 @@ async function connectPreferred(login) {
 
 async function connectCityMysql(target) {
   const login = resolveCityLogin(target);
-  const reused = await reuseLiveConnection(login);
-  if (reused) return reused;
+  const entry = createLocalPool(login);
   try {
-    return rememberConnection(login, await connectPreferred(login));
+    await ensurePoolHealth(entry);
+    const connection = await entry.pool.getConnection();
+    connection._flowdeskPooled = true;
+    connection._flowdeskPool = entry.pool;
+    return connection;
   } catch {
     /* Fall through to the broader local search. */
   }
+
   const ports = [...new Set([login.port, 3306, 3307].filter((value) => value >= 1 && value <= 65535))];
   const hosts = ["127.0.0.1", "localhost"];
   const pipes = ["\\\\.\\pipe\\MariaDB", "\\\\.\\pipe\\MySQL", "\\\\.\\pipe\\MySQL80"];
@@ -208,7 +240,10 @@ async function connectCityMysql(target) {
               cred,
               port,
             );
-            if (opened) return rememberConnection(login, opened);
+            if (opened) {
+              opened._flowdeskPooled = false;
+              return opened;
+            }
           } catch (error) {
             lastError = error;
           }
@@ -226,7 +261,10 @@ async function connectCityMysql(target) {
           cred,
           3306,
         );
-        if (opened) return rememberConnection(login, opened);
+        if (opened) {
+          opened._flowdeskPooled = false;
+          return opened;
+        }
       } catch (error) {
         lastError = error;
       }
@@ -237,7 +275,9 @@ async function connectCityMysql(target) {
 }
 
 function releaseCityMysql(connection) {
-  if (connection?._flowdeskPooled) return Promise.resolve();
+  if (connection?._flowdeskPooled) {
+    return connection.release?.().catch?.(() => null) || Promise.resolve();
+  }
   return connection?.end?.().catch(() => null);
 }
 

@@ -1,0 +1,474 @@
+const crypto = require("crypto");
+const mysql = require("mysql2/promise");
+const { Pool: PgPool } = require("pg");
+
+const CONNECT_TIMEOUT_MS = 3000;
+const QUERY_TIMEOUT_MS = 4500;
+const INTERACTIVE_QUERY_TIMEOUT_MS = 6500;
+const POOL_CONNECTION_LIMIT = 6;
+const POOL_MAX_IDLE = 4;
+const POOL_IDLE_TIMEOUT_MS = 60_000;
+const POOL_QUEUE_LIMIT = 12;
+const MAX_RETRIES = 3;
+const RETRY_BASE_MS = 120;
+const RETRY_MAX_MS = 1800;
+const CIRCUIT_FAILURE_THRESHOLD = 5;
+const CIRCUIT_OPEN_MS = 30_000;
+const MAX_CONCURRENT_OPS = 6;
+const HEALTH_CHECK_INTERVAL_MS = 45_000;
+
+const poolRegistry = new Map();
+const breakerRegistry = new Map();
+const semaphoreRegistry = new Map();
+const metricsRegistry = new Map();
+
+const RETRYABLE_ERRNO = new Set([
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "EPIPE",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "PROTOCOL_CONNECTION_LOST",
+]);
+
+const RETRYABLE_SQL_STATE = new Set(["08000", "08003", "08006", "08001", "HY000"]);
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function retryDelay(attempt) {
+  const jitter = Math.floor(Math.random() * 80);
+  return Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** Math.max(0, attempt - 1) + jitter);
+}
+
+function buildPoolKey(target) {
+  const fingerprint = crypto
+    .createHash("sha256")
+    .update(
+      [
+        target.engine,
+        target.host,
+        target.port,
+        target.database,
+        target.user,
+        target.password,
+        target.ssl ? "1" : "0",
+      ].join("\0"),
+    )
+    .digest("hex")
+    .slice(0, 24);
+  return `${target.engine}:${fingerprint}`;
+}
+
+function redactSecrets(text) {
+  return String(text || "")
+    .replace(/password[=:]\S+/gi, "password=[redacted]")
+    .replace(/access denied for user '[^']+'@'[^']+'/gi, "access denied for user [redacted]")
+    .slice(0, 240);
+}
+
+function getMetrics(poolKey) {
+  if (!metricsRegistry.has(poolKey)) {
+    metricsRegistry.set(poolKey, {
+      queries: 0,
+      failures: 0,
+      retries: 0,
+      lastLatencyMs: 0,
+      lastErrorCode: null,
+      lastSuccessAt: 0,
+    });
+  }
+  return metricsRegistry.get(poolKey);
+}
+
+function createSemaphore(limit) {
+  let active = 0;
+  const queue = [];
+  return {
+    async acquire() {
+      if (active < limit) {
+        active += 1;
+        return;
+      }
+      await new Promise((resolve) => queue.push(resolve));
+      active += 1;
+    },
+    release() {
+      active = Math.max(0, active - 1);
+      const next = queue.shift();
+      if (next) next();
+    },
+  };
+}
+
+function getSemaphore(poolKey) {
+  if (!semaphoreRegistry.has(poolKey)) {
+    semaphoreRegistry.set(poolKey, createSemaphore(MAX_CONCURRENT_OPS));
+  }
+  return semaphoreRegistry.get(poolKey);
+}
+
+function createCircuitBreaker(poolKey) {
+  return {
+    poolKey,
+    failures: 0,
+    openedUntil: 0,
+    isOpen() {
+      if (Date.now() < this.openedUntil) return true;
+      if (this.openedUntil > 0) {
+        this.openedUntil = 0;
+        this.failures = 0;
+      }
+      return false;
+    },
+    recordSuccess() {
+      this.failures = 0;
+      this.openedUntil = 0;
+    },
+    recordFailure() {
+      this.failures += 1;
+      if (this.failures >= CIRCUIT_FAILURE_THRESHOLD) {
+        this.openedUntil = Date.now() + CIRCUIT_OPEN_MS;
+      }
+    },
+  };
+}
+
+function getBreaker(poolKey) {
+  if (!breakerRegistry.has(poolKey)) {
+    breakerRegistry.set(poolKey, createCircuitBreaker(poolKey));
+  }
+  return breakerRegistry.get(poolKey);
+}
+
+function classifyDbError(error) {
+  const errno = String(error?.code || error?.errno || "").toUpperCase();
+  const sqlState = String(error?.sqlState || "").toUpperCase();
+  const message = redactSecrets(error?.message || "Falha no banco da cidade.");
+  const lowered = message.toLowerCase();
+
+  if (errno === "ER_CON_COUNT_ERROR" || lowered.includes("too many connections")) {
+    return {
+      code: "pool_exhausted",
+      message: "O banco da cidade atingiu o limite de conexoes. Tente novamente em instantes.",
+      retryable: true,
+      evictPool: false,
+    };
+  }
+  if (lowered.includes("timeout") || errno === "ETIMEDOUT") {
+    return {
+      code: "timeout",
+      message: "Banco da cidade nao respondeu a tempo.",
+      retryable: true,
+      evictPool: true,
+    };
+  }
+  if (
+    lowered.includes("access denied") ||
+    lowered.includes("password") ||
+    errno === "ER_ACCESS_DENIED_ERROR" ||
+    errno === "28000"
+  ) {
+    return {
+      code: "invalid_credentials",
+      message: "Credencial do banco invalida.",
+      retryable: false,
+      evictPool: false,
+    };
+  }
+  if (
+    RETRYABLE_ERRNO.has(errno) ||
+    RETRYABLE_SQL_STATE.has(sqlState) ||
+    lowered.includes("econnrefused") ||
+    lowered.includes("enotfound") ||
+    lowered.includes("connection lost") ||
+    lowered.includes("server has gone away") ||
+    lowered.includes("cannot enqueue")
+  ) {
+    return {
+      code: "offline",
+      message:
+        "Conexao com o banco da cidade foi interrompida. O sistema tentara reconectar automaticamente.",
+      retryable: true,
+      evictPool: true,
+    };
+  }
+  return {
+    code: "db_error",
+    message: "Falha ao sincronizar a whitelist com o banco da cidade.",
+    retryable: false,
+    evictPool: false,
+  };
+}
+
+function toPg(sql) {
+  let index = 0;
+  return sql.replace(/\?/g, () => `$${++index}`);
+}
+
+async function evictPool(poolKey) {
+  const entry = poolRegistry.get(poolKey);
+  if (!entry) return;
+  poolRegistry.delete(poolKey);
+  try {
+    if (entry.engine === "mysql") {
+      await entry.pool.end();
+    } else {
+      await entry.pool.end();
+    }
+  } catch {
+    /* pool already closed */
+  }
+}
+
+function createMysqlPool(target) {
+  const pool = mysql.createPool({
+    host: target.host,
+    port: target.port,
+    database: target.database,
+    user: target.user,
+    password: target.password,
+    ssl: target.ssl ? { rejectUnauthorized: false } : undefined,
+    waitForConnections: true,
+    connectionLimit: POOL_CONNECTION_LIMIT,
+    maxIdle: POOL_MAX_IDLE,
+    idleTimeout: POOL_IDLE_TIMEOUT_MS,
+    queueLimit: POOL_QUEUE_LIMIT,
+    connectTimeout: CONNECT_TIMEOUT_MS,
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 0,
+    charset: "utf8mb4",
+    timezone: "Z",
+  });
+  pool.on("connection", (connection) => {
+    connection.on("error", () => {
+      /* mysql2 removes broken connection from pool automatically */
+    });
+  });
+  return pool;
+}
+
+function createPgPool(target) {
+  return new PgPool({
+    host: target.host,
+    port: target.port,
+    database: target.database,
+    user: target.user,
+    password: target.password,
+    ssl: target.ssl ? { rejectUnauthorized: false } : undefined,
+    max: POOL_CONNECTION_LIMIT,
+    idleTimeoutMillis: POOL_IDLE_TIMEOUT_MS,
+    connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
+    allowExitOnIdle: true,
+    statement_timeout: QUERY_TIMEOUT_MS,
+  });
+}
+
+async function getPoolEntry(target) {
+  const poolKey = buildPoolKey(target);
+  const existing = poolRegistry.get(poolKey);
+  if (existing) return { poolKey, ...existing };
+
+  const entry =
+    target.engine === "postgres"
+      ? { engine: "postgres", pool: createPgPool(target), lastHealthAt: 0 }
+      : { engine: "mysql", pool: createMysqlPool(target), lastHealthAt: 0 };
+
+  poolRegistry.set(poolKey, entry);
+  return { poolKey, ...entry };
+}
+
+async function runQueryWithTimeout(run, timeoutMs) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      run(),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("query timeout")), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function pingPool(entry) {
+  if (entry.engine === "postgres") {
+    await entry.pool.query("SELECT 1");
+    return;
+  }
+  const conn = await entry.pool.getConnection();
+  try {
+    await conn.ping();
+  } finally {
+    conn.release();
+  }
+}
+
+async function ensureHealthy(entry, poolKey, force = false) {
+  const now = Date.now();
+  if (!force && now - entry.lastHealthAt < HEALTH_CHECK_INTERVAL_MS) return;
+  await pingPool(entry);
+  entry.lastHealthAt = now;
+  poolRegistry.set(poolKey, entry);
+}
+
+async function runMysqlTransaction(pool, fn, queryTimeoutMs) {
+  const connection = await pool.getConnection();
+  const query = async (sql, params = []) => {
+    const [rows] = await runQueryWithTimeout(
+      () => connection.execute(sql, params),
+      queryTimeoutMs,
+    );
+    return Array.isArray(rows) ? rows : [];
+  };
+  try {
+    await connection.beginTransaction();
+    const result = await fn(query);
+    await connection.commit();
+    return result;
+  } catch (error) {
+    await connection.rollback().catch(() => null);
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function runPgTransaction(pool, fn, queryTimeoutMs) {
+  const client = await pool.connect();
+  const query = async (sql, params = []) => {
+    const result = await runQueryWithTimeout(
+      () => client.query(toPg(sql), params),
+      queryTimeoutMs,
+    );
+    return result.rows || [];
+  };
+  try {
+    await client.query("BEGIN");
+    const result = await fn(query);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => null);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function runOnce(target, poolKey, fn, options) {
+  const queryTimeoutMs = options.interactive ? INTERACTIVE_QUERY_TIMEOUT_MS : QUERY_TIMEOUT_MS;
+  const entry = await getPoolEntry(target);
+  await ensureHealthy(entry, poolKey);
+
+  const metrics = getMetrics(poolKey);
+  const started = Date.now();
+
+  if (entry.engine === "postgres") {
+    const query = async (sql, params = []) => {
+      const result = await runQueryWithTimeout(
+        () => entry.pool.query(toPg(sql), params),
+        queryTimeoutMs,
+      );
+      return result.rows || [];
+    };
+    const withTransaction = (txFn) => runPgTransaction(entry.pool, txFn, queryTimeoutMs);
+    const value = await fn({ query, withTransaction });
+    metrics.queries += 1;
+    metrics.lastLatencyMs = Date.now() - started;
+    metrics.lastSuccessAt = Date.now();
+    return value;
+  }
+
+  const query = async (sql, params = []) => {
+    const [rows] = await runQueryWithTimeout(
+      () => entry.pool.execute(sql, params),
+      queryTimeoutMs,
+    );
+    return Array.isArray(rows) ? rows : [];
+  };
+  const withTransaction = (txFn) => runMysqlTransaction(entry.pool, txFn, queryTimeoutMs);
+  const value = await fn({ query, withTransaction });
+  metrics.queries += 1;
+  metrics.lastLatencyMs = Date.now() - started;
+  metrics.lastSuccessAt = Date.now();
+  return value;
+}
+
+async function executeWithCityDb(target, fn, options = {}) {
+  const poolKey = buildPoolKey(target);
+  const breaker = getBreaker(poolKey);
+  if (breaker.isOpen()) {
+    const error = new Error("Banco da cidade temporariamente indisponivel. Tente em instantes.");
+    error.code = "circuit_open";
+    throw error;
+  }
+
+  const semaphore = getSemaphore(poolKey);
+  await semaphore.acquire();
+  try {
+    let lastError = null;
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt += 1) {
+      try {
+        return await runOnce(target, poolKey, fn, options);
+      } catch (error) {
+        const classified = classifyDbError(error);
+        lastError = error;
+        getMetrics(poolKey).failures += 1;
+        getMetrics(poolKey).lastErrorCode = classified.code;
+
+        if (!classified.retryable || attempt >= MAX_RETRIES) {
+          breaker.recordFailure();
+          const finalError = new Error(classified.message);
+          finalError.code = classified.code;
+          throw finalError;
+        }
+
+        getMetrics(poolKey).retries += 1;
+        if (classified.evictPool) {
+          await evictPool(poolKey);
+        }
+        await sleep(retryDelay(attempt));
+      }
+    }
+    throw lastError || new Error("Falha ao acessar o banco da cidade.");
+  } finally {
+    semaphore.release();
+  }
+}
+
+async function healthCheckCityDb(target) {
+  const poolKey = buildPoolKey(target);
+  const breaker = getBreaker(poolKey);
+  if (breaker.isOpen()) {
+    return { ok: false, code: "circuit_open", latencyMs: 0 };
+  }
+  const started = Date.now();
+  try {
+    const entry = await getPoolEntry(target);
+    await ensureHealthy(entry, poolKey, true);
+    breaker.recordSuccess();
+    return { ok: true, code: "ok", latencyMs: Date.now() - started };
+  } catch (error) {
+    const classified = classifyDbError(error);
+    breaker.recordFailure();
+    return { ok: false, code: classified.code, latencyMs: Date.now() - started };
+  }
+}
+
+function getCityDbMetrics(target) {
+  const poolKey = buildPoolKey(target);
+  return { poolKey: poolKey.slice(0, 12), ...getMetrics(poolKey) };
+}
+
+module.exports = {
+  executeWithCityDb,
+  healthCheckCityDb,
+  getCityDbMetrics,
+  classifyDbError,
+  evictPool,
+  buildPoolKey,
+};
