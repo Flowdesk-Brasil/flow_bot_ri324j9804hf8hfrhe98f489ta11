@@ -20,6 +20,7 @@ const {
   mappingFingerprint,
   inferWhitelistChanged,
   normalizeWhitelistResult,
+  healthCheckActivePools,
 } = require("./whitelistCityDb");
 const {
   applyNicknameFormat,
@@ -33,6 +34,8 @@ const retryingFailedApplies = new Set();
 const attemptWindow = new Map();
 const ATTEMPT_WINDOW_MS = 120_000;
 const ATTEMPT_LIMIT = 5;
+let lastPoolHealthAt = 0;
+const POOL_HEALTH_INTERVAL_MS = 45_000;
 
 function clampText(value, maxLength) {
   return String(value || "").slice(0, maxLength);
@@ -787,9 +790,9 @@ async function applyWhitelistChange({
           missingPlayer ? "ID nao encontrado" : "Banco nao sincronizado",
           missingPlayer
             ? "Esse ID nao existe no banco da cidade. A whitelist so e liberada para um ID cadastrado."
-            : autoApproved
-              ? `${result.message || "O launcher ainda esta sincronizando o banco da cidade."} O pedido continua aberto e o sistema tenta de novo sozinho.`
-              : `${result.message || "Nao foi possivel aplicar a whitelist no banco da cidade."} O pedido permanece aberto e o sistema tenta de novo sozinho.`,
+              : autoApproved
+                ? `${result.message || "O banco da cidade ainda esta sincronizando."} O pedido continua aberto e o sistema tenta de novo sozinho.`
+                : `${result.message || "Nao foi possivel aplicar a whitelist no banco da cidade."} O pedido permanece aberto e o sistema tenta de novo sozinho.`,
         ),
       );
       void persistWhitelistFailure({
@@ -1137,6 +1140,12 @@ async function retryFailedWhitelistApplies(client) {
 }
 
 async function reconcileCompletedAgentJobs(client) {
+  if (Date.now() - lastPoolHealthAt >= POOL_HEALTH_INTERVAL_MS) {
+    lastPoolHealthAt = Date.now();
+    await healthCheckActivePools().catch((error) => {
+      console.error("[city-db-health]", error);
+    });
+  }
   await retryFailedWhitelistApplies(client).catch((error) => {
     console.error("[whitelist-auto-retry]", error);
   });

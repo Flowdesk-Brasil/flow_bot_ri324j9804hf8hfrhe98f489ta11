@@ -1,6 +1,7 @@
 const crypto = require("crypto");
 const mysql = require("mysql2/promise");
 const { Pool: PgPool } = require("pg");
+const { settleMaybePromise } = require("../utils/settleMaybePromise");
 
 const CONNECT_TIMEOUT_MS = 3000;
 const QUERY_TIMEOUT_MS = 4500;
@@ -69,6 +70,24 @@ function redactSecrets(text) {
     .slice(0, 240);
 }
 
+function logCityDb(level, event, extra = {}) {
+  const payload = {
+    scope: "city-db",
+    event,
+    ts: new Date().toISOString(),
+    ...extra,
+  };
+  if (level === "error") {
+    console.error("[city-db]", payload);
+    return;
+  }
+  if (level === "warn") {
+    console.warn("[city-db]", payload);
+    return;
+  }
+  console.info("[city-db]", payload);
+}
+
 function getMetrics(poolKey) {
   if (!metricsRegistry.has(poolKey)) {
     metricsRegistry.set(poolKey, {
@@ -131,6 +150,11 @@ function createCircuitBreaker(poolKey) {
       this.failures += 1;
       if (this.failures >= CIRCUIT_FAILURE_THRESHOLD) {
         this.openedUntil = Date.now() + CIRCUIT_OPEN_MS;
+        logCityDb("warn", "circuit_open", {
+          poolKey: this.poolKey.slice(0, 12),
+          failures: this.failures,
+          openMs: CIRCUIT_OPEN_MS,
+        });
       }
     },
   };
@@ -212,15 +236,8 @@ async function evictPool(poolKey) {
   const entry = poolRegistry.get(poolKey);
   if (!entry) return;
   poolRegistry.delete(poolKey);
-  try {
-    if (entry.engine === "mysql") {
-      await entry.pool.end();
-    } else {
-      await entry.pool.end();
-    }
-  } catch {
-    /* pool already closed */
-  }
+  logCityDb("warn", "pool_evicted", { poolKey: poolKey.slice(0, 12), engine: entry.engine });
+  await settleMaybePromise(entry.pool?.end?.());
 }
 
 function createMysqlPool(target) {
@@ -330,7 +347,7 @@ async function runMysqlTransaction(pool, fn, queryTimeoutMs) {
     await connection.commit();
     return result;
   } catch (error) {
-    await connection.rollback().catch(() => null);
+    await settleMaybePromise(connection.rollback?.());
     throw error;
   } finally {
     connection.release();
@@ -352,7 +369,7 @@ async function runPgTransaction(pool, fn, queryTimeoutMs) {
     await client.query("COMMIT");
     return result;
   } catch (error) {
-    await client.query("ROLLBACK").catch(() => null);
+    await settleMaybePromise(client.query("ROLLBACK"));
     throw error;
   } finally {
     client.release();
@@ -413,7 +430,9 @@ async function executeWithCityDb(target, fn, options = {}) {
     let lastError = null;
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt += 1) {
       try {
-        return await runOnce(target, poolKey, fn, options);
+        const value = await runOnce(target, poolKey, fn, options);
+        breaker.recordSuccess();
+        return value;
       } catch (error) {
         const classified = classifyDbError(error);
         lastError = error;
@@ -428,6 +447,12 @@ async function executeWithCityDb(target, fn, options = {}) {
         }
 
         getMetrics(poolKey).retries += 1;
+        logCityDb("warn", "query_retry", {
+          poolKey: poolKey.slice(0, 12),
+          attempt,
+          code: classified.code,
+          delayMs: retryDelay(attempt),
+        });
         if (classified.evictPool) {
           await evictPool(poolKey);
         }
@@ -464,11 +489,45 @@ function getCityDbMetrics(target) {
   return { poolKey: poolKey.slice(0, 12), ...getMetrics(poolKey) };
 }
 
+async function healthCheckActivePools() {
+  const snapshots = [];
+  for (const [poolKey, entry] of poolRegistry.entries()) {
+    const started = Date.now();
+    try {
+      await ensureHealthy(entry, poolKey, true);
+      getBreaker(poolKey).recordSuccess();
+      snapshots.push({ poolKey: poolKey.slice(0, 12), ok: true, latencyMs: Date.now() - started });
+    } catch (error) {
+      const classified = classifyDbError(error);
+      getBreaker(poolKey).recordFailure();
+      logCityDb("warn", "pool_health_fail", {
+        poolKey: poolKey.slice(0, 12),
+        code: classified.code,
+      });
+      if (classified.evictPool) {
+        await evictPool(poolKey);
+      }
+      snapshots.push({
+        poolKey: poolKey.slice(0, 12),
+        ok: false,
+        code: classified.code,
+        latencyMs: Date.now() - started,
+      });
+    }
+  }
+  if (snapshots.length) {
+    logCityDb("info", "pool_health_scan", { pools: snapshots.length, ok: snapshots.filter((item) => item.ok).length });
+  }
+  return snapshots;
+}
+
 module.exports = {
   executeWithCityDb,
   healthCheckCityDb,
+  healthCheckActivePools,
   getCityDbMetrics,
   classifyDbError,
   evictPool,
   buildPoolKey,
+  logCityDb,
 };

@@ -3,7 +3,9 @@ const { decryptWhitelistSecret } = require("../utils/whitelistSecret");
 const {
   executeWithCityDb,
   healthCheckCityDb,
+  healthCheckActivePools,
   classifyDbError,
+  logCityDb,
 } = require("./cityDbRuntime");
 
 const IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -247,8 +249,13 @@ async function executeWhitelistOperation(settings, operation, identifierValue, o
   let cityTarget = null;
   try {
     cityTarget = settingsToTarget(settings, settings.guild_id);
-  } catch {
+  } catch (error) {
     cityTarget = null;
+    logCityDb("warn", "direct_target_unavailable", {
+      guildId: settings.guild_id,
+      operation,
+      message: error instanceof Error ? error.message : String(error),
+    });
   }
 
   const launcherCityDb =
@@ -263,36 +270,76 @@ async function executeWhitelistOperation(settings, operation, identifierValue, o
         }
       : null);
   const launcherOpts = options.interactive ? { priority: "interactive" } : {};
-  const mode = String(settings?.connection_mode || "direct").toLowerCase();
-
-  if (mode === "agent" || mode === "launcher") {
-    if (cityTarget && options.interactive) {
-      return raceCityOperations(
-        settings,
-        mapping,
-        operation,
-        identifierValue,
-        cityTarget,
-        launcherCityDb,
-        launcherOpts,
-      );
-    }
-    return runViaLauncher(settings, operation, identifierValue, mapping, launcherCityDb, launcherOpts);
-  }
+  let lastDirect = null;
 
   if (cityTarget) {
-    return raceCityOperations(
-      settings,
-      mapping,
-      operation,
-      identifierValue,
-      cityTarget,
-      launcherCityDb,
-      launcherOpts,
-    );
+    try {
+      const direct = await runDirectWhitelistOperation(settings, mapping, operation, identifierValue, {
+        interactive: Boolean(options.interactive),
+      });
+      lastDirect = direct;
+      if (direct?.ok) {
+        logCityDb("info", "whitelist_direct_ok", {
+          guildId: settings.guild_id,
+          operation,
+          code: direct.code || "ok",
+        });
+        return normalizeWhitelistResult(direct);
+      }
+      logCityDb("warn", "whitelist_direct_rejected", {
+        guildId: settings.guild_id,
+        operation,
+        code: direct?.code || "unknown",
+      });
+      if (direct?.code === "player_not_found" || direct?.code === "multiple_players") {
+        return normalizeWhitelistResult(direct);
+      }
+      if (direct && !isRetryableLauncherCode(direct.code)) {
+        return direct;
+      }
+    } catch (error) {
+      const sanitized = sanitizeCityDbError(error);
+      lastDirect = { ok: false, ...sanitized };
+      logCityDb("error", "whitelist_direct_error", {
+        guildId: settings.guild_id,
+        operation,
+        code: sanitized.code,
+        message: sanitized.message,
+      });
+      if (!isRetryableLauncherCode(sanitized.code)) {
+        return lastDirect;
+      }
+    }
   }
 
-  return runViaLauncher(settings, operation, identifierValue, mapping, launcherCityDb, launcherOpts);
+  if (launcherCityDb) {
+    const db = require("./whitelistDbService");
+    const hint = await db.getLauncherConnectivityHint(settings.guild_id).catch(() => ({ online: false }));
+    if (hint?.online) {
+      logCityDb("info", "whitelist_launcher_assist", {
+        guildId: settings.guild_id,
+        operation,
+      });
+      return runViaLauncher(settings, operation, identifierValue, mapping, launcherCityDb, launcherOpts);
+    }
+  }
+
+  logCityDb("warn", "whitelist_offline", {
+    guildId: settings.guild_id,
+    operation,
+    hasDirectTarget: Boolean(cityTarget),
+    lastDirectCode: lastDirect?.code || null,
+  });
+  if (lastDirect) {
+    return lastDirect.ok ? normalizeWhitelistResult(lastDirect) : lastDirect;
+  }
+  return {
+    ok: false,
+    code: "offline",
+    message: cityTarget
+      ? "Nao foi possivel conectar ao banco da cidade agora. A integracao continua salva e o sistema reconecta automaticamente."
+      : "Conexao do banco da cidade incompleta. Configure o IP publico, o usuario e a senha no painel.",
+  };
 }
 
 function inferWhitelistChanged(result) {
@@ -387,7 +434,7 @@ async function raceCityOperations(
     }
     try {
       return await runDirectWhitelistOperation(settings, mapping, operation, identifierValue, {
-        interactive: Boolean(options.interactive),
+        interactive: Boolean(interactive),
       });
     } catch (error) {
       const sanitized = sanitizeCityDbError(error);
@@ -416,11 +463,11 @@ async function raceCityOperations(
 function buildLauncherWaitMessage(hint) {
   if (!hint?.online) {
     if (hint?.reason === "missing") {
-      return "O Flowdesk Launcher nao esta vinculado na VPS. Abra o app, faca login e aguarde ficar online.";
+      return "O launcher nao esta vinculado. Na primeira configuracao, abra o app na VPS. Depois a whitelist usa o banco direto.";
     }
-    return "O Flowdesk Launcher na VPS esta offline ou reconectando. Abra o app e aguarde aparecer Conectado.";
+    return "O launcher na VPS esta offline. Se a conexao ja foi salva, a whitelist continua pelo banco direto.";
   }
-  return "O launcher recebeu a tarefa mas ainda esta sincronizando. Deixe o app aberto e tente de novo em alguns segundos.";
+  return "O launcher recebeu a tarefa mas ainda esta sincronizando. Se a conexao ja foi salva, o backend tenta o banco direto.";
 }
 
 async function runViaLauncher(settings, operation, identifierValue, mapping, cityDb, options = {}) {
@@ -634,6 +681,13 @@ function mappingFingerprint(mapping) {
 }
 
 function sanitizeCityDbError(error) {
+  const raw = String(error?.message || "");
+  if (/reading ['"]catch['"]/i.test(raw)) {
+    return {
+      code: "db_error",
+      message: "Falha ao finalizar a conexao com o banco. Tente conectar novamente.",
+    };
+  }
   if (error?.code === "circuit_open") {
     return {
       code: "offline",
@@ -652,4 +706,5 @@ module.exports = {
   inferWhitelistChanged,
   normalizeWhitelistResult,
   healthCheckCityDb,
+  healthCheckActivePools,
 };
