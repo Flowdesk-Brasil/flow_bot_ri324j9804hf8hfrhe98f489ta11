@@ -1,12 +1,14 @@
 {
   "name": "flowdesk-launcher",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "private": true,
   "description": "Flowdesk Launcher",
   "author": "Flowdesk",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
+    "icons": "node scripts/generate-icons.js",
+    "predist": "node scripts/generate-icons.js",
     "dist": "electron-builder --win nsis --x64 && node scripts/copy-dist.js"
   },
   "dependencies": {
@@ -16,7 +18,9 @@
   },
   "devDependencies": {
     "electron": "^37.2.0",
-    "electron-builder": "^26.0.12"
+    "electron-builder": "^26.0.12",
+    "png-to-ico": "^3.0.2",
+    "sharp": "^0.35.4"
   },
   "build": {
     "appId": "com.flowdesk.launcher",
@@ -32,6 +36,7 @@
       "executor.js",
       "cityMysql.js",
       "open-db-ports.cmd",
+      "assets/**/*",
       "renderer/**/*"
     ],
     "extraResources": [
@@ -42,6 +47,7 @@
     ],
     "asar": true,
     "win": {
+      "icon": "assets/icon.ico",
       "signAndEditExecutable": false,
       "target": [
         {
@@ -54,6 +60,9 @@
     },
     "nsis": {
       "oneClick": false,
+      "installerIcon": "assets/icon.ico",
+      "uninstallerIcon": "assets/icon.ico",
+      "installerHeaderIcon": "assets/icon.ico",
       "perMachine": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,

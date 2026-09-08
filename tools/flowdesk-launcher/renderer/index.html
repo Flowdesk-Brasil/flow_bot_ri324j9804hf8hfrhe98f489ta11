@@ -4,6 +4,8 @@
   <meta charset="utf-8" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; script-src 'self' 'unsafe-inline'; img-src 'self' https: data:;" />
   <title>Flowdesk Launcher</title>
+  <link rel="icon" type="image/png" href="./assets/favicon.png" />
+  <link rel="apple-touch-icon" href="./assets/logo.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet" />
@@ -38,9 +40,8 @@
       padding: 0 16px; -webkit-app-region: drag; position: relative; z-index: 2;
     }
     .brand { display: flex; align-items: center; gap: 10px; font-size: 11px; letter-spacing: .18em; text-transform: uppercase; color: #9a9a9e; font-weight: 500; }
-    .mark {
-      width: 22px; height: 22px; border-radius: 7px; background: #fff; color: #111;
-      display: grid; place-items: center; font-size: 11px; font-weight: 700;
+    .brand-logo {
+      width: 22px; height: 22px; border-radius: 7px; object-fit: cover; flex: 0 0 auto;
       box-shadow: 0 0 0 4px rgba(255,255,255,.04);
     }
     .window-actions { display: flex; gap: 8px; -webkit-app-region: no-drag; }
@@ -63,11 +64,9 @@
       letter-spacing: -.03em; font-weight: 400;
     }
     .sub { color: var(--muted); line-height: 1.6; font-size: 14px; margin: 14px 0 0; }
-    .hero-mark {
-      width: 72px; height: 72px; border-radius: 22px; margin: 18px 0 22px;
-      background:
-        radial-gradient(circle at 30% 28%, #fff, #8d8d8d 36%, #111 72%);
-      box-shadow: 0 18px 50px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.35);
+    .hero-logo {
+      width: 72px; height: 72px; border-radius: 22px; margin: 18px 0 22px; object-fit: cover;
+      box-shadow: 0 18px 50px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.12);
       animation: breathe 2.8s ease-in-out infinite;
     }
     @keyframes breathe { 50% { transform: scale(.96); filter: brightness(1.08); } }
@@ -140,7 +139,7 @@
   <div class="orb orb-b"></div>
   <div class="grain"></div>
   <div class="titlebar">
-    <div class="brand"><span class="mark">F</span> Flowdesk</div>
+    <div class="brand"><img class="brand-logo" src="./assets/favicon.png" alt="" /><span>Flowdesk</span></div>
     <div class="window-actions">
       <button id="min" aria-label="Minimizar"></button>
       <button id="close" class="close" aria-label="Fechar"></button>
@@ -158,7 +157,7 @@
 
     <section id="login" class="view">
       <p class="kicker">Acesso</p>
-      <div class="hero-mark"></div>
+      <img class="hero-logo" src="./assets/logo.png" alt="Flowdesk" />
       <h1>Entre e a cidade<br>reconhece sozinha.</h1>
       <p class="sub" id="loginText">Instale na VPS da cidade. O launcher so vincula a maquina, publica o IP e abre as portas. O banco e configurado no painel, do seu PC.</p>
       <button class="primary" id="loginBtn">
@@ -173,7 +172,7 @@
 
     <section id="waiting" class="view">
       <p class="kicker">Autorizacao</p>
-      <div class="hero-mark"></div>
+      <img class="hero-logo" src="./assets/logo.png" alt="Flowdesk" />
       <h1>Confirme no<br>navegador.</h1>
       <p class="sub" id="waitText">Abra a Flowdesk, entre na sua conta e este launcher valida sozinho.</p>
       <div class="stack">

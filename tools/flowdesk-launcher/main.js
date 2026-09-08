@@ -102,7 +102,38 @@ function emitState() {
   }
 }
 
+function resolveAppIconPath() {
+  const candidates = [
+    path.join(__dirname, "assets", "icon.ico"),
+    path.join(__dirname, "assets", "icon.png"),
+    path.join(__dirname, "renderer", "assets", "logo.png"),
+  ];
+  return candidates.find((candidate) => fs.existsSync(candidate)) || null;
+}
+
+function loadAppIcon(size) {
+  const iconPath = resolveAppIconPath();
+  if (!iconPath) return nativeImage.createEmpty();
+  let image = nativeImage.createFromPath(iconPath);
+  if (image.isEmpty()) return image;
+  if (size && size > 0) {
+    image = image.resize({ width: size, height: size, quality: "best" });
+  }
+  return image;
+}
+
+function applyAppBranding() {
+  if (process.platform === "win32") {
+    app.setAppUserModelId("com.flowdesk.launcher");
+  }
+  const icon = loadAppIcon();
+  if (!icon.isEmpty()) {
+    app.dock?.setIcon?.(icon);
+  }
+}
+
 function createWindow() {
+  const icon = loadAppIcon();
   mainWindow = new BrowserWindow({
     width: 460,
     height: 760,
@@ -113,6 +144,8 @@ function createWindow() {
     backgroundColor: "#050505",
     resizable: false,
     autoHideMenuBar: true,
+    icon: icon.isEmpty() ? undefined : icon,
+    title: "Flowdesk Launcher",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -130,9 +163,8 @@ function createWindow() {
 }
 
 function createTray() {
-  const image = nativeImage.createFromDataURL(
-    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAGUlEQVR4nO3BMQEAAAgDoJvc6F9hJxP0AA8OBgAB/wM+WwAAAABJRU5ErkJggg==",
-  );
+  const image = loadAppIcon(32);
+  if (image.isEmpty()) return;
   tray = new Tray(image);
   tray.setToolTip("Flowdesk Launcher");
   tray.setContextMenu(
@@ -785,6 +817,7 @@ if (!gotLock) {
   }
 
   app.whenReady().then(async () => {
+    applyAppBranding();
     createWindow();
     createTray();
     await restoreSession();
