@@ -352,6 +352,72 @@ async function executeWhitelistOperation(settings, operation, identifierValue, o
   return runViaLauncher(settings, operation, identifierValue, mapping, launcherCityDb, launcherOpts);
 }
 
+function inferWhitelistChanged(result) {
+  if (!result?.ok) return false;
+  if (result.changed === true || result.code === "applied") return true;
+
+  const previous = result.previousValue;
+  const next = result.nextValue ?? result.currentValue;
+  if (isWhitelistOffValue(previous) && isWhitelistOnValue(next)) return true;
+  if (isWhitelistOnValue(previous) && isWhitelistOffValue(next)) return true;
+  if (previous != null && next != null && String(previous) !== String(next)) return true;
+
+  if (result.changed === false || result.skipped === true || result.code === "already_applied") {
+    return false;
+  }
+
+  if (result.skipped === false && result.state === "on" && isWhitelistOffValue(previous)) {
+    return true;
+  }
+  if (result.skipped === false && result.state === "off" && isWhitelistOnValue(previous)) {
+    return true;
+  }
+
+  if (previous == null && next == null) return false;
+  return false;
+}
+
+function normalizeWhitelistResult(result) {
+  if (!result || typeof result !== "object") return result;
+  const changed = inferWhitelistChanged(result);
+  const alreadyApplied = result.skipped === true || result.code === "already_applied";
+  return {
+    ...result,
+    changed,
+    skipped: changed ? false : alreadyApplied,
+    code: changed ? "applied" : alreadyApplied ? "already_applied" : result.code || "ok",
+  };
+}
+
+function pickBestWhitelistResult(results) {
+  const list = (Array.isArray(results) ? results : []).filter(
+    (item) => item && typeof item === "object",
+  );
+  const notFound = list.find((item) => item.code === "player_not_found");
+  if (notFound) return normalizeWhitelistResult(notFound);
+
+  const successes = list.filter((item) => item.ok === true).map(normalizeWhitelistResult);
+  if (successes.length) {
+    return (
+      successes.find((item) => item.changed === true) ||
+      successes.find((item) => item.code === "applied") ||
+      successes.find((item) => !item.skipped && item.code !== "already_applied") ||
+      successes[0]
+    );
+  }
+
+  const failure =
+    list.find((item) => item.code && item.code !== "port_closed") ||
+    list.find((item) => item.ok === false) ||
+    null;
+  if (failure) return failure;
+  return {
+    ok: false,
+    code: "offline",
+    message: "Nao foi possivel conectar ao banco da cidade agora.",
+  };
+}
+
 async function raceCityOperations(
   settings,
   mapping,
@@ -368,43 +434,28 @@ async function raceCityOperations(
     mapping,
     launcherCityDb,
     launcherOpts,
-  ).then((value) => {
-    if (value?.ok === true || !isRetryableLauncherCode(value?.code)) return value;
-    throw value;
-  });
+  );
 
   const directTask = (async () => {
     const portOpen = await probeCityPort(cityTarget.host, cityTarget.port);
     if (!portOpen) {
-      throw { ok: false, code: "port_closed", message: "Porta do banco fechada." };
+      return { ok: false, code: "port_closed", message: "Porta do banco fechada." };
     }
     try {
       return await runDirectWhitelistOperation(settings, mapping, operation, identifierValue);
     } catch (error) {
       const sanitized = sanitizeCityDbError(error);
       if (sanitized.code !== "offline" && sanitized.code !== "timeout") {
-        throw { ok: false, ...sanitized };
+        return { ok: false, ...sanitized };
       }
       rememberPortState(cityTarget.host, cityTarget.port, false);
-      throw { ok: false, ...sanitized };
+      return { ok: false, ...sanitized };
     }
   })();
 
-  try {
-    return await Promise.any([directTask, launcherTask]);
-  } catch (aggregate) {
-    const errors = Array.isArray(aggregate?.errors) ? aggregate.errors : [];
-    const meaningful =
-      errors.find((item) => item && typeof item === "object" && item.code && item.code !== "port_closed") ||
-      errors.find((item) => item && typeof item === "object" && item.code === "player_not_found") ||
-      errors[0];
-    if (meaningful && typeof meaningful === "object") return meaningful;
-    return {
-      ok: false,
-      code: "offline",
-      message: "Nao foi possivel conectar ao banco da cidade agora.",
-    };
-  }
+  const settled = await Promise.allSettled([directTask, launcherTask]);
+  const values = settled.map((entry) => (entry.status === "fulfilled" ? entry.value : entry.reason));
+  return pickBestWhitelistResult(values);
 }
 
 async function runViaLauncher(settings, operation, identifierValue, mapping, cityDb, options = {}) {
@@ -462,17 +513,16 @@ async function runViaLauncher(settings, operation, identifierValue, mapping, cit
       await sleep(fast ? 200 * attempt : 400 * attempt);
       continue;
     }
-    return {
+    return normalizeWhitelistResult({
       ok: true,
       code: result.code || "ok",
       skipped: result.skipped === true,
-      changed: result.changed === true,
       playerKey: result.playerKey,
       previousValue: result.previousValue ?? null,
       nextValue: result.nextValue ?? result.currentValue ?? null,
       currentValue: result.currentValue ?? null,
       state: result.state,
-    };
+    });
   }
   return last;
 }
@@ -520,7 +570,7 @@ async function runDirectWhitelistOperation(settings, mapping, operation, identif
 
     const approve = operation === "APPROVE_WHITELIST";
     if ((approve && state === "on") || (!approve && state === "off")) {
-      return {
+      return normalizeWhitelistResult({
         ok: true,
         skipped: true,
         changed: false,
@@ -529,13 +579,13 @@ async function runDirectWhitelistOperation(settings, mapping, operation, identif
         previousValue: current == null ? null : String(current),
         nextValue: current == null ? null : String(current),
         state,
-      };
+      });
     }
 
     const desired = coerceValue(mapping.valueType, approve ? mapping.valueOn : mapping.valueOff);
     await query(updateSql, [desired, playerKey]);
     const nextState = classifyState(mapping, desired);
-    return {
+    return normalizeWhitelistResult({
       ok: true,
       skipped: false,
       changed: true,
@@ -544,7 +594,7 @@ async function runDirectWhitelistOperation(settings, mapping, operation, identif
       previousValue: current == null ? null : String(current),
       nextValue: String(desired),
       state: nextState,
-    };
+    });
   });
 }
 
@@ -585,4 +635,6 @@ module.exports = {
   sanitizeCityDbError,
   normalizeMapping,
   mappingFingerprint,
+  inferWhitelistChanged,
+  normalizeWhitelistResult,
 };

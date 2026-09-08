@@ -18,6 +18,8 @@ const {
   executeWhitelistOperation,
   sanitizeCityDbError,
   mappingFingerprint,
+  inferWhitelistChanged,
+  normalizeWhitelistResult,
 } = require("./whitelistCityDb");
 const {
   applyNicknameFormat,
@@ -98,36 +100,37 @@ function validateIdentifier(kind, raw) {
 
 function wasWhitelistAlreadyApplied(result) {
   if (!result?.ok) return false;
-  if (result.changed === true) return false;
-  if (result.changed === false) return true;
-  return result.skipped === true || result.code === "already_applied";
+  return !inferWhitelistChanged(result);
 }
 
 function buildWhitelistApplyNotice({ result, approve, autoApproved }) {
-  const alreadyApplied = wasWhitelistAlreadyApplied(result);
-  const changed = result.changed === true;
+  const normalized = normalizeWhitelistResult(result);
+  const freshlyApplied = inferWhitelistChanged(normalized);
+  const alreadyApplied = wasWhitelistAlreadyApplied(normalized);
+  const before = normalized.previousValue ?? "0";
+  const after = normalized.nextValue ?? normalized.currentValue ?? "1";
 
   if (!approve) {
     return buildNoticePayload(
       alreadyApplied ? "Whitelist ja estava removida" : "Whitelist removida",
       alreadyApplied
         ? "O registro da cidade ja estava desligado. Nada foi alterado."
-        : "A whitelist foi removida no banco da cidade e o Discord foi sincronizado.",
+        : `Seu ID estava ligado (${before}) e foi desligado (${after}) no banco da cidade. O Discord foi sincronizado.`,
       "ok",
     );
   }
 
   if (autoApproved) {
-    if (changed) {
+    if (freshlyApplied) {
       return buildNoticePayload(
         "Whitelist liberada",
-        "Seu ID foi encontrado e liberado no banco da cidade. Cargos e nickname foram aplicados no Discord.",
+        `Seu ID estava desligado (${before}) e foi liberado (${after}) no banco da cidade. Cargos e nickname foram aplicados no Discord.`,
         "ok",
       );
     }
     return buildNoticePayload(
       "Whitelist ja liberada",
-      "Este ID ja esta liberado no banco da cidade (1 ou true). Cargos e nickname foram sincronizados no Discord.",
+      `Este ID ja estava liberado no banco da cidade (${after}). Cargos e nickname foram sincronizados no Discord.`,
       "ok",
     );
   }
@@ -135,8 +138,8 @@ function buildWhitelistApplyNotice({ result, approve, autoApproved }) {
   return buildNoticePayload(
     alreadyApplied ? "Whitelist ja estava liberada" : "Whitelist sincronizada",
     alreadyApplied
-      ? "O registro da cidade ja estava liberado. O Discord foi sincronizado."
-      : "O banco da cidade foi atualizado e o Discord foi sincronizado.",
+      ? `O registro da cidade ja estava liberado (${after}). O Discord foi sincronizado.`
+      : `O banco da cidade foi atualizado (${before} -> ${after}) e o Discord foi sincronizado.`,
     "ok",
   );
 }
@@ -212,7 +215,7 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
 
   let result;
   try {
-    result = await operationPromise;
+    result = normalizeWhitelistResult(await operationPromise);
   } catch (error) {
     result = { ok: false, ...sanitizeCityDbError(error) };
   } finally {
@@ -765,10 +768,12 @@ async function applyWhitelistChange({
   try {
     let result;
     try {
-      result = await executeWhitelistOperation(
-        settings,
-        cityOperation,
-        request.identifier_value,
+      result = normalizeWhitelistResult(
+        await executeWhitelistOperation(
+          settings,
+          cityOperation,
+          request.identifier_value,
+        ),
       );
     } catch (error) {
       result = { ok: false, ...sanitizeCityDbError(error) };
