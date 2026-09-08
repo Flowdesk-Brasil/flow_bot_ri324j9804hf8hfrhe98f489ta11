@@ -153,28 +153,138 @@ async function listApplyFailedRequests(limit = 15) {
   return unwrap(result, "listApplyFailedRequests") || [];
 }
 
-async function waitForAgentJob(jobId, timeoutMs = 15000, pollMs = 50) {
+async function getAgentJob(jobId) {
+  const result = await supabase
+    .from(AGENT_JOBS_TABLE)
+    .select("id, status, result, error_message, claimed_at")
+    .eq("id", jobId)
+    .maybeSingle();
+  return unwrap(result, "getAgentJob");
+}
+
+async function requeueStaleAgentJobs(guildId, maxAgeMs = 45000) {
+  if (!guildId) return;
+  const cutoff = new Date(Date.now() - Math.max(5000, Number(maxAgeMs) || 45000)).toISOString();
+  const result = await supabase
+    .from(AGENT_JOBS_TABLE)
+    .update({ status: "queued", claimed_at: null })
+    .eq("guild_id", guildId)
+    .eq("status", "claimed")
+    .lt("claimed_at", cutoff);
+  unwrap(result, "requeueStaleAgentJobs");
+}
+
+async function findPendingAgentJob(guildId, operation, identifierValue) {
+  const result = await supabase
+    .from(AGENT_JOBS_TABLE)
+    .select("id, status, payload, created_at")
+    .eq("guild_id", guildId)
+    .eq("operation", operation)
+    .in("status", ["queued", "claimed"])
+    .order("created_at", { ascending: false })
+    .limit(12);
+  const rows = unwrap(result, "findPendingAgentJob") || [];
+  const target = String(identifierValue || "").trim();
+  return (
+    rows.find((row) => {
+      const payload = row.payload && typeof row.payload === "object" ? row.payload : {};
+      return String(payload.identifierValue || "").trim() === target;
+    }) || null
+  );
+}
+
+async function getLauncherConnectivityHint(guildId) {
+  const result = await supabase
+    .from("launcher_devices")
+    .select("connection_status, last_seen_at, last_error")
+    .eq("guild_id", guildId)
+    .order("last_seen_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  const row = unwrap(result, "getLauncherConnectivityHint");
+  if (!row) {
+    return { online: false, reason: "missing" };
+  }
+  const lastSeen = Date.parse(String(row.last_seen_at || ""));
+  const fresh = Number.isFinite(lastSeen) && Date.now() - lastSeen < 45_000;
+  const online = row.connection_status === "online" && fresh;
+  return {
+    online,
+    reason: row.connection_status || "unknown",
+    lastError: row.last_error || null,
+  };
+}
+
+async function waitForAgentJob(jobId, timeoutMs = 15000, pollMs = 50, options = {}) {
+  const extendIfClaimed = options.extendIfClaimed !== false;
+  const extendMs = Number(options.extendMs || 12000);
+  const maxTotalMs = Number(
+    options.maxTotalMs || timeoutMs + (extendIfClaimed ? extendMs : 0),
+  );
+  const started = Date.now();
+  let extendedOnce = false;
+
   return new Promise((resolve) => {
     let settled = false;
     let pollTimer = null;
+    let watchdog = null;
     let channel = null;
 
     const finish = (row) => {
       if (settled) return;
       settled = true;
       if (pollTimer) clearInterval(pollTimer);
+      if (watchdog) clearTimeout(watchdog);
       if (channel) supabase.removeChannel(channel);
       resolve(row);
     };
 
+    const finishTimeout = () => {
+      finish({
+        id: jobId,
+        status: "timeout",
+        result: null,
+        error_message: "O launcher na VPS nao respondeu a tempo. Deixe o app aberto.",
+      });
+    };
+
+    const scheduleWatchdog = () => {
+      if (watchdog) clearTimeout(watchdog);
+      const elapsed = Date.now() - started;
+      const remainingTotal = maxTotalMs - elapsed;
+      if (remainingTotal <= 0) {
+        void handleTimeout();
+        return;
+      }
+      const phaseLimit = extendedOnce ? maxTotalMs : timeoutMs;
+      const phaseRemaining = Math.max(0, phaseLimit - elapsed);
+      watchdog = setTimeout(
+        () => void handleTimeout(),
+        Math.min(remainingTotal, phaseRemaining || remainingTotal),
+      );
+    };
+
+    const handleTimeout = async () => {
+      try {
+        const row = await getAgentJob(jobId);
+        if (row && (row.status === "done" || row.status === "failed")) {
+          finish(row);
+          return;
+        }
+        if (extendIfClaimed && !extendedOnce && row?.status === "claimed") {
+          extendedOnce = true;
+          scheduleWatchdog();
+          return;
+        }
+      } catch {
+        /* continua para timeout final */
+      }
+      finishTimeout();
+    };
+
     const readRow = async () => {
       try {
-        const result = await supabase
-          .from(AGENT_JOBS_TABLE)
-          .select("id, status, result, error_message")
-          .eq("id", jobId)
-          .maybeSingle();
-        const row = unwrap(result, "waitForAgentJob");
+        const row = await getAgentJob(jobId);
         if (row && (row.status === "done" || row.status === "failed")) {
           finish(row);
         }
@@ -185,6 +295,7 @@ async function waitForAgentJob(jobId, timeoutMs = 15000, pollMs = 50) {
 
     void readRow();
     pollTimer = setInterval(readRow, pollMs);
+    scheduleWatchdog();
 
     try {
       channel = supabase
@@ -208,15 +319,6 @@ async function waitForAgentJob(jobId, timeoutMs = 15000, pollMs = 50) {
     } catch {
       /* fallback apenas com polling */
     }
-
-    setTimeout(() => {
-      finish({
-        id: jobId,
-        status: "queued",
-        result: null,
-        error_message: "O launcher na VPS nao respondeu a tempo. Deixe o app aberto.",
-      });
-    }, timeoutMs);
   });
 }
 
@@ -279,6 +381,10 @@ module.exports = {
   enqueueAgentJob,
   listApplyFailedRequests,
   waitForAgentJob,
+  getAgentJob,
+  requeueStaleAgentJobs,
+  findPendingAgentJob,
+  getLauncherConnectivityHint,
   findQueuedAgentJob,
   listDoneJobsForDiscordSync,
   markJobDiscordSynced,

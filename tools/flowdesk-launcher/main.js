@@ -552,7 +552,7 @@ async function runSync() {
   try {
     const alive = await runHeartbeat();
     if (!alive) {
-      backoffMs = Math.min(backoffMs * 2, 30000);
+      backoffMs = Math.min(Math.max(Math.round(backoffMs * 1.6), 500), 15000);
       return;
     }
     const publicIp = await observePublicIp();
@@ -635,7 +635,7 @@ async function runSync() {
         : "VPS no ar. MySQL pronto neste computador.",
     );
   } catch (error) {
-    backoffMs = Math.min(backoffMs * 2, 30000);
+    backoffMs = Math.min(Math.max(Math.round(backoffMs * 1.6), 500), 15000);
     const message = sanitizeError(error).message;
     logLine(message);
     if (runtime.connection === "online") {
@@ -652,7 +652,7 @@ function startHeartbeatLoop() {
   clearInterval(heartbeatTimer);
   heartbeatTimer = setInterval(() => {
     void runHeartbeat();
-  }, 8000);
+  }, 5000);
 }
 
 function startSyncLoop() {

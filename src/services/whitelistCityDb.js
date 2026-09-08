@@ -427,6 +427,7 @@ async function raceCityOperations(
   launcherCityDb,
   launcherOpts,
 ) {
+  const interactive = launcherOpts?.priority === "interactive";
   const launcherTask = runViaLauncher(
     settings,
     operation,
@@ -453,50 +454,92 @@ async function raceCityOperations(
     }
   })();
 
+  if (interactive) {
+    const direct = await directTask;
+    if (direct?.ok === true) {
+      return normalizeWhitelistResult(direct);
+    }
+    const launcher = await launcherTask;
+    return pickBestWhitelistResult([direct, launcher]);
+  }
+
   const settled = await Promise.allSettled([directTask, launcherTask]);
   const values = settled.map((entry) => (entry.status === "fulfilled" ? entry.value : entry.reason));
   return pickBestWhitelistResult(values);
 }
 
+function buildLauncherWaitMessage(hint) {
+  if (!hint?.online) {
+    if (hint?.reason === "missing") {
+      return "O Flowdesk Launcher nao esta vinculado na VPS. Abra o app, faca login e aguarde ficar online.";
+    }
+    return "O Flowdesk Launcher na VPS esta offline ou reconectando. Abra o app e aguarde aparecer Conectado.";
+  }
+  return "O launcher recebeu a tarefa mas ainda esta sincronizando. Deixe o app aberto e tente de novo em alguns segundos.";
+}
+
 async function runViaLauncher(settings, operation, identifierValue, mapping, cityDb, options = {}) {
   const db = require("./whitelistDbService");
   const fast = options.priority === "interactive";
-  const attempts = fast ? 2 : 3;
-  const timeouts = fast ? [3500, 5500] : [9000, 14000, 14000];
-  const pollMs = fast ? 15 : 50;
+  const attempts = fast ? 3 : 3;
+  const timeouts = fast ? [8000, 12000, 16000] : [9000, 14000, 18000];
+  const pollMs = fast ? 20 : 50;
+  const waitOpts = fast
+    ? { extendIfClaimed: true, extendMs: 14000, maxTotalMs: 28000 }
+    : { extendIfClaimed: true, extendMs: 10000, maxTotalMs: 24000 };
   let last = {
     ok: false,
     code: "offline",
     message: "Nao foi possivel enfileirar o SQL no launcher da VPS.",
   };
+
+  await db.requeueStaleAgentJobs(settings.guild_id, fast ? 25000 : 90000);
+
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    const queued = await db.enqueueAgentJob({
-      guild_id: settings.guild_id,
-      operation,
-      payload: {
-        identifierValue,
-        mapping,
-        cityDb: cityDb || undefined,
-      },
-    });
-    if (!queued?.id) {
-      await sleep(fast ? 150 * attempt : 300 * attempt);
+    await db.requeueStaleAgentJobs(settings.guild_id, fast ? 20000 : 60000);
+
+    let jobId = null;
+    const pending = await db.findPendingAgentJob(settings.guild_id, operation, identifierValue);
+    if (pending?.id) {
+      jobId = pending.id;
+    } else {
+      const queued = await db.enqueueAgentJob({
+        guild_id: settings.guild_id,
+        operation,
+        payload: {
+          identifierValue,
+          mapping,
+          cityDb: cityDb || undefined,
+        },
+      });
+      jobId = queued?.id || null;
+    }
+
+    if (!jobId) {
+      await sleep(fast ? 200 * attempt : 400 * attempt);
       continue;
     }
+
     const finished = await db.waitForAgentJob(
-      queued.id,
+      jobId,
       timeouts[Math.min(attempt - 1, timeouts.length - 1)],
       pollMs,
+      waitOpts,
     );
+
     if (finished.status !== "done") {
+      const hint = await db.getLauncherConnectivityHint(settings.guild_id);
       last = {
         ok: false,
-        code: "vps_timeout",
+        code: finished.status === "timeout" ? "vps_timeout" : "offline",
         message:
           finished.error_message ||
-          "O launcher na VPS ainda esta sincronizando o banco. O pedido continua aberto.",
+          buildLauncherWaitMessage(hint),
       };
-      await sleep(fast ? 200 * attempt : 400 * attempt);
+      if (finished.status === "timeout") {
+        await db.requeueStaleAgentJobs(settings.guild_id, fast ? 15000 : 45000);
+      }
+      await sleep(fast ? 350 * attempt : 600 * attempt);
       continue;
     }
     const result = finished.result && typeof finished.result === "object" ? finished.result : {};
