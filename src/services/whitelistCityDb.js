@@ -4,9 +4,9 @@ const { Client } = require("pg");
 const { decryptWhitelistSecret } = require("../utils/whitelistSecret");
 
 const IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const QUERY_TIMEOUT_MS = 4000;
-const CONNECT_TIMEOUT_MS = 2000;
-const PORT_PROBE_MS = 700;
+const QUERY_TIMEOUT_MS = 3000;
+const CONNECT_TIMEOUT_MS = 1500;
+const PORT_PROBE_MS = 400;
 const PORT_CACHE_MS = 90_000;
 const portProbeCache = new Map();
 
@@ -281,7 +281,7 @@ function settingsToTarget(settings, guildId) {
   };
 }
 
-async function executeWhitelistOperation(settings, operation, identifierValue) {
+async function executeWhitelistOperation(settings, operation, identifierValue, options = {}) {
   const mapping = normalizeMapping(settings.mapping);
   if (!mapping.playerTable || !mapping.playerIdColumn || !mapping.whitelistColumn) {
     throw new Error("Configure a tabela e as colunas da whitelist no painel.");
@@ -292,42 +292,112 @@ async function executeWhitelistOperation(settings, operation, identifierValue) {
   } catch {
     cityTarget = null;
   }
-  const forceDirect = String(settings?.connection_mode || "").toLowerCase() === "direct";
-  const cachedOpen = cityTarget
-    ? portProbeCache.get(`${cityTarget.host}:${Number(cityTarget.port || 3306)}`)
-    : null;
-  const shouldProbe =
-    Boolean(cityTarget) &&
-    (forceDirect || (cachedOpen?.open === true && Date.now() - cachedOpen.at < PORT_CACHE_MS));
-  const portOpen = shouldProbe ? await probeCityPort(cityTarget.host, cityTarget.port) : false;
 
-  if (portOpen) {
+  const launcherCityDb =
+    settingsToLauncherCityDb(settings, settings.guild_id) ||
+    (cityTarget
+      ? {
+          engine: cityTarget.engine,
+          port: cityTarget.port,
+          database: cityTarget.database,
+          user: cityTarget.user,
+          password: cityTarget.password,
+        }
+      : null);
+  const launcherOpts = options.interactive ? { priority: "interactive" } : {};
+  const mode = String(settings?.connection_mode || "direct").toLowerCase();
+
+  if (mode === "agent" || mode === "launcher") {
+    if (cityTarget && options.interactive) {
+      return raceCityOperations(
+        settings,
+        mapping,
+        operation,
+        identifierValue,
+        cityTarget,
+        launcherCityDb,
+        launcherOpts,
+      );
+    }
+    return runViaLauncher(settings, operation, identifierValue, mapping, launcherCityDb, launcherOpts);
+  }
+
+  if (cityTarget) {
+    return raceCityOperations(
+      settings,
+      mapping,
+      operation,
+      identifierValue,
+      cityTarget,
+      launcherCityDb,
+      launcherOpts,
+    );
+  }
+
+  return runViaLauncher(settings, operation, identifierValue, mapping, launcherCityDb, launcherOpts);
+}
+
+async function raceCityOperations(
+  settings,
+  mapping,
+  operation,
+  identifierValue,
+  cityTarget,
+  launcherCityDb,
+  launcherOpts,
+) {
+  const launcherTask = runViaLauncher(
+    settings,
+    operation,
+    identifierValue,
+    mapping,
+    launcherCityDb,
+    launcherOpts,
+  ).then((value) => {
+    if (value?.ok === true || !isRetryableLauncherCode(value?.code)) return value;
+    throw value;
+  });
+
+  const directTask = (async () => {
+    const portOpen = await probeCityPort(cityTarget.host, cityTarget.port);
+    if (!portOpen) {
+      throw { ok: false, code: "port_closed", message: "Porta do banco fechada." };
+    }
     try {
       return await runDirectWhitelistOperation(settings, mapping, operation, identifierValue);
     } catch (error) {
       const sanitized = sanitizeCityDbError(error);
       if (sanitized.code !== "offline" && sanitized.code !== "timeout") {
-        throw error;
+        throw { ok: false, ...sanitized };
       }
-      if (cityTarget) rememberPortState(cityTarget.host, cityTarget.port, false);
+      rememberPortState(cityTarget.host, cityTarget.port, false);
+      throw { ok: false, ...sanitized };
     }
-  }
+  })();
 
-  const launcherCityDb = settingsToLauncherCityDb(settings, settings.guild_id) || (cityTarget
-    ? {
-        engine: cityTarget.engine,
-        port: cityTarget.port,
-        database: cityTarget.database,
-        user: cityTarget.user,
-        password: cityTarget.password,
-      }
-    : null);
-  return runViaLauncher(settings, operation, identifierValue, mapping, launcherCityDb);
+  try {
+    return await Promise.any([directTask, launcherTask]);
+  } catch (aggregate) {
+    const errors = Array.isArray(aggregate?.errors) ? aggregate.errors : [];
+    const meaningful =
+      errors.find((item) => item && typeof item === "object" && item.code && item.code !== "port_closed") ||
+      errors.find((item) => item && typeof item === "object" && item.code === "player_not_found") ||
+      errors[0];
+    if (meaningful && typeof meaningful === "object") return meaningful;
+    return {
+      ok: false,
+      code: "offline",
+      message: "Nao foi possivel conectar ao banco da cidade agora.",
+    };
+  }
 }
 
-async function runViaLauncher(settings, operation, identifierValue, mapping, cityDb) {
+async function runViaLauncher(settings, operation, identifierValue, mapping, cityDb, options = {}) {
   const db = require("./whitelistDbService");
-  const attempts = 3;
+  const fast = options.priority === "interactive";
+  const attempts = fast ? 2 : 3;
+  const timeouts = fast ? [5000, 8000] : [9000, 14000, 14000];
+  const pollMs = fast ? 25 : 50;
   let last = {
     ok: false,
     code: "offline",
@@ -344,10 +414,14 @@ async function runViaLauncher(settings, operation, identifierValue, mapping, cit
       },
     });
     if (!queued?.id) {
-      await sleep(300 * attempt);
+      await sleep(fast ? 150 * attempt : 300 * attempt);
       continue;
     }
-    const finished = await db.waitForAgentJob(queued.id, attempt === 1 ? 9000 : 14000);
+    const finished = await db.waitForAgentJob(
+      queued.id,
+      timeouts[Math.min(attempt - 1, timeouts.length - 1)],
+      pollMs,
+    );
     if (finished.status !== "done") {
       last = {
         ok: false,
@@ -356,7 +430,7 @@ async function runViaLauncher(settings, operation, identifierValue, mapping, cit
           finished.error_message ||
           "O launcher na VPS ainda esta sincronizando o banco. O pedido continua aberto.",
       };
-      await sleep(400 * attempt);
+      await sleep(fast ? 200 * attempt : 400 * attempt);
       continue;
     }
     const result = finished.result && typeof finished.result === "object" ? finished.result : {};
@@ -370,7 +444,7 @@ async function runViaLauncher(settings, operation, identifierValue, mapping, cit
         nextValue: result.nextValue,
       };
       if (!isRetryableLauncherCode(last.code)) return last;
-      await sleep(400 * attempt);
+      await sleep(fast ? 200 * attempt : 400 * attempt);
       continue;
     }
     return {
@@ -445,8 +519,7 @@ async function runDirectWhitelistOperation(settings, mapping, operation, identif
 
     const desired = coerceValue(mapping.valueType, approve ? mapping.valueOn : mapping.valueOff);
     await query(updateSql, [desired, playerKey]);
-    const confirmRows = await query(selectSql, [identifierValue]);
-    const next = confirmRows[0]?.whitelist_value;
+    const nextState = classifyState(mapping, desired);
     return {
       ok: true,
       skipped: false,
@@ -454,8 +527,8 @@ async function runDirectWhitelistOperation(settings, mapping, operation, identif
       code: "applied",
       playerKey,
       previousValue: current == null ? null : String(current),
-      nextValue: next == null ? null : String(next),
-      state: classifyState(mapping, next),
+      nextValue: String(desired),
+      state: nextState,
     };
   });
 }

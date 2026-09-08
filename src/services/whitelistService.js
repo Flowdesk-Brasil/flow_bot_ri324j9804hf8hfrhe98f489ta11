@@ -194,15 +194,29 @@ async function upsertAutoWhitelistRequest({
 }
 
 async function handleAutomaticWhitelistSubmit(interaction, settings, identifierKind, identifierValue) {
+  const operationPromise = executeWhitelistOperation(
+    settings,
+    "APPROVE_WHITELIST",
+    identifierValue,
+    { interactive: true },
+  );
+
+  let deferTimer = null;
   if (!interaction.deferred && !interaction.replied) {
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => null);
+    deferTimer = setTimeout(() => {
+      if (!interaction.deferred && !interaction.replied) {
+        void interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => null);
+      }
+    }, 1800);
   }
 
   let result;
   try {
-    result = await executeWhitelistOperation(settings, "APPROVE_WHITELIST", identifierValue);
+    result = await operationPromise;
   } catch (error) {
     result = { ok: false, ...sanitizeCityDbError(error) };
+  } finally {
+    if (deferTimer) clearTimeout(deferTimer);
   }
 
   const guildId = interaction.guildId;

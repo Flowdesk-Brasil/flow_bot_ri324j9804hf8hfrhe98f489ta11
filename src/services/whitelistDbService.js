@@ -153,7 +153,7 @@ async function listApplyFailedRequests(limit = 15) {
   return unwrap(result, "listApplyFailedRequests") || [];
 }
 
-async function waitForAgentJob(jobId, timeoutMs = 15000) {
+async function waitForAgentJob(jobId, timeoutMs = 15000, pollMs = 50) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     const result = await supabase
@@ -163,7 +163,7 @@ async function waitForAgentJob(jobId, timeoutMs = 15000) {
       .maybeSingle();
     const row = unwrap(result, "waitForAgentJob");
     if (row && (row.status === "done" || row.status === "failed")) return row;
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
   }
   return {
     id: jobId,
