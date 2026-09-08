@@ -207,7 +207,7 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
       if (!interaction.deferred && !interaction.replied) {
         void interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => null);
       }
-    }, 1800);
+    }, 2500);
   }
 
   let result;

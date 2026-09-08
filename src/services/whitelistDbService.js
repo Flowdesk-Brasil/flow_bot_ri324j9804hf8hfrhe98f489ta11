@@ -154,23 +154,70 @@ async function listApplyFailedRequests(limit = 15) {
 }
 
 async function waitForAgentJob(jobId, timeoutMs = 15000, pollMs = 50) {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    const result = await supabase
-      .from(AGENT_JOBS_TABLE)
-      .select("id, status, result, error_message")
-      .eq("id", jobId)
-      .maybeSingle();
-    const row = unwrap(result, "waitForAgentJob");
-    if (row && (row.status === "done" || row.status === "failed")) return row;
-    await new Promise((resolve) => setTimeout(resolve, pollMs));
-  }
-  return {
-    id: jobId,
-    status: "queued",
-    result: null,
-    error_message: "O launcher na VPS nao respondeu a tempo. Deixe o app aberto.",
-  };
+  return new Promise((resolve) => {
+    let settled = false;
+    let pollTimer = null;
+    let channel = null;
+
+    const finish = (row) => {
+      if (settled) return;
+      settled = true;
+      if (pollTimer) clearInterval(pollTimer);
+      if (channel) supabase.removeChannel(channel);
+      resolve(row);
+    };
+
+    const readRow = async () => {
+      try {
+        const result = await supabase
+          .from(AGENT_JOBS_TABLE)
+          .select("id, status, result, error_message")
+          .eq("id", jobId)
+          .maybeSingle();
+        const row = unwrap(result, "waitForAgentJob");
+        if (row && (row.status === "done" || row.status === "failed")) {
+          finish(row);
+        }
+      } catch {
+        /* continua aguardando */
+      }
+    };
+
+    void readRow();
+    pollTimer = setInterval(readRow, pollMs);
+
+    try {
+      channel = supabase
+        .channel(`whitelist-job-${jobId}-${Date.now()}`)
+        .on(
+          "postgres_changes",
+          {
+            event: "UPDATE",
+            schema: "public",
+            table: AGENT_JOBS_TABLE,
+            filter: `id=eq.${jobId}`,
+          },
+          (payload) => {
+            const row = payload.new;
+            if (row && (row.status === "done" || row.status === "failed")) {
+              finish(row);
+            }
+          },
+        )
+        .subscribe();
+    } catch {
+      /* fallback apenas com polling */
+    }
+
+    setTimeout(() => {
+      finish({
+        id: jobId,
+        status: "queued",
+        result: null,
+        error_message: "O launcher na VPS nao respondeu a tempo. Deixe o app aberto.",
+      });
+    }, timeoutMs);
+  });
 }
 
 async function findQueuedAgentJob(guildId, requestId, operation) {

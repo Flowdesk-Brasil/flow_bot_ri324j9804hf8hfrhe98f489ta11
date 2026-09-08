@@ -292,8 +292,6 @@ async function executeJob(target, operation, payload) {
   const desired = coerceValue(mapping.valueType, approve ? mapping.valueOn : mapping.valueOff);
   const updateSql = buildUpdateSql(target.engine, mapping);
   await withCityDatabase(target, (query) => query(updateSql, [desired, playerKey]));
-  const confirmRows = await withCityDatabase(target, (query) => query(selectSql, [identifierValue]));
-  const next = confirmRows[0]?.whitelist_value;
   return {
     ok: true,
     skipped: false,
@@ -301,8 +299,8 @@ async function executeJob(target, operation, payload) {
     code: "applied",
     playerKey,
     previousValue: current == null ? null : String(current),
-    nextValue: next == null ? null : String(next),
-    state: classifyState(mapping, next),
+    nextValue: String(desired),
+    state: classifyState(mapping, desired),
   };
 }
 

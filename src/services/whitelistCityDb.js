@@ -4,11 +4,12 @@ const { Client } = require("pg");
 const { decryptWhitelistSecret } = require("../utils/whitelistSecret");
 
 const IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const QUERY_TIMEOUT_MS = 3000;
-const CONNECT_TIMEOUT_MS = 1500;
-const PORT_PROBE_MS = 400;
-const PORT_CACHE_MS = 90_000;
+const QUERY_TIMEOUT_MS = 2500;
+const CONNECT_TIMEOUT_MS = 1200;
+const PORT_PROBE_MS = 300;
+const PORT_CACHE_MS = 120_000;
 const portProbeCache = new Map();
+const cityPoolCache = new Map();
 
 function isSafeSqlIdentifier(value) {
   return IDENTIFIER_RE.test(String(value || ""));
@@ -184,6 +185,32 @@ function probeCityPort(host, port) {
   });
 }
 
+function poolKey(target) {
+  return `${target.engine}|${target.host}|${target.port}|${target.database}|${target.user}`;
+}
+
+function getMysqlPool(target) {
+  const key = poolKey(target);
+  const existing = cityPoolCache.get(key);
+  if (existing) return existing;
+  const pool = mysql.createPool({
+    host: target.host,
+    port: target.port,
+    database: target.database,
+    user: target.user,
+    password: target.password,
+    ssl: target.ssl ? { rejectUnauthorized: false } : undefined,
+    connectTimeout: CONNECT_TIMEOUT_MS,
+    connectionLimit: 4,
+    maxIdle: 3,
+    idleTimeout: 90_000,
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 0,
+  });
+  cityPoolCache.set(key, pool);
+  return pool;
+}
+
 async function withCityDatabase(target, fn) {
   if (target.engine === "postgres") {
     const client = new Client({
@@ -207,23 +234,11 @@ async function withCityDatabase(target, fn) {
     }
   }
 
-  const connection = await mysql.createConnection({
-    host: target.host,
-    port: target.port,
-    database: target.database,
-    user: target.user,
-    password: target.password,
-    ssl: target.ssl ? { rejectUnauthorized: false } : undefined,
-    connectTimeout: CONNECT_TIMEOUT_MS,
+  const pool = getMysqlPool(target);
+  return fn(async (sql, params = []) => {
+    const [rows] = await pool.execute(sql, params);
+    return Array.isArray(rows) ? rows : [];
   });
-  try {
-    return await fn(async (sql, params = []) => {
-      const [rows] = await connection.execute(sql, params);
-      return Array.isArray(rows) ? rows : [];
-    });
-  } finally {
-    await connection.end().catch(() => null);
-  }
 }
 
 function isUnusableCityHost(value) {
@@ -396,8 +411,8 @@ async function runViaLauncher(settings, operation, identifierValue, mapping, cit
   const db = require("./whitelistDbService");
   const fast = options.priority === "interactive";
   const attempts = fast ? 2 : 3;
-  const timeouts = fast ? [5000, 8000] : [9000, 14000, 14000];
-  const pollMs = fast ? 25 : 50;
+  const timeouts = fast ? [3500, 5500] : [9000, 14000, 14000];
+  const pollMs = fast ? 15 : 50;
   let last = {
     ok: false,
     code: "offline",

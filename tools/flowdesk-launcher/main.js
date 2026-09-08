@@ -26,7 +26,7 @@ let pollTimer = null;
 let syncTimer = null;
 let heartbeatTimer = null;
 let updateTimer = null;
-let backoffMs = 400;
+let backoffMs = 120;
 const runtime = {
   view: "boot",
   message: "Preparando...",
@@ -628,7 +628,7 @@ async function runSync() {
         /* keep polling; the next whitelist job still retries */
       }
     }
-    backoffMs = results.length ? 250 : 400;
+    backoffMs = results.length ? 80 : 120;
     markOnline(
       runtime.publicIp
         ? `VPS no ar. IP ${runtime.publicIp}. MySQL pronto neste computador.`
