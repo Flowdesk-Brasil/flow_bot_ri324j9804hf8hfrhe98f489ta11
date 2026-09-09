@@ -20,14 +20,41 @@ function unwrap(result, operation) {
   return result.data;
 }
 
+function isMissingColumnError(error, column) {
+  const code = String(error?.code || "");
+  const message = String(error?.message || "").toLowerCase();
+  const name = String(column || "").toLowerCase();
+  if (!name) return false;
+  if (code === "PGRST204" || code === "42703") {
+    return message.includes(name);
+  }
+  return (
+    message.includes(name) &&
+    (message.includes("column") ||
+      message.includes("schema cache") ||
+      message.includes("could not find"))
+  );
+}
+
+const SETTINGS_COLUMNS =
+  "guild_id, enabled, panel_channel_id, review_channel_id, logs_channel_id, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, approved_role_ids, denied_role_ids, review_role_ids, identifier_kind, identifier_label, identifier_placeholder, approval_mode, connection_mode, db_engine, db_host, db_port, db_name, db_user, db_ssl, db_password_cipher, mapping, mapping_status, last_health_ok, agent_public_ip, configured_by_user_id, updated_at, nickname_format";
+const SETTINGS_COLUMNS_LEGACY =
+  "guild_id, enabled, panel_channel_id, review_channel_id, logs_channel_id, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, approved_role_ids, denied_role_ids, review_role_ids, identifier_kind, identifier_label, identifier_placeholder, approval_mode, connection_mode, db_engine, db_host, db_port, db_name, db_user, db_ssl, db_password_cipher, mapping, mapping_status, last_health_ok, agent_public_ip, configured_by_user_id, updated_at";
+
 async function getGuildWhitelistSettings(guildId) {
   const result = await supabase
     .from(SETTINGS_TABLE)
-    .select(
-      "guild_id, enabled, panel_channel_id, review_channel_id, logs_channel_id, panel_layout, panel_title, panel_description, panel_button_label, panel_message_id, approved_role_ids, denied_role_ids, review_role_ids, identifier_kind, identifier_label, identifier_placeholder, approval_mode, connection_mode, db_engine, db_host, db_port, db_name, db_user, db_ssl, db_password_cipher, mapping, mapping_status, last_health_ok, agent_public_ip, configured_by_user_id, updated_at",
-    )
+    .select(SETTINGS_COLUMNS)
     .eq("guild_id", guildId)
     .maybeSingle();
+  if (result.error && isMissingColumnError(result.error, "nickname_format")) {
+    const fallback = await supabase
+      .from(SETTINGS_TABLE)
+      .select(SETTINGS_COLUMNS_LEGACY)
+      .eq("guild_id", guildId)
+      .maybeSingle();
+    return unwrap(fallback, "getGuildWhitelistSettings");
+  }
   return unwrap(result, "getGuildWhitelistSettings");
 }
 
@@ -87,14 +114,18 @@ async function findOpenRequest(guildId, userId) {
 }
 
 async function createWhitelistRequest(record) {
-  const result = await supabase
-    .from(REQUESTS_TABLE)
-    .insert({
-      ...record,
-      correlation_id: record.correlation_id || randomUUID(),
-    })
-    .select("*")
-    .single();
+  const payload = {
+    ...record,
+    correlation_id: record.correlation_id || randomUUID(),
+  };
+  const result = await supabase.from(REQUESTS_TABLE).insert(payload).select("*").single();
+  if (result.error && payload.player_name != null && isMissingColumnError(result.error, "player_name")) {
+    const { player_name: playerName, ...rest } = payload;
+    const fallback = await supabase.from(REQUESTS_TABLE).insert(rest).select("*").single();
+    const row = unwrap(fallback, "createWhitelistRequest");
+    if (row) row.player_name = playerName;
+    return row;
+  }
   return unwrap(result, "createWhitelistRequest");
 }
 
@@ -105,6 +136,18 @@ async function updateWhitelistRequest(id, patch) {
     .eq("id", id)
     .select("*")
     .single();
+  if (result.error && patch.player_name != null && isMissingColumnError(result.error, "player_name")) {
+    const { player_name: playerName, ...rest } = patch;
+    const fallback = await supabase
+      .from(REQUESTS_TABLE)
+      .update(rest)
+      .eq("id", id)
+      .select("*")
+      .single();
+    const row = unwrap(fallback, "updateWhitelistRequest");
+    if (row) row.player_name = playerName;
+    return row;
+  }
   return unwrap(result, "updateWhitelistRequest");
 }
 

@@ -3,18 +3,18 @@ const mysql = require("mysql2/promise");
 const { Pool: PgPool } = require("pg");
 const { settleMaybePromise } = require("../utils/settleMaybePromise");
 
-const CONNECT_TIMEOUT_MS = 3000;
-const QUERY_TIMEOUT_MS = 4500;
-const INTERACTIVE_QUERY_TIMEOUT_MS = 6500;
+const CONNECT_TIMEOUT_MS = 10_000;
+const QUERY_TIMEOUT_MS = 8_000;
+const INTERACTIVE_QUERY_TIMEOUT_MS = 12_000;
 const POOL_CONNECTION_LIMIT = 6;
 const POOL_MAX_IDLE = 4;
-const POOL_IDLE_TIMEOUT_MS = 60_000;
-const POOL_QUEUE_LIMIT = 12;
-const MAX_RETRIES = 3;
-const RETRY_BASE_MS = 120;
-const RETRY_MAX_MS = 1800;
-const CIRCUIT_FAILURE_THRESHOLD = 5;
-const CIRCUIT_OPEN_MS = 30_000;
+const POOL_IDLE_TIMEOUT_MS = 90_000;
+const POOL_QUEUE_LIMIT = 16;
+const MAX_RETRIES = 5;
+const RETRY_BASE_MS = 180;
+const RETRY_MAX_MS = 2500;
+const CIRCUIT_FAILURE_THRESHOLD = 6;
+const CIRCUIT_OPEN_MS = 20_000;
 const MAX_CONCURRENT_OPS = 6;
 const HEALTH_CHECK_INTERVAL_MS = 45_000;
 
@@ -173,6 +173,22 @@ function classifyDbError(error) {
   const message = redactSecrets(error?.message || "Falha no banco da cidade.");
   const lowered = message.toLowerCase();
 
+  if (errno === "CIRCUIT_OPEN" || error?.code === "circuit_open") {
+    return {
+      code: "circuit_open",
+      message: "Banco da cidade temporariamente indisponivel. Tente novamente em instantes.",
+      retryable: true,
+      evictPool: false,
+    };
+  }
+  if (/reading ['"]catch['"]/i.test(message)) {
+    return {
+      code: "offline",
+      message: "Falha ao finalizar a conexao com o banco. O sistema reconecta automaticamente.",
+      retryable: true,
+      evictPool: true,
+    };
+  }
   if (errno === "ER_CON_COUNT_ERROR" || lowered.includes("too many connections")) {
     return {
       code: "pool_exhausted",
@@ -255,7 +271,7 @@ function createMysqlPool(target) {
     queueLimit: POOL_QUEUE_LIMIT,
     connectTimeout: CONNECT_TIMEOUT_MS,
     enableKeepAlive: true,
-    keepAliveInitialDelay: 0,
+    keepAliveInitialDelay: 10_000,
     charset: "utf8mb4",
     timezone: "Z",
   });
@@ -280,6 +296,8 @@ function createPgPool(target) {
     connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
     allowExitOnIdle: true,
     statement_timeout: QUERY_TIMEOUT_MS,
+    keepAlive: true,
+    keepAliveInitialDelayMillis: 10_000,
   });
 }
 
@@ -320,7 +338,7 @@ async function pingPool(entry) {
   try {
     await conn.ping();
   } finally {
-    conn.release();
+    await settleMaybePromise(conn.release?.());
   }
 }
 
@@ -350,7 +368,7 @@ async function runMysqlTransaction(pool, fn, queryTimeoutMs) {
     await settleMaybePromise(connection.rollback?.());
     throw error;
   } finally {
-    connection.release();
+    await settleMaybePromise(connection.release?.());
   }
 }
 
@@ -372,7 +390,7 @@ async function runPgTransaction(pool, fn, queryTimeoutMs) {
     await settleMaybePromise(client.query("ROLLBACK"));
     throw error;
   } finally {
-    client.release();
+    await settleMaybePromise(client.release?.());
   }
 }
 

@@ -34,6 +34,7 @@ const CUSTOM_IDS = {
   startWhitelist: "whitelist:request",
   submitWhitelistModal: "whitelist:submit",
   whitelistIdentifierInput: "whitelist:identifier",
+  whitelistPlayerNameInput: "whitelist:player_name",
 };
 
 module.exports = { CUSTOM_IDS };

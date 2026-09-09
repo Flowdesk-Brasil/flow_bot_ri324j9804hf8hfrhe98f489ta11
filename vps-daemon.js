@@ -8,8 +8,24 @@ const os = require('os');
 const cors = require('cors');
 
 const app = express();
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.disable("x-powered-by");
+app.use(cors({ origin: false }));
+app.use(express.json({ limit: "10mb" }));
+app.use((req, res, next) => {
+  res.setHeader("X-Flowdesk-Agent", "vps-daemon");
+  res.setHeader("Cache-Control", "no-store");
+  next();
+});
+
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "flowdesk-vps-daemon",
+    uptime: Math.round(process.uptime()),
+    ts: new Date().toISOString(),
+  });
+});
+app.get("/ping", (req, res) => res.json({ ok: true }));
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 const AUTH_TOKEN =
@@ -37,6 +53,56 @@ if (!fs.existsSync(MINECRAFT_HOSTING_ROOT)) {
   fs.mkdirSync(MINECRAFT_HOSTING_ROOT, { recursive: true });
 }
 
+function ensureRuntimePath() {
+  const extras = [];
+  try {
+    const root = "/www/server/nodejs";
+    if (fs.existsSync(root)) {
+      for (const name of fs.readdirSync(root)) {
+        const bin = path.join(root, name, "bin");
+        if (fs.existsSync(path.join(bin, "node"))) extras.push(bin);
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  extras.push("/usr/local/bin", "/usr/bin", "/bin");
+  process.env.PATH = [...new Set([...extras, ...(process.env.PATH || "").split(":").filter(Boolean)])].join(":");
+}
+ensureRuntimePath();
+
+function canonicalizeAgentPath(value) {
+  const raw = String(value || "/").split("?")[0];
+  return raw.length > 1 && raw.endsWith("/") ? raw.slice(0, -1) : raw || "/";
+}
+
+function serializeAgentBody(body) {
+  if (body === undefined || body === null) return "{}";
+  if (typeof body === "string") {
+    const trimmed = body.trim();
+    return trimmed || "{}";
+  }
+  try {
+    return JSON.stringify(body);
+  } catch {
+    return "{}";
+  }
+}
+
+function signVpsAgentRequest(vpsCode, method, path, serializedBody) {
+  return crypto
+    .createHmac("sha256", AUTH_TOKEN)
+    .update(`${vpsCode}:${method}:${canonicalizeAgentPath(path)}:${serializedBody}`)
+    .digest("hex");
+}
+
+function signaturesMatch(leftHex, rightHex) {
+  const left = Buffer.from(String(leftHex || ""), "utf8");
+  const right = Buffer.from(String(rightHex || ""), "utf8");
+  if (!left.length || left.length !== right.length) return false;
+  return crypto.timingSafeEqual(left, right);
+}
+
 // ─── Auth Middleware ──────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   const auth = req.headers['authorization'] || '';
@@ -46,14 +112,21 @@ app.use((req, res, next) => {
   const signature = String(req.headers['x-flowdesk-signature'] || '');
   const vpsCode = String(req.headers['x-flowdesk-vps'] || req.params?.vpsCode || '');
   if (signature && vpsCode) {
-    const body = req.body === undefined ? undefined : JSON.stringify(req.body);
-    const expected = crypto
-      .createHmac('sha256', AUTH_TOKEN)
-      .update(`${vpsCode}:${req.method}:${req.originalUrl || req.url}:${body || ''}`)
-      .digest('hex');
-    const left = Buffer.from(signature);
-    const right = Buffer.from(expected);
-    if (left.length !== right.length || !crypto.timingSafeEqual(left, right)) {
+    const serializedBody = serializeAgentBody(req.body);
+    const pathCandidates = [...new Set([
+      req.originalUrl,
+      req.url,
+      req.path,
+      canonicalizeAgentPath(req.originalUrl),
+      canonicalizeAgentPath(req.url),
+    ].filter(Boolean))];
+    const bodyCandidates = [...new Set([serializedBody, "{}", ""])];
+    const accepted = pathCandidates.some((pathValue) =>
+      bodyCandidates.some((bodyValue) =>
+        signaturesMatch(signature, signVpsAgentRequest(vpsCode, req.method, pathValue, bodyValue)),
+      ),
+    );
+    if (!accepted) {
       return res.status(401).json({ ok: false, message: "Invalid request signature" });
     }
   }
@@ -191,59 +264,486 @@ function langFromName(name) {
   return map[ext] || 'text';
 }
 
-/** Detect the start command from a project dir */
-function detectStartScript(projectPath) {
-  const pkgPath = path.join(projectPath, 'package.json');
-  if (fs.existsSync(pkgPath)) {
-    try {
-      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-      if (pkg.main) return { interpreter: 'node', script: pkg.main };
-    } catch (_) {}
-    // Check for index.js
-    if (fs.existsSync(path.join(projectPath, 'index.js'))) {
-      return { interpreter: 'node', script: 'index.js' };
-    }
-    if (fs.existsSync(path.join(projectPath, 'src/index.js'))) {
-      return { interpreter: 'node', script: 'src/index.js' };
-    }
-    // Fallback: use npm start
-    return { interpreter: 'npm', script: 'start' };
+function readJsonSafe(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return null;
   }
-  if (fs.existsSync(path.join(projectPath, 'main.py'))) {
-    return { interpreter: 'python3', script: 'main.py' };
+}
+
+function projectFileNames(projectPath) {
+  try {
+    return fs.readdirSync(projectPath).filter((name) => name !== "." && name !== "..");
+  } catch {
+    return [];
   }
-  if (fs.existsSync(path.join(projectPath, 'bot.py'))) {
-    return { interpreter: 'python3', script: 'bot.py' };
+}
+
+function detectFrameworkRecipe(projectPath, incoming) {
+  if (incoming && typeof incoming === "object" && incoming.startCommand) {
+    return {
+      id: incoming.id || "custom",
+      label: incoming.label || "App",
+      installCommand: incoming.installCommand || null,
+      buildCommand: incoming.buildCommand || null,
+      startCommand: String(incoming.startCommand),
+      outputDir: incoming.outputDir || null,
+    };
+  }
+  const persisted = readJsonSafe(path.join(projectPath, ".flowdesk-recipe.json"));
+  if (persisted?.startCommand) return persisted;
+
+  const files = projectFileNames(projectPath);
+  const pkg = readJsonSafe(path.join(projectPath, "package.json"));
+  const has = (name) => files.includes(name);
+  const dep = (name) => Boolean(pkg?.dependencies?.[name] || pkg?.devDependencies?.[name]);
+  const script = (name) => (typeof pkg?.scripts?.[name] === "string" ? pkg.scripts[name] : null);
+
+  if (has("next.config.ts") || has("next.config.js") || has("next.config.mjs") || has("next.config.cjs") || dep("next")) {
+    return {
+      id: "nextjs",
+      label: "Next.js",
+      installCommand: "npm install --production=false",
+      buildCommand: script("build") ? "npm run build" : "npx next build",
+      startCommand: "npx next start -H 0.0.0.0 -p $PORT",
+      outputDir: ".next",
+    };
+  }
+  if (has("nuxt.config.ts") || has("nuxt.config.js") || dep("nuxt")) {
+    return {
+      id: "nuxt",
+      label: "Nuxt",
+      installCommand: "npm install --production=false",
+      buildCommand: script("build") ? "npm run build" : "npx nuxt build",
+      startCommand: script("start") ? "npm start" : "npx nuxt start --port $PORT --hostname 0.0.0.0",
+      outputDir: ".output",
+    };
+  }
+  if (has("vite.config.ts") || has("vite.config.js") || has("vite.config.mjs") || dep("vite")) {
+    return {
+      id: "vite",
+      label: "Vite",
+      installCommand: "npm install --production=false",
+      buildCommand: script("build") ? "npm run build" : "npx vite build",
+      startCommand: "npx vite preview --host 0.0.0.0 --port $PORT",
+      outputDir: "dist",
+    };
+  }
+  if (has("nest-cli.json") || dep("@nestjs/core")) {
+    return {
+      id: "nestjs",
+      label: "NestJS",
+      installCommand: "npm install --production=false",
+      buildCommand: script("build") ? "npm run build" : "npx nest build",
+      startCommand: script("start") ? "npm start" : "node dist/main.js",
+      outputDir: "dist",
+    };
+  }
+  if (pkg) {
+    return {
+      id: "node",
+      label: "Node.js",
+      installCommand: "npm install --production=false",
+      buildCommand: script("build") && !/dev|watch/i.test(script("build")) ? "npm run build" : null,
+      startCommand: script("start") ? "npm start" : pkg.main ? `node ${pkg.main}` : "node index.js",
+      outputDir: null,
+    };
+  }
+  if (has("requirements.txt") || has("main.py") || has("app.py") || has("bot.py")) {
+    const entry = has("app.py") ? "app.py" : has("bot.py") ? "bot.py" : "main.py";
+    return {
+      id: "python",
+      label: "Python",
+      installCommand: has("requirements.txt") ? "pip3 install -r requirements.txt" : null,
+      buildCommand: null,
+      startCommand: `python3 ${entry}`,
+      outputDir: null,
+    };
   }
   return null;
 }
 
-/** Start or restart a project in PM2 with env injection */
-async function pm2StartOrRestart(vpsCode, projectPath) {
-  const detected = detectStartScript(projectPath);
-  if (!detected) throw new Error('Nenhum arquivo de entrada detectado (index.js, main.py, etc). Certifique-se de que o projeto foi clonado corretamente.');
+function persistFrameworkRecipe(projectPath, recipe) {
+  if (!projectPath || !fs.existsSync(projectPath) || !recipe) return;
+  fs.writeFileSync(path.join(projectPath, ".flowdesk-recipe.json"), JSON.stringify(recipe), "utf8");
+}
 
-  const envObj = loadProjectEnv(projectPath);
+function isSafeProjectCommand(command) {
+  return /^(npm|npx|node|python3|pip3|true)\b/.test(String(command || "").trim());
+}
 
-  // Try restart first (if already registered)
+/** Detect the start command from a project dir */
+function detectStartScript(projectPath) {
+  const recipe = detectFrameworkRecipe(projectPath, null);
+  if (recipe?.startCommand) {
+    return { interpreter: "bash", script: recipe.startCommand, recipe };
+  }
+  return null;
+}
+
+function sanitizeGitBranch(value) {
+  const text = String(value || "main").trim();
+  return /^[A-Za-z0-9._/-]+$/.test(text) ? text : "main";
+}
+
+function listProjectNames(projectPath) {
   try {
-    await runCommand(`pm2 restart "${vpsCode}" --update-env`, projectPath, envObj);
-    await runCommand('pm2 save', null, {});
+    return fs.readdirSync(projectPath).filter((name) => name !== "." && name !== "..");
+  } catch {
+    return [];
+  }
+}
+
+function isBareProjectDir(projectPath) {
+  if (!fs.existsSync(projectPath)) return true;
+  const names = listProjectNames(projectPath);
+  if (!names.length) return true;
+  return names.every((name) => name === ".env" || name === ".env.example");
+}
+
+function projectNeedsDeploy(projectPath) {
+  if (isBareProjectDir(projectPath)) return true;
+  if (detectStartScript(projectPath)) return false;
+  return !fs.existsSync(path.join(projectPath, ".git"));
+}
+
+function notifyProjectProvisioned(vpsCode) {
+  if (typeof fetch === "undefined") return;
+  fetch("https://fdesk.flwdesk.com/api/webhooks/vps-provisioned", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      token: FLOWDESK_WEBHOOK_TOKEN,
+      vpsCode,
+      status: "online",
+    }),
+  }).catch(() => {});
+}
+
+async function installProjectDependencies(projectPath, recipe) {
+  const command = recipe?.installCommand;
+  if (command && command !== "true" && isSafeProjectCommand(command)) {
+    await runCommand(command, projectPath);
     return;
-  } catch (_) { /* not registered yet, will start fresh */ }
+  }
+  if (fs.existsSync(path.join(projectPath, "package.json"))) {
+    await runCommand("npm install --production=false", projectPath);
+    return;
+  }
+  if (fs.existsSync(path.join(projectPath, "requirements.txt"))) {
+    await runCommand("pip3 install -r requirements.txt", projectPath).catch(() => {});
+  }
+}
 
-  // Delete stale entry if any
-  await runCommand(`pm2 delete "${vpsCode}"`).catch(() => {});
+async function cloneProjectFromGit(projectPath, gitUrl, branch) {
+  const envBackup = loadProjectEnv(projectPath);
+  const tmpPath = `${projectPath}.clone-tmp`;
+  if (fs.existsSync(tmpPath)) {
+    fs.rmSync(tmpPath, { recursive: true, force: true });
+  }
+  fs.mkdirSync(PROJECTS_DIR, { recursive: true });
+  await runCommand(`git clone --depth=1 -b ${branch} "${gitUrl}" "${tmpPath}"`, PROJECTS_DIR);
+  if (fs.existsSync(projectPath)) {
+    fs.rmSync(projectPath, { recursive: true, force: true });
+  }
+  fs.renameSync(tmpPath, projectPath);
+  if (Object.keys(envBackup).length) {
+    writeProjectEnv(projectPath, { ...loadProjectEnv(projectPath), ...envBackup });
+  }
+}
 
-  let startCmd;
-  if (detected.interpreter === 'npm') {
-    startCmd = `pm2 start npm --name "${vpsCode}" --update-env -- ${detected.script}`;
+function projectHttpPort(vpsCode) {
+  let hash = 0;
+  for (const ch of String(vpsCode)) hash = ((hash * 33) + ch.charCodeAt(0)) >>> 0;
+  return 31000 + (hash % 900);
+}
+
+function nginxConfigDirs() {
+  const preferred = "/www/server/panel/vhost/nginx";
+  if (fs.existsSync(preferred)) return [preferred];
+  const fallback = "/etc/nginx/conf.d";
+  return fs.existsSync(fallback) ? [fallback] : [];
+}
+
+function flowdeskTlsPaths() {
+  return {
+    dir: "/opt/flowdesk/certs",
+    crt: "/opt/flowdesk/certs/flwdesk.crt",
+    key: "/opt/flowdesk/certs/flwdesk.key",
+  };
+}
+
+function ensureFlowdeskTlsCert() {
+  const { dir, crt, key } = flowdeskTlsPaths();
+  if (fs.existsSync(crt) && fs.existsSync(key)) return { crt, key };
+  fs.mkdirSync(dir, { recursive: true });
+  execSync(
+    `openssl req -x509 -nodes -days 825 -newkey rsa:2048 -keyout "${key}" -out "${crt}" -subj "/CN=*.flwdesk.com" -addext "subjectAltName=DNS:*.flwdesk.com,DNS:flwdesk.com"`,
+    { stdio: "ignore" },
+  );
+  return { crt, key };
+}
+
+function nginxSslListenBlock() {
+  const { crt, key } = ensureFlowdeskTlsCert();
+  return `    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    ssl_certificate ${crt};
+    ssl_certificate_key ${key};`;
+}
+
+function normalizeProjectHosts(domains, vpsCode) {
+  const hosts = (Array.isArray(domains) ? domains : [])
+    .map((item) => String(item || "").trim().toLowerCase())
+    .filter((item) => /^[a-z0-9][a-z0-9.-]*[a-z0-9]$/.test(item) || /^[a-z0-9]$/.test(item));
+  const fallback = `${String(vpsCode || "site").toLowerCase()}.flwdesk.com`;
+  if (!hosts.includes(fallback)) hosts.push(fallback);
+  return [...new Set(hosts)];
+}
+
+function persistProjectHosts(projectPath, hosts) {
+  if (!projectPath || !fs.existsSync(projectPath) || !hosts.length) return;
+  fs.writeFileSync(path.join(projectPath, ".flowdesk-domains.json"), JSON.stringify(hosts), "utf8");
+}
+
+function loadPersistedHosts(projectPath) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(projectPath, ".flowdesk-domains.json"), "utf8"));
+    return Array.isArray(raw) ? raw.map((item) => String(item || "")).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+function projectLooksBuilt(projectPath, recipe) {
+  const outputDir = recipe?.outputDir;
+  if (outputDir === ".next") return fs.existsSync(path.join(projectPath, ".next", "BUILD_ID"));
+  if (outputDir && outputDir !== ".") return fs.existsSync(path.join(projectPath, outputDir));
+  return fs.existsSync(path.join(projectPath, ".next", "BUILD_ID"))
+    || fs.existsSync(path.join(projectPath, "dist", "index.js"));
+}
+
+async function buildProjectIfNeeded(projectPath, recipe) {
+  const command = recipe?.buildCommand;
+  if (!command || !isSafeProjectCommand(command)) return;
+  if (projectLooksBuilt(projectPath, recipe)) return;
+  await runCommand(command, projectPath);
+}
+
+function writeFlowdeskErrorPages() {
+  const dir = "/opt/flowdesk/error-pages";
+  fs.mkdirSync(dir, { recursive: true });
+  const shell = (code, title, text) => `<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${code} — Flowdesk</title>
+  <style>
+    :root { color-scheme: light; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #fafafa; color: #111; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+    main { width: min(520px, calc(100vw - 48px)); }
+    p.kicker { margin: 0 0 16px; font-size: 13px; letter-spacing: .16em; text-transform: uppercase; color: #8a8a8a; }
+    h1 { margin: 0 0 12px; font-size: 44px; letter-spacing: -.04em; }
+    p.copy { margin: 0; line-height: 1.6; color: #666; }
+    a { color: #111; }
+  </style>
+</head>
+<body>
+  <main>
+    <p class="kicker">Flowdesk Hosting</p>
+    <h1>${title}</h1>
+    <p class="copy">${text}</p>
+  </main>
+</body>
+</html>`;
+  fs.writeFileSync(path.join(dir, "404.html"), shell("404", "404", "Este projeto nao existe ou ainda nao foi publicado. Confira o subdominio no painel da VPS."));
+  fs.writeFileSync(path.join(dir, "500.html"), shell("500", "500", "O site encontrou um erro temporario. Tente novamente em instantes."));
+  fs.writeFileSync(path.join(dir, "502.html"), shell("502", "502", "O projeto ainda esta subindo ou ficou offline. Inicie a VPS no painel Flowdesk."));
+}
+
+function writeNginxFile(fileName, contents) {
+  for (const dir of nginxConfigDirs()) {
+    fs.writeFileSync(path.join(dir, fileName), contents, "utf8");
+  }
+}
+
+function writeDefaultCustomerNginx() {
+  writeFlowdeskErrorPages();
+  writeNginxFile("flowdesk-default.conf", `server {
+    listen 80;
+    listen [::]:80;
+${nginxSslListenBlock()}
+    server_name *.flwdesk.com;
+    root /opt/flowdesk/error-pages;
+    error_page 404 /404.html;
+    error_page 500 /500.html;
+    error_page 502 503 504 /502.html;
+    location / {
+        try_files $uri /404.html;
+    }
+    location = /404.html { }
+    location = /500.html { }
+    location = /502.html { }
+}
+`);
+}
+
+function writeProjectNginx(vpsCode, domains, port) {
+  const hosts = normalizeProjectHosts(domains, vpsCode);
+  writeNginxFile(`flowdesk-${vpsCode}.conf`, `server {
+    listen 80;
+    listen [::]:80;
+${nginxSslListenBlock()}
+    server_name ${hosts.join(" ")};
+    client_max_body_size 32m;
+    error_page 404 /flowdesk-404.html;
+    error_page 500 /flowdesk-500.html;
+    error_page 502 503 504 /flowdesk-502.html;
+    location = /flowdesk-404.html { alias /opt/flowdesk/error-pages/404.html; }
+    location = /flowdesk-500.html { alias /opt/flowdesk/error-pages/500.html; }
+    location = /flowdesk-502.html { alias /opt/flowdesk/error-pages/502.html; }
+    location / {
+        proxy_pass http://127.0.0.1:${port};
+        proxy_http_version 1.1;
+        proxy_connect_timeout 3s;
+        proxy_read_timeout 60s;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_intercept_errors on;
+    }
+}
+`);
+  return hosts;
+}
+
+async function reloadNginx() {
+  await runCommand("nginx -t && nginx -s reload").catch(() =>
+    runCommand("/etc/init.d/nginx reload").catch(() => null),
+  );
+}
+
+async function publishProjectHttp(vpsCode, projectPath, domains) {
+  const port = projectHttpPort(vpsCode);
+  const envObj = loadProjectEnv(projectPath);
+  envObj.PORT = String(port);
+  envObj.HOST = "0.0.0.0";
+  envObj.HOSTNAME = "0.0.0.0";
+  if (fs.existsSync(projectPath)) {
+    writeProjectEnv(projectPath, envObj);
+  }
+  const hosts = normalizeProjectHosts([
+    ...(Array.isArray(domains) ? domains : []),
+    ...loadPersistedHosts(projectPath),
+  ], vpsCode);
+  persistProjectHosts(projectPath, hosts);
+  writeDefaultCustomerNginx();
+  writeProjectNginx(vpsCode, hosts, port);
+  await reloadNginx();
+  return port;
+}
+
+async function ensureCustomerHttpStack() {
+  try {
+    writeDefaultCustomerNginx();
+    await reloadNginx();
+  } catch (error) {
+    console.error("[Flowdesk Daemon] Falha ao publicar nginx padrao:", error.message);
+  }
+}
+
+async function deployProject(vpsCode, projectPath, input = {}) {
+  const gitUrl = String(input.gitUrl || "").trim();
+  const branch = sanitizeGitBranch(input.branch);
+
+  if (fs.existsSync(path.join(projectPath, ".git"))) {
+    await runCommand(`git fetch origin && git reset --hard origin/${branch}`, projectPath);
+  } else if (gitUrl) {
+    await cloneProjectFromGit(projectPath, gitUrl, branch);
   } else {
-    startCmd = `pm2 start ${detected.interpreter} --name "${vpsCode}" --update-env -- ${detected.script}`;
+    const error = new Error("gitUrl obrigatorio para deploy inicial.");
+    error.code = "needs_deploy";
+    throw error;
   }
 
-  await runCommand(startCmd, projectPath, envObj);
-  await runCommand('pm2 save', null, {});
+  const recipe = detectFrameworkRecipe(projectPath, input.framework);
+  persistFrameworkRecipe(projectPath, recipe);
+  await installProjectDependencies(projectPath, recipe);
+  await buildProjectIfNeeded(projectPath, recipe);
+  const port = await publishProjectHttp(vpsCode, projectPath, input.domains);
+  await pm2StartOrRestart(vpsCode, projectPath, recipe);
+  notifyProjectProvisioned(vpsCode);
+  return {
+    ok: true,
+    status: "online",
+    autoDeployed: true,
+    port,
+    framework: recipe,
+    message: recipe?.label
+      ? `Deploy ${recipe.label} concluido e projeto no ar.`
+      : "Deploy concluido e projeto iniciado.",
+  };
+}
+
+async function startOrRestartProject(vpsCode, projectPath, input = {}) {
+  if (projectNeedsDeploy(projectPath)) {
+    if (!String(input.gitUrl || "").trim()) {
+      const error = new Error("Projeto ainda nao foi deployado. O sistema inicia o deploy automaticamente quando o GitHub esta vinculado.");
+      error.code = "needs_deploy";
+      throw error;
+    }
+    return deployProject(vpsCode, projectPath, input);
+  }
+  const recipe = detectFrameworkRecipe(projectPath, input.framework);
+  persistFrameworkRecipe(projectPath, recipe);
+  await buildProjectIfNeeded(projectPath, recipe);
+  const port = await publishProjectHttp(vpsCode, projectPath, input.domains);
+  await pm2StartOrRestart(vpsCode, projectPath, recipe);
+  return { ok: true, status: "online", autoDeployed: false, port, framework: recipe };
+}
+
+function buildPm2App(vpsCode, projectPath, recipe, envObj) {
+  const start = String(recipe?.startCommand || "npm start").replace(/\$PORT/g, String(envObj.PORT || "3000"));
+  if (!isSafeProjectCommand(start)) {
+    throw new Error("Comando de start do projeto nao permitido.");
+  }
+  if (start === "npm start") {
+    return { name: vpsCode, cwd: projectPath, script: "npm", args: "start", env: envObj, autorestart: true };
+  }
+  return {
+    name: vpsCode,
+    cwd: projectPath,
+    script: "bash",
+    args: `-lc ${JSON.stringify(start)}`,
+    env: envObj,
+    autorestart: true,
+  };
+}
+
+/** Start or restart a project in PM2 with env injection */
+async function pm2StartOrRestart(vpsCode, projectPath, incomingRecipe) {
+  const recipe = incomingRecipe || detectFrameworkRecipe(projectPath, null);
+  if (!recipe?.startCommand) {
+    throw new Error("Nenhum arquivo de entrada detectado (Next.js, Node, Python). Confira se o repositorio foi clonado.");
+  }
+
+  const envObj = loadProjectEnv(projectPath);
+  const ecoPath = path.join(projectPath, ".flowdesk-pm2.json");
+  fs.writeFileSync(ecoPath, JSON.stringify({ apps: [buildPm2App(vpsCode, projectPath, recipe, envObj)] }), "utf8");
+
+  try {
+    await runCommand(`pm2 delete "${vpsCode}"`).catch(() => {});
+    await runCommand(`pm2 start "${ecoPath}" --update-env`, projectPath, envObj);
+  } catch (error) {
+    throw new Error(error.message || "Falha ao iniciar o processo no PM2.");
+  }
+  await runCommand("pm2 save", null, {});
 }
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
@@ -1609,54 +2109,19 @@ app.post('/v1/vps/:vpsCode/actions/:action', async (req, res) => {
   try {
     // ── DEPLOY ──────────────────────────────────────────
     if (action === 'deploy') {
-      const { gitUrl, branch = 'main' } = req.body;
-
-      if (fs.existsSync(path.join(projectPath, '.git'))) {
-        // Already cloned — pull latest
-        await runCommand(`git fetch origin && git reset --hard origin/${branch}`, projectPath);
-      } else if (gitUrl) {
-        // Fresh clone
-        fs.mkdirSync(projectPath, { recursive: true });
-        await runCommand(`git clone --depth=1 -b ${branch} "${gitUrl}" "${projectPath}"`, PROJECTS_DIR);
-      } else {
-        return res.status(400).json({ ok: false, message: 'gitUrl obrigatório para deploy inicial.' });
-      }
-
-      // Install dependencies
-      if (fs.existsSync(path.join(projectPath, 'package.json'))) {
-        await runCommand('npm install --production=false', projectPath);
-      } else if (fs.existsSync(path.join(projectPath, 'requirements.txt'))) {
-        await runCommand('pip3 install -r requirements.txt', projectPath).catch(() => {});
-      }
-
-      // Start
-      await pm2StartOrRestart(vpsCode, projectPath);
-
-      // Notify Flowdesk backend to exit provisioning
-      try {
-        if (typeof fetch !== "undefined") {
-          fetch("https://fdesk.flwdesk.com/api/webhooks/vps-provisioned", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              token: FLOWDESK_WEBHOOK_TOKEN,
-              vpsCode,
-              status: "online"
-            })
-          }).catch(() => {});
-        }
-      } catch(err) {}
-
-      return res.json({ ok: true, status: 'online', message: 'Deploy concluído.' });
+      const result = await deployProject(vpsCode, projectPath, req.body || {});
+      return res.json(result);
     }
 
     // ── START ────────────────────────────────────────────
     if (action === 'start') {
-      if (!fs.existsSync(projectPath)) {
-        return res.status(400).json({ ok: false, message: 'Projeto ainda não foi deployado. Clique em Deploy primeiro.' });
-      }
-      await pm2StartOrRestart(vpsCode, projectPath);
-      return res.json({ ok: true, status: 'online' });
+      const result = await startOrRestartProject(vpsCode, projectPath, req.body || {});
+      return res.json({
+        ...result,
+        message: result.autoDeployed
+          ? 'Deploy inicial concluido e projeto iniciado.'
+          : result.message || 'Projeto iniciado.',
+      });
     }
 
     // ── STOP ─────────────────────────────────────────────
@@ -1678,11 +2143,13 @@ app.post('/v1/vps/:vpsCode/actions/:action', async (req, res) => {
 
     // ── RESTART ──────────────────────────────────────────
     if (action === 'restart') {
-      if (!fs.existsSync(projectPath)) {
-        return res.status(400).json({ ok: false, message: 'Projeto ainda não foi deployado. Clique em Deploy primeiro.' });
-      }
-      await pm2StartOrRestart(vpsCode, projectPath);
-      return res.json({ ok: true, status: 'online' });
+      const result = await startOrRestartProject(vpsCode, projectPath, req.body || {});
+      return res.json({
+        ...result,
+        message: result.autoDeployed
+          ? 'Deploy automatico concluido e projeto reiniciado.'
+          : result.message || 'Projeto reiniciado.',
+      });
     }
 
     // ── ROLLBACK / SYNC (passthrough) ────────────────────
@@ -1690,7 +2157,13 @@ app.post('/v1/vps/:vpsCode/actions/:action', async (req, res) => {
 
   } catch (err) {
     console.error(`[Daemon] Action ${action} failed for ${vpsCode}:`, err.message);
-    res.status(500).json({ ok: false, status: 'crashed', message: err.message });
+    const needsDeploy = err.code === "needs_deploy" || /deploy/i.test(String(err.message || ""));
+    res.status(needsDeploy ? 400 : 500).json({
+      ok: false,
+      status: needsDeploy ? "offline" : "crashed",
+      code: err.code || (needsDeploy ? "needs_deploy" : null),
+      message: err.message,
+    });
   }
 });
 
@@ -1832,10 +2305,11 @@ app.get('/v1/vps/:vpsCode/logs', async (req, res) => {
   }
 });
 
-// ── Health / Ping ─────────────────────────────────────────────────────────────
-app.get('/ping', (req, res) => res.json({ ok: true }));
-
-// ─── Start Server ─────────────────────────────────────────────────────────────
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[Flowdesk Daemon] Listening on ${PORT}`);
+const server = app.listen(PORT, process.env.DAEMON_BIND || "127.0.0.1", () => {
+  console.log(`[Flowdesk Daemon] Listening on ${process.env.DAEMON_BIND || "127.0.0.1"}:${PORT}`);
+  ensureCustomerHttpStack();
 });
+server.keepAliveTimeout = 75_000;
+server.headersTimeout = 80_000;
+server.requestTimeout = 180_000;
+server.timeout = 180_000;

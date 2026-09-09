@@ -17,6 +17,22 @@ function resolveNicknameFormat(settings) {
   );
 }
 
+function sanitizePlayerName(value) {
+  const text = String(value || "")
+    .replace(/[\u0000-\u001F\u007F]/g, "")
+    .replace(/[<>@#:`*_~|]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 24);
+  if (text.length < 2) {
+    return { ok: false, message: "Informe seu nome do jogo com pelo menos 2 letras." };
+  }
+  if (!/[A-Za-zÀ-ÿ]/.test(text)) {
+    return { ok: false, message: "O nome precisa ter letras. Nao use so numeros ou simbolos." };
+  }
+  return { ok: true, value: text };
+}
+
 function applyNicknameFormat(format, nome, id) {
   const safeId = String(id || "")
     .replace(/[\u0000-\u001F\u007F]/g, "")
@@ -43,4 +59,5 @@ module.exports = {
   normalizeNicknameFormat,
   resolveNicknameFormat,
   applyNicknameFormat,
+  sanitizePlayerName,
 };

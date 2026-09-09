@@ -25,7 +25,9 @@ const {
 const {
   applyNicknameFormat,
   resolveNicknameFormat,
+  sanitizePlayerName,
 } = require("../utils/whitelistNickname");
+const { settleMaybePromise } = require("../utils/settleMaybePromise");
 
 const WHITELIST_REVIEW_PREFIX = "whitelist:";
 const COMPONENT_TYPE = { ACTION_ROW: 1, BUTTON: 2, TEXT_DISPLAY: 10, CONTAINER: 17 };
@@ -173,6 +175,7 @@ async function upsertAutoWhitelistRequest({
   userId,
   identifierKind,
   identifierValue,
+  playerName,
   correlationId,
 }) {
   const openRequest = await whitelistDb.findOpenRequest(guildId, userId);
@@ -181,6 +184,9 @@ async function upsertAutoWhitelistRequest({
       identifier_kind: identifierKind,
       identifier_value: identifierValue,
       correlation_id: correlationId,
+      ...(playerName || openRequest.player_name
+        ? { player_name: playerName || openRequest.player_name }
+        : {}),
     });
   }
   try {
@@ -191,6 +197,7 @@ async function upsertAutoWhitelistRequest({
       identifier_value: identifierValue,
       status: "pending",
       correlation_id: correlationId,
+      ...(playerName ? { player_name: playerName } : {}),
     });
   } catch {
     const retryOpen = await whitelistDb.findOpenRequest(guildId, userId);
@@ -199,7 +206,7 @@ async function upsertAutoWhitelistRequest({
   }
 }
 
-async function handleAutomaticWhitelistSubmit(interaction, settings, identifierKind, identifierValue) {
+async function handleAutomaticWhitelistSubmit(interaction, settings, identifierKind, identifierValue, playerName) {
   const operationPromise = executeWhitelistOperation(
     settings,
     "APPROVE_WHITELIST",
@@ -211,7 +218,7 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
   if (!interaction.deferred && !interaction.replied) {
     deferTimer = setTimeout(() => {
       if (!interaction.deferred && !interaction.replied) {
-        void interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => null);
+        void settleMaybePromise(interaction.deferReply({ flags: MessageFlags.Ephemeral }));
       }
     }, 2500);
   }
@@ -254,6 +261,7 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
         userId: interaction.user.id,
         identifierKind,
         identifierValue,
+        playerName,
         correlationId,
       });
     } catch {
@@ -292,6 +300,7 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
       userId: interaction.user.id,
       identifierKind,
       identifierValue,
+      playerName,
       correlationId,
     });
   } catch {
@@ -323,19 +332,21 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
   );
 }
 
-async function applyApprovedNickname(guild, userId, settings, identifierValue) {
+async function applyApprovedNickname(guild, userId, settings, identifierValue, playerName) {
   const member =
     guild.members.cache.get(userId) || (await guild.members.fetch(userId).catch(() => null));
   if (!member) return;
-  const displayName =
-    member.displayName || member.user?.globalName || member.user?.username || "Jogador";
+  const parsedName = sanitizePlayerName(playerName);
+  const displayName = parsedName.ok
+    ? parsedName.value
+    : member.displayName || member.user?.globalName || member.user?.username || "Jogador";
   const nextNick = applyNicknameFormat(
     resolveNicknameFormat(settings),
     displayName,
     identifierValue,
   );
   if (!nextNick || member.nickname === nextNick || member.displayName === nextNick) return;
-  await member.setNickname(nextNick).catch(() => null);
+  await settleMaybePromise(member.setNickname(nextNick));
 }
 
 function buildNoticePayload(title, message, tone = "error") {
@@ -357,15 +368,19 @@ function buildNoticePayload(title, message, tone = "error") {
 }
 
 async function replyEphemeral(interaction, payload) {
-  if (interaction.deferred && !interaction.replied) {
-    await interaction.editReply(payload).catch(() => interaction.followUp(payload).catch(() => null));
-    return;
+  try {
+    if (interaction.deferred && !interaction.replied) {
+      await interaction.editReply(payload);
+      return;
+    }
+    if (interaction.replied) {
+      await interaction.followUp(payload);
+      return;
+    }
+    await interaction.reply(payload);
+  } catch {
+    await settleMaybePromise(interaction.followUp?.(payload));
   }
-  if (interaction.replied) {
-    await interaction.followUp(payload).catch(() => null);
-    return;
-  }
-  await interaction.reply(payload);
 }
 
 function isWhitelistButtonInteraction(interaction) {
@@ -437,6 +452,9 @@ function buildReviewPayload({ request, member, identifierKind, identifierValue, 
           content: [
             "### Solicitacao de whitelist",
             `**Membro:** ${mention}`,
+            request.player_name
+              ? `**Nome:** \`${clampText(request.player_name, 40)}\``
+              : "",
             `**Identificador (${identifierKind}):** \`${clampText(identifierValue, 80)}\``,
             `**Status:** ${statusLabel}`,
             `**Pedido:** \`${request.id}\``,
@@ -537,7 +555,7 @@ async function showWhitelistModal(interaction) {
   const identifierKind = String(settings.identifier_kind || "discord_id");
   const label = clampText(settings.identifier_label || "ID / License", 45);
   const placeholder = clampText(
-    settings.identifier_placeholder || "Informe seu ID, license ou token",
+    settings.identifier_placeholder || "Coloque seu ID do jogo",
     100,
   );
 
@@ -548,7 +566,7 @@ async function showWhitelistModal(interaction) {
   const identifierInput = new TextInputBuilder()
     .setCustomId(CUSTOM_IDS.whitelistIdentifierInput)
     .setLabel(label)
-    .setPlaceholder(placeholder)
+    .setPlaceholder(placeholder || "Coloque seu ID do jogo")
     .setStyle(TextInputStyle.Short)
     .setRequired(true)
     .setMinLength(1)
@@ -558,7 +576,19 @@ async function showWhitelistModal(interaction) {
     identifierInput.setValue(interaction.user.id);
   }
 
-  modal.addComponents(new ActionRowBuilder().addComponents(identifierInput));
+  const nameInput = new TextInputBuilder()
+    .setCustomId(CUSTOM_IDS.whitelistPlayerNameInput)
+    .setLabel("SEU NOME")
+    .setPlaceholder("Coloque seu NOME do jogo")
+    .setStyle(TextInputStyle.Short)
+    .setRequired(true)
+    .setMinLength(2)
+    .setMaxLength(24);
+
+  modal.addComponents(
+    new ActionRowBuilder().addComponents(identifierInput),
+    new ActionRowBuilder().addComponents(nameInput),
+  );
   await interaction.showModal(modal);
 }
 
@@ -594,6 +624,30 @@ async function handleWhitelistModalSubmit(interaction) {
   }
   const identifierValue = parsedIdentifier.value;
 
+  let playerName = "";
+  try {
+    const parsedName = sanitizePlayerName(
+      interaction.fields.getTextInputValue(CUSTOM_IDS.whitelistPlayerNameInput),
+    );
+    if (!parsedName.ok) {
+      await replyEphemeral(
+        interaction,
+        buildNoticePayload("Nome invalido", parsedName.message),
+      );
+      return;
+    }
+    playerName = parsedName.value;
+  } catch {
+    await replyEphemeral(
+      interaction,
+      buildNoticePayload(
+        "Nome obrigatorio",
+        "Informe seu nome do jogo. Esse nome sera usado no nick apos a liberacao.",
+      ),
+    );
+    return;
+  }
+
   if (!consumeAttempt(guildId, interaction.user.id).ok) {
     await replyEphemeral(
       interaction,
@@ -609,7 +663,13 @@ async function handleWhitelistModalSubmit(interaction) {
   const isAutomatic = String(settings.approval_mode || "manual") === "automatic";
 
   if (isAutomatic) {
-    await handleAutomaticWhitelistSubmit(interaction, settings, identifierKind, identifierValue);
+    await handleAutomaticWhitelistSubmit(
+      interaction,
+      settings,
+      identifierKind,
+      identifierValue,
+      playerName,
+    );
     return;
   }
 
@@ -644,6 +704,7 @@ async function handleWhitelistModalSubmit(interaction) {
       user_id: interaction.user.id,
       identifier_kind: identifierKind,
       identifier_value: identifierValue,
+      player_name: playerName,
       status: "pending",
       correlation_id: correlationId,
     });
@@ -710,6 +771,7 @@ async function handleWhitelistModalSubmit(interaction) {
     color: 0x3d8bff,
     lines: [
       `**Membro:** ${interaction.user} (\`${interaction.user.id}\`)`,
+      `**Nome:** \`${playerName}\``,
       `**Identificador:** \`${identifierKind}\` \`${identifierValue}\``,
       `**Pedido:** \`${request.id}\``,
     ],
@@ -895,6 +957,7 @@ async function persistWhitelistSuccess({
     player_key: result.playerKey || null,
     previous_whitelist_value: result.previousValue ?? null,
     next_whitelist_value: result.nextValue ?? null,
+    ...(request.player_name ? { player_name: request.player_name } : {}),
   });
   await Promise.all([
     whitelistDb.insertWhitelistAudit({
@@ -924,6 +987,7 @@ async function persistWhitelistSuccess({
           request.user_id,
           settings,
           request.identifier_value,
+          request.player_name,
         )
       : Promise.resolve(),
     refreshReviewMessage(interaction.guild, nextRequest, settings),
@@ -939,13 +1003,14 @@ async function persistWhitelistSuccess({
       lines: [
         `**Pedido:** \`${request.id}\``,
         `**Membro:** <@${request.user_id}>`,
+        request.player_name ? `**Nome:** \`${clampText(request.player_name, 40)}\`` : "",
         `**Identificador:** \`${request.identifier_value}\``,
         `**Jogador:** \`${result.playerKey || "-"}\``,
         `**Antes:** \`${result.previousValue ?? "null"}\``,
         `**Depois:** \`${result.nextValue ?? "null"}\``,
         `**Staff:** ${autoApproved ? "Automatico" : `${interaction.user} (\`${interaction.user.id}\`)`}`,
         `**Correlation:** \`${correlationId}\``,
-      ],
+      ].filter(Boolean),
     }),
   ]).catch(() => null);
 }
@@ -955,7 +1020,7 @@ async function handleWhitelistReviewInteraction(interaction) {
   if (!parsed || !interaction.guildId || !interaction.guild) return;
 
   if (!interaction.deferred && !interaction.replied) {
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => null);
+    await settleMaybePromise(interaction.deferReply({ flags: MessageFlags.Ephemeral }));
   }
 
   const runtime = await getGuildWhitelistRuntime(interaction.guildId);
@@ -1118,7 +1183,13 @@ async function retryFailedWhitelistApplies(client) {
         next_whitelist_value: result.nextValue ?? null,
       });
       await assignRoles(guild, request.user_id, settings.approved_role_ids, settings.denied_role_ids);
-      await applyApprovedNickname(guild, request.user_id, settings, request.identifier_value);
+      await applyApprovedNickname(
+        guild,
+        request.user_id,
+        settings,
+        request.identifier_value,
+        request.player_name,
+      );
       await sendWhitelistLog({
         guild,
         settings,
@@ -1127,6 +1198,7 @@ async function retryFailedWhitelistApplies(client) {
         lines: [
           `**Pedido:** \`${request.id}\``,
           `**Membro:** <@${request.user_id}>`,
+          request.player_name ? `**Nome:** \`${clampText(request.player_name, 40)}\`` : "",
           `**Jogador:** \`${result.playerKey || request.player_key || "-"}\``,
         ],
       });
@@ -1165,6 +1237,13 @@ async function reconcileCompletedAgentJobs(client) {
       if (request.status === "approved" || request.status === "denied") {
         if (approve) {
           await assignRoles(guild, request.user_id, settings.approved_role_ids, settings.denied_role_ids);
+          await applyApprovedNickname(
+            guild,
+            request.user_id,
+            settings,
+            request.identifier_value,
+            request.player_name,
+          );
         } else {
           await assignRoles(guild, request.user_id, settings.denied_role_ids, settings.approved_role_ids);
         }

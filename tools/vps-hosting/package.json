@@ -1,0 +1,10 @@
+{
+  "name": "flowdesk-vps-daemon",
+  "private": true,
+  "version": "1.0.0",
+  "main": "vps-daemon.js",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2"
+  }
+}

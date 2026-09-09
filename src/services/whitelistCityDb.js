@@ -568,6 +568,7 @@ function isRetryableLauncherCode(code) {
     "timeout",
     "vps_timeout",
     "pool_exhausted",
+    "circuit_open",
     "missing_credentials",
     "invalid_credentials",
   ].includes(String(code || ""));
@@ -681,19 +682,6 @@ function mappingFingerprint(mapping) {
 }
 
 function sanitizeCityDbError(error) {
-  const raw = String(error?.message || "");
-  if (/reading ['"]catch['"]/i.test(raw)) {
-    return {
-      code: "db_error",
-      message: "Falha ao finalizar a conexao com o banco. Tente conectar novamente.",
-    };
-  }
-  if (error?.code === "circuit_open") {
-    return {
-      code: "offline",
-      message: "Banco da cidade temporariamente indisponivel. Tente novamente em instantes.",
-    };
-  }
   const classified = classifyDbError(error);
   return { code: classified.code, message: classified.message };
 }
