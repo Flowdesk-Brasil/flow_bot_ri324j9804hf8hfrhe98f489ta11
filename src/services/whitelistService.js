@@ -21,6 +21,7 @@ const {
   inferWhitelistChanged,
   normalizeWhitelistResult,
   healthCheckActivePools,
+  warmupWhitelistRoute,
 } = require("./whitelistCityDb");
 const {
   applyNicknameFormat,
@@ -35,6 +36,19 @@ const COMPONENT_TYPE = { ACTION_ROW: 1, BUTTON: 2, TEXT_DISPLAY: 10, CONTAINER: 
 const applyingLocks = new Set();
 const retryingFailedApplies = new Set();
 const attemptWindow = new Map();
+const warmRuntimeCache = new Map();
+const WARM_RUNTIME_MS = 90_000;
+
+function rememberWarmRuntime(guildId, runtime, settings) {
+  if (!guildId || !settings) return;
+  warmRuntimeCache.set(String(guildId), { runtime, settings, at: Date.now() });
+}
+
+function takeWarmRuntime(guildId) {
+  const row = warmRuntimeCache.get(String(guildId || ""));
+  if (!row || Date.now() - row.at > WARM_RUNTIME_MS) return null;
+  return row;
+}
 const ATTEMPT_WINDOW_MS = 120_000;
 const ATTEMPT_LIMIT = 5;
 let lastPoolHealthAt = 0;
@@ -67,6 +81,22 @@ function missingPlayerNotice() {
   return buildNoticePayload(
     "ID nao encontrado",
     "Esse ID nao existe. Confira o numero e tente de novo.",
+  );
+}
+
+function idTakenNotice() {
+  return buildNoticePayload(
+    "ID ja utilizado",
+    "Esse ID ja foi liberado por outro membro. Use o seu proprio ID.",
+    "warning",
+  );
+}
+
+function idAlreadyOnNotice() {
+  return buildNoticePayload(
+    "ID ja liberado",
+    "Esse ID ja esta liberado. Ele nao pode ser usado por outra conta.",
+    "warning",
   );
 }
 
@@ -207,17 +237,43 @@ function buildWhitelistApplyNotice({ result, approve, autoApproved }) {
   );
 }
 
-async function assertManualWhitelistClaim(guildId, userId, identifierValue) {
-  const byId = await whitelistDb.findBoundRequestByIdentifier(guildId, identifierValue);
-  if (byId && String(byId.user_id) !== String(userId) && byId.status === "pending") {
+async function assertIdentifierAvailable(guildId, userId, identifierValue) {
+  const rows = await whitelistDb.listBoundRequestsByIdentifier(guildId, identifierValue);
+  const self = rows.find((row) => String(row.user_id) === String(userId)) || null;
+  const foreignApproved = rows.find(
+    (row) => String(row.user_id) !== String(userId) && row.status === "approved",
+  );
+  if (foreignApproved) {
+    return {
+      ok: false,
+      code: "id_taken",
+      title: "ID ja utilizado",
+      message: "Esse ID ja foi liberado por outro membro. Use o seu proprio ID.",
+      existing: foreignApproved,
+    };
+  }
+  const foreignOpen = rows.find(
+    (row) =>
+      String(row.user_id) !== String(userId) &&
+      (row.status === "pending" || row.status === "apply_failed"),
+  );
+  if (foreignOpen) {
     return {
       ok: false,
       code: "id_busy",
       title: "ID em analise",
       message: "Este ID ja esta em analise por outro membro.",
+      existing: foreignOpen,
     };
   }
-  return { ok: true };
+  return { ok: true, existing: self };
+}
+
+function canGrantApprovedRoles(result, userId, boundRequest) {
+  if (!isConfirmedCityPlayer(result)) return false;
+  if (boundRequest && String(boundRequest.user_id) !== String(userId)) return false;
+  if (inferWhitelistChanged(result)) return true;
+  return Boolean(boundRequest && String(boundRequest.user_id) === String(userId));
 }
 
 function isCityPlayerMissing(result) {
@@ -307,6 +363,15 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
 
   const guildId = interaction.guildId;
   const correlationId = randomUUID();
+  const claim = await assertIdentifierAvailable(guildId, interaction.user.id, identifierValue);
+  if (!claim.ok) {
+    if (deferTimer) clearTimeout(deferTimer);
+    await replyEphemeral(
+      interaction,
+      claim.code === "id_taken" ? idTakenNotice() : buildNoticePayload(claim.title, claim.message, "warning"),
+    );
+    return;
+  }
 
   let result;
   let memberHint = null;
@@ -393,23 +458,35 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
     return;
   }
 
-  const notice = buildWhitelistApplyNotice({ result, approve: true, autoApproved: true });
-  await Promise.all([
-    replyEphemeral(interaction, notice),
-    persistWhitelistSuccess({
+  if (!canGrantApprovedRoles(result, interaction.user.id, claim.existing)) {
+    if (request?.id) {
+      await whitelistDb.updateWhitelistRequest(request.id, {
+        status: "cancelled",
+        apply_error: "ID ja liberado por outro membro.",
+      }).catch(() => null);
+    }
+    await replyEphemeral(
       interaction,
-      settings,
-      request,
-      result,
-      approve: true,
-      operation: "APPROVE_WHITELIST",
-      autoApproved: true,
-      correlationId,
-      cityPending: result.deferred === true || result.code === "city_deferred",
-      playerName,
-      member: memberHint,
-    }),
-  ]);
+      wasWhitelistAlreadyApplied(result) ? idAlreadyOnNotice() : idTakenNotice(),
+    );
+    return;
+  }
+
+  const notice = buildWhitelistApplyNotice({ result, approve: true, autoApproved: true });
+  await replyEphemeral(interaction, notice);
+  void persistWhitelistSuccess({
+    interaction,
+    settings,
+    request,
+    result,
+    approve: true,
+    operation: "APPROVE_WHITELIST",
+    autoApproved: true,
+    correlationId,
+    cityPending: result.deferred === true || result.code === "city_deferred",
+    playerName,
+    member: memberHint,
+  });
 }
 
 async function applyApprovedNickname(guild, userId, settings, identifierValue, playerName, memberHint = null) {
@@ -714,14 +791,19 @@ async function showWhitelistModal(interaction) {
     new ActionRowBuilder().addComponents(nameInput),
   );
   await interaction.showModal(modal);
+  rememberWarmRuntime(guildId, runtime, settings);
+  void prefetchGuildMember(interaction.guild, interaction.user.id);
+  void warmupWhitelistRoute(settings);
 }
 
 async function handleWhitelistModalSubmit(interaction) {
   const guildId = interaction.guildId;
   if (!guildId || !interaction.guild) return;
 
-  const runtime = await getGuildWhitelistRuntime(guildId);
-  const settings = runtime?.settings || (await whitelistDb.getGuildWhitelistSettings(guildId));
+  const warmed = takeWarmRuntime(guildId);
+  const runtime = warmed?.runtime || (await getGuildWhitelistRuntime(guildId));
+  const settings =
+    warmed?.settings || runtime?.settings || (await whitelistDb.getGuildWhitelistSettings(guildId));
 
   if (!runtime?.licenseUsable || !isWhitelistModuleActive(settings)) {
     await replyEphemeral(
@@ -797,7 +879,7 @@ async function handleWhitelistModalSubmit(interaction) {
     return;
   }
 
-  const claim = await assertManualWhitelistClaim(guildId, interaction.user.id, identifierValue);
+  const claim = await assertIdentifierAvailable(guildId, interaction.user.id, identifierValue);
   if (!claim.ok) {
     await replyEphemeral(
       interaction,
@@ -955,6 +1037,28 @@ async function applyWhitelistChange({
   const cityOperation = cityOperationFor(operation);
 
   try {
+    if (approve) {
+      const claim = await assertIdentifierAvailable(
+        request.guild_id,
+        request.user_id,
+        request.identifier_value,
+      );
+      if (!claim.ok) {
+        await replyEphemeral(
+          interaction,
+          claim.code === "id_taken" ? idTakenNotice() : buildNoticePayload(claim.title, claim.message, "warning"),
+        );
+        void persistWhitelistFailure({
+          interaction,
+          settings,
+          request,
+          result: { ok: false, code: claim.code, message: claim.message },
+          operation,
+          correlationId,
+        });
+        return;
+      }
+    }
     const memberPromise = prefetchGuildMember(interaction.guild, request.user_id);
     let result = await applyCityWhitelist(settings, request.identifier_value, cityOperation);
     if (!approve && !result.ok && isOptionalCityFailure(result)) {
@@ -1003,21 +1107,44 @@ async function applyWhitelistChange({
       return;
     }
 
-    await Promise.all([
-      replyEphemeral(interaction, buildWhitelistApplyNotice({ result, approve, autoApproved })),
-      persistWhitelistSuccess({
-        interaction,
-        settings,
-        request,
-        result,
-        approve,
-        operation,
-        autoApproved,
-        correlationId,
-        cityPending: result.deferred === true || result.code === "city_deferred",
-        member: memberHint,
-      }),
-    ]);
+    if (approve) {
+      const latest = await assertIdentifierAvailable(
+        request.guild_id,
+        request.user_id,
+        request.identifier_value,
+      );
+      if (!latest.ok || !canGrantApprovedRoles(result, request.user_id, latest.existing)) {
+        await replyEphemeral(
+          interaction,
+          latest.code === "id_taken" || wasWhitelistAlreadyApplied(result)
+            ? idTakenNotice()
+            : buildNoticePayload(latest.title || "ID ja utilizado", latest.message || "Esse ID nao pode ser usado nesta conta.", "warning"),
+        );
+        void persistWhitelistFailure({
+          interaction,
+          settings,
+          request,
+          result: { ok: false, code: latest.code || "id_taken", message: latest.message || "ID ja utilizado." },
+          operation,
+          correlationId,
+        });
+        return;
+      }
+    }
+
+    await replyEphemeral(interaction, buildWhitelistApplyNotice({ result, approve, autoApproved }));
+    await persistWhitelistSuccess({
+      interaction,
+      settings,
+      request,
+      result,
+      approve,
+      operation,
+      autoApproved,
+      correlationId,
+      cityPending: result.deferred === true || result.code === "city_deferred",
+      member: memberHint,
+    });
   } finally {
     applyingLocks.delete(lockKey);
   }
@@ -1310,12 +1437,19 @@ async function retryFailedWhitelistApplies(client) {
     try {
       const settings = await whitelistDb.getGuildWhitelistSettings(request.guild_id);
       if (!isWhitelistModuleActive(settings)) continue;
+      const claim = await assertIdentifierAvailable(
+        request.guild_id,
+        request.user_id,
+        request.identifier_value,
+      );
+      if (!claim.ok) continue;
       const result = await executeWhitelistOperation(
         settings,
         "APPROVE_WHITELIST",
         request.identifier_value,
       );
       if (!result.ok || !isConfirmedCityPlayer(result)) continue;
+      if (!canGrantApprovedRoles(result, request.user_id, claim.existing)) continue;
       const guild = await client.guilds.fetch(request.guild_id).catch(() => null);
       if (!guild) continue;
       await whitelistDb.updateWhitelistRequest(request.id, {
@@ -1380,6 +1514,15 @@ async function reconcileCompletedAgentJobs(client) {
       const result = job.result && typeof job.result === "object" ? job.result : {};
       if (request.status === "approved" || request.status === "denied") {
         if (approve) {
+          const claim = await assertIdentifierAvailable(
+            request.guild_id,
+            request.user_id,
+            request.identifier_value,
+          );
+          if (!claim.ok) {
+            await whitelistDb.markJobDiscordSynced(job.id);
+            continue;
+          }
           await assignRoles(guild, request.user_id, settings.approved_role_ids, settings.denied_role_ids);
           await applyApprovedNickname(
             guild,

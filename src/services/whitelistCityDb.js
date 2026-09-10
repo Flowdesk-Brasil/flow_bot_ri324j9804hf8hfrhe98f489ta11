@@ -13,8 +13,34 @@ const IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const PORT_PROBE_MS = 250;
 const PORT_CACHE_MS = 120_000;
 const HINT_CACHE_MS = 2_500;
+const ROUTE_AFFINITY_MS = 10 * 60_000;
 const portProbeCache = new Map();
 const launcherHintCache = new Map();
+const routeAffinity = new Map();
+
+function rememberRoute(guildId, via) {
+  if (!guildId || !via) return;
+  routeAffinity.set(String(guildId), { via, at: Date.now() });
+}
+
+function preferredRoute(guildId) {
+  const row = routeAffinity.get(String(guildId || ""));
+  if (!row || Date.now() - row.at > ROUTE_AFFINITY_MS) return null;
+  return row.via;
+}
+
+function peekLauncherHint(guildId) {
+  const cached = launcherHintCache.get(String(guildId || ""));
+  if (cached && Date.now() - cached.at < HINT_CACHE_MS) return cached.value;
+  return null;
+}
+
+async function warmupWhitelistRoute(settings) {
+  if (!settings?.guild_id) return preferredRoute(settings?.guild_id);
+  const hint = await readLauncherHint(settings.guild_id);
+  if (hint?.online) rememberRoute(settings.guild_id, "launcher");
+  return preferredRoute(settings.guild_id);
+}
 
 function decorateCityFailure(result) {
   const { uniqueNotice } = require("./cityDbErrors");
@@ -208,18 +234,19 @@ function classifyState(mapping, current) {
   return "off";
 }
 
-function buildSelectSql(engine, mapping) {
+function buildSelectSql(engine, mapping, candidateCount = 1) {
   const playerTable = quoteSqlIdentifier(engine, mapping.playerTable);
   const playerId = quoteSqlIdentifier(engine, mapping.playerIdColumn);
   const whitelist = quoteSqlIdentifier(engine, mapping.whitelistColumn);
+  const placeholders = Array.from({ length: Math.max(1, candidateCount) }, () => "?").join(", ");
   if (mappingUsesJoin(mapping)) {
     const joinTable = quoteSqlIdentifier(engine, mapping.joinTable);
     const joinFrom = quoteSqlIdentifier(engine, mapping.joinFromColumn);
     const joinTo = quoteSqlIdentifier(engine, mapping.joinToColumn);
     const joinId = quoteSqlIdentifier(engine, mapping.joinIdentifierColumn);
-    return `SELECT ${playerTable}.${playerId} AS player_key, ${playerTable}.${whitelist} AS whitelist_value FROM ${playerTable} INNER JOIN ${joinTable} ON ${playerTable}.${joinFrom} = ${joinTable}.${joinTo} WHERE ${joinTable}.${joinId} = ? LIMIT 2`;
+    return `SELECT ${playerTable}.${playerId} AS player_key, ${playerTable}.${whitelist} AS whitelist_value FROM ${playerTable} INNER JOIN ${joinTable} ON ${playerTable}.${joinFrom} = ${joinTable}.${joinTo} WHERE ${joinTable}.${joinId} IN (${placeholders}) LIMIT 2`;
   }
-  return `SELECT ${playerId} AS player_key, ${whitelist} AS whitelist_value FROM ${playerTable} WHERE ${playerId} = ? LIMIT 2`;
+  return `SELECT ${playerId} AS player_key, ${whitelist} AS whitelist_value FROM ${playerTable} WHERE ${playerId} IN (${placeholders}) LIMIT 2`;
 }
 
 function buildUpdateSql(engine, mapping) {
@@ -351,8 +378,10 @@ async function executeWhitelistOperation(settings, operation, identifierValue, o
     priority: interactive ? "interactive" : "background",
   };
 
-  const hintPromise = launcherCityDb ? readLauncherHint(settings.guild_id) : Promise.resolve({ online: false });
-  const useDirect = Boolean(cityTarget);
+  const preferred = preferredRoute(settings.guild_id);
+  const cachedHint = peekLauncherHint(settings.guild_id);
+  const skipDirectFirst = preferred === "launcher" || cachedHint?.online === true;
+  const useDirect = Boolean(cityTarget) && !skipDirectFirst;
   const directTask = useDirect
     ? (async () => {
         const portOpen = await probeCityPort(cityTarget.host, cityTarget.port);
@@ -373,10 +402,9 @@ async function executeWhitelistOperation(settings, operation, identifierValue, o
       })()
     : null;
 
-  const hint = await hintPromise;
-  const useLauncher = Boolean(launcherCityDb && (hint?.online || !cityTarget));
+  const useLauncher = Boolean(launcherCityDb);
 
-  if (useLauncher && hint?.online) {
+  if (useLauncher) {
     logCityDb("info", "whitelist_launcher_local", {
       guildId: settings.guild_id,
       operation,
@@ -386,7 +414,7 @@ async function executeWhitelistOperation(settings, operation, identifierValue, o
   const launcherTask = useLauncher
     ? runViaLauncher(settings, operation, identifierValue, mapping, launcherCityDb, {
         ...launcherOpts,
-        brief: interactive && !hint?.online,
+        brief: interactive && preferred !== "launcher",
       }).catch((error) => {
         logCityDb("warn", "whitelist_launcher_error", {
           guildId: settings.guild_id,
@@ -402,18 +430,38 @@ async function executeWhitelistOperation(settings, operation, identifierValue, o
     : null;
 
   if (launcherTask && directTask) {
-    return raceFirstDecisiveResult([directTask, launcherTask]);
+    const raced = await raceFirstDecisiveResult([directTask, launcherTask]);
+    if (raced?.ok) rememberRoute(settings.guild_id, raced.via === "direct" ? "direct" : "launcher");
+    return raced;
   }
   if (launcherTask) {
     const viaLauncher = await launcherTask;
     if (viaLauncher?.ok || isDecisiveCityResult(viaLauncher)) {
+      if (viaLauncher?.ok) rememberRoute(settings.guild_id, "launcher");
       return viaLauncher?.ok ? normalizeWhitelistResult(viaLauncher) : decorateCityFailure(viaLauncher);
+    }
+    if (cityTarget && skipDirectFirst) {
+      try {
+        const portOpen = await probeCityPort(cityTarget.host, cityTarget.port);
+        if (portOpen) {
+          const direct = await runDirectWhitelistOperation(settings, mapping, operation, identifierValue, {
+            interactive,
+          });
+          if (direct?.ok || isDecisiveCityResult(direct)) {
+            if (direct?.ok) rememberRoute(settings.guild_id, "direct");
+            return direct?.ok ? normalizeWhitelistResult(direct) : decorateCityFailure(direct);
+          }
+        }
+      } catch (error) {
+        /* launcher ja falhou; cai no deferred */
+      }
     }
     return decorateCityFailure(viaLauncher || { ok: false, code: "city_deferred" });
   }
   if (directTask) {
     const direct = await directTask;
     if (direct?.ok || isDecisiveCityResult(direct)) {
+      if (direct?.ok) rememberRoute(settings.guild_id, "direct");
       return direct?.ok ? normalizeWhitelistResult(direct) : decorateCityFailure(direct);
     }
     if (direct && !isRetryableLauncherCode(direct.code)) {
@@ -565,12 +613,12 @@ async function runViaLauncher(settings, operation, identifierValue, mapping, cit
   const fast = options.priority === "interactive";
   const brief = options.brief === true;
   const attempts = brief ? 1 : fast ? 1 : 2;
-  const timeouts = brief ? [2200] : fast ? [5500] : [8000, 12000];
-  const pollMs = fast || brief ? 15 : 40;
+  const timeouts = brief ? [1800] : fast ? [4000] : [8000, 12000];
+  const pollMs = fast || brief ? 10 : 40;
   const waitOpts = brief
-    ? { extendIfClaimed: true, extendMs: 1500, maxTotalMs: 3200 }
+    ? { extendIfClaimed: true, extendMs: 1200, maxTotalMs: 2500 }
     : fast
-      ? { extendIfClaimed: true, extendMs: 3500, maxTotalMs: 8000 }
+      ? { extendIfClaimed: true, extendMs: 2500, maxTotalMs: 5500 }
       : { extendIfClaimed: true, extendMs: 8000, maxTotalMs: 18000 };
   let last = {
     ok: false,
@@ -678,7 +726,8 @@ async function runDirectWhitelistOperation(
   runtimeOptions = {},
 ) {
   const target = settingsToTarget(settings, settings.guild_id);
-  const selectSql = buildSelectSql(target.engine, mapping);
+  const candidates = identifierCandidates(identifierValue);
+  const selectSql = buildSelectSql(target.engine, mapping, candidates.length);
   const updateSql = buildUpdateSql(target.engine, mapping);
   const dbOptions = { interactive: runtimeOptions.interactive === true };
 
@@ -686,11 +735,7 @@ async function runDirectWhitelistOperation(
     target,
     async (query, withTransaction) => {
       const readAndMaybeWrite = async (runQuery) => {
-        let rows = [];
-        for (const candidate of identifierCandidates(identifierValue)) {
-          rows = await runQuery(selectSql, [candidate]);
-          if (rows.length) break;
-        }
+        const rows = await runQuery(selectSql, candidates);
         if (rows.length > 1) {
           return { ok: false, code: "multiple_players", message: "Mais de um jogador encontrado." };
         }
@@ -798,4 +843,5 @@ module.exports = {
   normalizeWhitelistResult,
   healthCheckCityDb,
   healthCheckActivePools,
+  warmupWhitelistRoute,
 };

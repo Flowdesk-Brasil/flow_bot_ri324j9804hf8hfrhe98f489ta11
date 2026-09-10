@@ -89,7 +89,7 @@ async function findApprovedRequestByUser(guildId, userId) {
   return rows[0] || null;
 }
 
-async function findBoundRequestByIdentifier(guildId, identifierValue) {
+async function listBoundRequestsByIdentifier(guildId, identifierValue) {
   const result = await supabase
     .from(REQUESTS_TABLE)
     .select("id, guild_id, user_id, identifier_value, status")
@@ -97,8 +97,12 @@ async function findBoundRequestByIdentifier(guildId, identifierValue) {
     .eq("identifier_value", identifierValue)
     .in("status", ["approved", "pending", "apply_failed"])
     .order("id", { ascending: false })
-    .limit(8);
-  const rows = unwrap(result, "findBoundRequestByIdentifier") || [];
+    .limit(12);
+  return unwrap(result, "listBoundRequestsByIdentifier") || [];
+}
+
+async function findBoundRequestByIdentifier(guildId, identifierValue) {
+  const rows = await listBoundRequestsByIdentifier(guildId, identifierValue);
   return rows.find((row) => row.status === "approved") || rows[0] || null;
 }
 
@@ -428,6 +432,7 @@ module.exports = {
   listEnabledWhitelistSettings,
   findApprovedRequestByUser,
   findBoundRequestByIdentifier,
+  listBoundRequestsByIdentifier,
   findOpenRequest,
   createWhitelistRequest,
   updateWhitelistRequest,

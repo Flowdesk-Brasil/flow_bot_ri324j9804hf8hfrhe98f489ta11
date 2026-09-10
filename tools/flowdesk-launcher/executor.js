@@ -3,8 +3,8 @@ const { connectCityMysql, releaseCityMysql } = require("./cityMysql");
 const { healCityMysql } = require("./cityHeal");
 
 const IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const CONNECT_TIMEOUT_MS = 8000;
-const QUERY_TIMEOUT_MS = 8000;
+const CONNECT_TIMEOUT_MS = 2000;
+const QUERY_TIMEOUT_MS = 2500;
 
 function isSafeSqlIdentifier(value) {
   return IDENTIFIER_RE.test(String(value || ""));
@@ -130,18 +130,38 @@ function classifyState(mapping, current) {
   return "off";
 }
 
-function buildSelectSql(engine, mapping) {
+function identifierCandidates(value) {
+  const raw = String(value ?? "").trim();
+  const out = [];
+  const add = (item) => {
+    if (item === 0 || item) {
+      const key = typeof item === "number" ? `n:${item}` : `s:${item}`;
+      if (!out.some((entry) => entry.key === key)) out.push({ key, value: item });
+    }
+  };
+  add(raw);
+  const stripped = raw.replace(/^(license2?:|steam:|discord:|fivem:|live:|xbl:|char\d+:)/i, "");
+  add(stripped);
+  if (/^\d{1,18}$/.test(stripped)) {
+    add(Number(stripped));
+    add(String(Number(stripped)));
+  }
+  return out.map((entry) => entry.value);
+}
+
+function buildSelectSql(engine, mapping, candidateCount = 1) {
   const playerTable = quoteSqlIdentifier(engine, mapping.playerTable);
   const playerId = quoteSqlIdentifier(engine, mapping.playerIdColumn);
   const whitelist = quoteSqlIdentifier(engine, mapping.whitelistColumn);
+  const placeholders = Array.from({ length: Math.max(1, candidateCount) }, () => "?").join(", ");
   if (mappingUsesJoin(mapping)) {
     const joinTable = quoteSqlIdentifier(engine, mapping.joinTable);
     const joinFrom = quoteSqlIdentifier(engine, mapping.joinFromColumn);
     const joinTo = quoteSqlIdentifier(engine, mapping.joinToColumn);
     const joinId = quoteSqlIdentifier(engine, mapping.joinIdentifierColumn);
-    return `SELECT ${playerTable}.${playerId} AS player_key, ${playerTable}.${whitelist} AS whitelist_value FROM ${playerTable} INNER JOIN ${joinTable} ON ${playerTable}.${joinFrom} = ${joinTable}.${joinTo} WHERE ${joinTable}.${joinId} = ? LIMIT 2`;
+    return `SELECT ${playerTable}.${playerId} AS player_key, ${playerTable}.${whitelist} AS whitelist_value FROM ${playerTable} INNER JOIN ${joinTable} ON ${playerTable}.${joinFrom} = ${joinTable}.${joinTo} WHERE ${joinTable}.${joinId} IN (${placeholders}) LIMIT 2`;
   }
-  return `SELECT ${playerId} AS player_key, ${whitelist} AS whitelist_value FROM ${playerTable} WHERE ${playerId} = ? LIMIT 2`;
+  return `SELECT ${playerId} AS player_key, ${whitelist} AS whitelist_value FROM ${playerTable} WHERE ${playerId} IN (${placeholders}) LIMIT 2`;
 }
 
 function buildUpdateSql(engine, mapping) {
@@ -353,10 +373,11 @@ async function executeJob(target, operation, payload) {
   if (!identifierValue) {
     return { ok: false, code: "missing_identifier", message: "Identificador ausente." };
   }
-  const selectSql = buildSelectSql(target.engine, mapping);
+  const candidates = identifierCandidates(identifierValue);
+  const selectSql = buildSelectSql(target.engine, mapping, candidates.length);
   const updateSql = buildUpdateSql(target.engine, mapping);
   return withCityDatabase(target, async (query) => {
-    const rows = await query(selectSql, [identifierValue]);
+    const rows = await query(selectSql, candidates);
     if (rows.length > 1) {
       return { ok: false, code: "multiple_players", message: "Mais de um jogador encontrado." };
     }

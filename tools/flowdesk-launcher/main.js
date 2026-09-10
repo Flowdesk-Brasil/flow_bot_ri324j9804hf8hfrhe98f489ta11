@@ -428,6 +428,7 @@ async function restoreSession() {
   runtime.cityDb = vault.cityDb && typeof vault.cityDb === "object" ? vault.cityDb : runtime.cityDb;
   markOnline("Conectado ao painel.");
   startHeartbeatLoop();
+  startJobPump();
   startSyncLoop();
   startWatchdog();
   void observePublicIp().then((ip) => {
@@ -515,6 +516,7 @@ async function bindServer(guildId) {
       : "VPS vinculada. Detectando IP publico...",
   );
   startHeartbeatLoop();
+  startJobPump();
   startSyncLoop();
   startWatchdog();
   void runHeal({ elevate: true });
@@ -568,9 +570,12 @@ function looksLikeIpv4(value) {
 }
 
 let lastPublicIpAt = 0;
+let jobPumpTimer = null;
+let jobPumpBusy = false;
+let pendingJobResults = [];
 
 async function observePublicIp() {
-  if (runtime.publicIp && Date.now() - lastPublicIpAt < 20_000) {
+  if (runtime.publicIp && Date.now() - lastPublicIpAt < 60_000) {
     return runtime.publicIp;
   }
   const endpoints = [
@@ -634,14 +639,120 @@ async function runHeartbeat() {
   return false;
 }
 
-async function runSync() {
+function isInteractiveJob(operation) {
+  return /APPROVE_WHITELIST|REMOVE_WHITELIST|GET_PLAYER|CHECK_WHITELIST|TEST_MAPPING|TEST_CONNECTION/.test(
+    String(operation || ""),
+  );
+}
+
+async function runJobOnce(job) {
+  const target = dbTarget(job.payload || {});
+  const operation = String(job.operation || "");
   try {
-    const alive = await runHeartbeat();
-    if (!alive) {
-      backoffMs = Math.min(Math.max(Math.round(backoffMs * 1.6), 500), 15000);
+    let result = await executeJob(target, operation, job.payload || {});
+    if (result.ok === false && /offline|timeout/i.test(String(result.message || result.code || ""))) {
+      result = await executeJob(target, operation, job.payload || {});
+    }
+    if (
+      result.ok === false &&
+      !isInteractiveJob(operation) &&
+      /offline|timeout|access denied|unknown database/i.test(String(result.message || result.code || ""))
+    ) {
+      await runHeal({ elevate: true });
+      result = await executeJob(target, operation, job.payload || {});
+    }
+    if (result.ok !== false) rememberCityDb(target);
+    return {
+      id: job.id,
+      ok: result.ok !== false,
+      result,
+      errorMessage: result.ok === false ? result.message : null,
+    };
+  } catch (error) {
+    if (!isInteractiveJob(operation)) {
+      await runHeal({ elevate: true });
+      try {
+        const retry = await executeJob(target, operation, job.payload || {});
+        if (retry.ok !== false) rememberCityDb(target);
+        return {
+          id: job.id,
+          ok: retry.ok !== false,
+          result: retry,
+          errorMessage: retry.ok === false ? retry.message : null,
+        };
+      } catch (retryError) {
+        const sanitized = sanitizeError(retryError);
+        return { id: job.id, ok: false, result: sanitized, errorMessage: sanitized.message };
+      }
+    }
+    const sanitized = sanitizeError(error);
+    return { id: job.id, ok: false, result: sanitized, errorMessage: sanitized.message };
+  }
+}
+
+async function runJobPump() {
+  if (jobPumpBusy || runtime.view !== "home" || !readVault().accessToken) return;
+  jobPumpBusy = true;
+  try {
+    const results = pendingJobResults.splice(0);
+    let synced = await api("/api/launcher/session", {
+      method: "POST",
+      body: {
+        action: "jobs",
+        waitMs: 2000,
+        results,
+      },
+    });
+    if (!synced.ok && /invalida/i.test(String(synced.message || ""))) {
+      synced = await api("/api/launcher/session", {
+        method: "POST",
+        body: {
+          action: "sync",
+          observedIp: runtime.publicIp || "",
+          appVersion: app.getVersion(),
+          results,
+        },
+      });
+    }
+    if (!synced.ok) {
+      if (results.length) pendingJobResults.unshift(...results);
       return;
     }
-    const publicIp = await observePublicIp();
+    if (synced.config) {
+      runtime.config = synced.config;
+      if (synced.config.user && synced.config.database) {
+        rememberCityDb({
+          engine: synced.config.engine,
+          port: synced.config.port,
+          database: synced.config.database,
+          user: synced.config.user,
+          password: synced.config.password,
+        });
+      }
+    }
+    for (const job of synced.jobs || []) {
+      pendingJobResults.push(await runJobOnce(job));
+    }
+  } catch (error) {
+    logLine(`job-pump: ${sanitizeError(error).message}`);
+  } finally {
+    jobPumpBusy = false;
+    lastJobPumpTick = Date.now();
+    if (runtime.view === "home") {
+      jobPumpTimer = setTimeout(() => void runJobPump(), pendingJobResults.length ? 0 : 25);
+    }
+  }
+}
+
+function startJobPump() {
+  clearTimeout(jobPumpTimer);
+  jobPumpBusy = false;
+  void runJobPump();
+}
+
+async function runSync() {
+  try {
+    const publicIp = runtime.publicIp || (await observePublicIp());
     const synced = await api("/api/launcher/session", {
       method: "POST",
       body: {
@@ -670,50 +781,7 @@ async function runSync() {
         });
       }
     }
-    const results = [];
-    for (const job of synced.jobs || []) {
-      const target = dbTarget(job.payload || {});
-      try {
-        let result = await executeJob(target, String(job.operation || ""), job.payload || {});
-        if (result.ok === false && /offline|timeout|access denied|unknown database/i.test(String(result.message || result.code || ""))) {
-          await runHeal({ elevate: true });
-          result = await executeJob(target, String(job.operation || ""), job.payload || {});
-        }
-        if (result.ok !== false) rememberCityDb(target);
-        results.push({
-          id: job.id,
-          ok: result.ok !== false,
-          result,
-          errorMessage: result.ok === false ? result.message : null,
-        });
-      } catch (error) {
-        await runHeal({ elevate: true });
-        try {
-          const retry = await executeJob(target, String(job.operation || ""), job.payload || {});
-          if (retry.ok !== false) rememberCityDb(target);
-          results.push({
-            id: job.id,
-            ok: retry.ok !== false,
-            result: retry,
-            errorMessage: retry.ok === false ? retry.message : null,
-          });
-        } catch (retryError) {
-          const sanitized = sanitizeError(retryError);
-          results.push({
-            id: job.id,
-            ok: false,
-            result: sanitized,
-            errorMessage: sanitized.message,
-          });
-        }
-      }
-    }
-    if (results.length) {
-      await api("/api/launcher/session", {
-        method: "POST",
-        body: { action: "sync", results, observedIp: publicIp, appVersion: app.getVersion() },
-      });
-    } else if (Date.now() - lastHealthAt > 20000) {
+    if (Date.now() - lastHealthAt > 20000) {
       try {
         const target = dbTarget({});
         if (target.user && target.database) {
@@ -723,11 +791,11 @@ async function runSync() {
             lastHealthAt = Date.now();
           }
         }
-        } catch {
-          void runHeal({ elevate: false });
-        }
+      } catch {
+        void runHeal({ elevate: false });
+      }
     }
-    backoffMs = 80;
+    backoffMs = 15000;
     if (runtime.heal?.ok === false) {
       runtime.message = runtime.heal.message || "Corrigindo o MySQL local...";
       emitState();
@@ -760,6 +828,7 @@ function startHeartbeatLoop() {
 }
 
 let lastSyncTick = 0;
+let lastJobPumpTick = 0;
 let watchdogTimer = null;
 
 function startSyncLoop() {
@@ -777,9 +846,14 @@ function startWatchdog() {
   clearInterval(watchdogTimer);
   watchdogTimer = setInterval(() => {
     if (runtime.view !== "home") return;
-    if (Date.now() - lastSyncTick > 25_000) {
+    if (Date.now() - lastJobPumpTick > 8_000) {
+      logLine("Watchdog: fila de jobs parou. Reiniciando.");
+      startJobPump();
+    }
+    if (Date.now() - lastSyncTick > 40_000) {
       logLine("Watchdog: sync parou. Reiniciando loops.");
       startHeartbeatLoop();
+      startJobPump();
       startSyncLoop();
       void runHeal({ elevate: true });
     }
@@ -1024,6 +1098,7 @@ ipcMain.handle("launcher:logout", async () => {
   await api("/api/launcher/session", { method: "POST", body: { action: "logout" } }).catch(() => null);
   writeVault({ installId: getInstallId() });
   clearTimeout(syncTimer);
+  clearTimeout(jobPumpTimer);
   clearInterval(heartbeatTimer);
   runtime.view = "login";
   runtime.user = null;
