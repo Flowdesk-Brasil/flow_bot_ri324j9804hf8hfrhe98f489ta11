@@ -92,14 +92,6 @@ function idTakenNotice() {
   );
 }
 
-function idAlreadyOnNotice() {
-  return buildNoticePayload(
-    "ID ja liberado",
-    "Esse ID ja esta liberado. Ele nao pode ser usado por outra conta.",
-    "warning",
-  );
-}
-
 function unverifiedPlayerNotice() {
   return buildNoticePayload(
     "ID nao confirmado",
@@ -272,8 +264,16 @@ async function assertIdentifierAvailable(guildId, userId, identifierValue) {
 function canGrantApprovedRoles(result, userId, boundRequest) {
   if (!isConfirmedCityPlayer(result)) return false;
   if (boundRequest && String(boundRequest.user_id) !== String(userId)) return false;
-  if (inferWhitelistChanged(result)) return true;
-  return Boolean(boundRequest && String(boundRequest.user_id) === String(userId));
+  return inferWhitelistChanged(result) === true;
+}
+
+function refuseTakenId(interaction, claim) {
+  return replyEphemeral(
+    interaction,
+    claim?.code === "id_busy"
+      ? buildNoticePayload(claim.title, claim.message, "warning")
+      : idTakenNotice(),
+  );
 }
 
 function isCityPlayerMissing(result) {
@@ -366,43 +366,18 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
   const claim = await assertIdentifierAvailable(guildId, interaction.user.id, identifierValue);
   if (!claim.ok) {
     if (deferTimer) clearTimeout(deferTimer);
-    await replyEphemeral(
-      interaction,
-      claim.code === "id_taken" ? idTakenNotice() : buildNoticePayload(claim.title, claim.message, "warning"),
-    );
+    await refuseTakenId(interaction, claim);
     return;
   }
 
   let result;
-  let memberHint = null;
-  let request = null;
   try {
-    const settled = await Promise.all([
-      applyCityWhitelist(settings, identifierValue, "APPROVE_WHITELIST"),
-      prefetchGuildMember(interaction.guild, interaction.user.id),
-      upsertAutoWhitelistRequest({
-        guildId,
-        userId: interaction.user.id,
-        identifierKind,
-        identifierValue,
-        playerName,
-        correlationId,
-      }).catch(() => null),
-    ]);
-    result = settled[0];
-    memberHint = settled[1];
-    request = settled[2];
+    result = await applyCityWhitelist(settings, identifierValue, "APPROVE_WHITELIST");
   } finally {
     if (deferTimer) clearTimeout(deferTimer);
   }
 
   if (isCityPlayerMissing(result) || result.code === "player_not_found") {
-    if (request?.id) {
-      await whitelistDb.updateWhitelistRequest(request.id, {
-        status: "cancelled",
-        apply_error: "ID nao encontrado.",
-      }).catch(() => null);
-    }
     await replyEphemeral(interaction, missingPlayerNotice());
     return;
   }
@@ -415,32 +390,26 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
   }
 
   if (!result.ok) {
-    if (!request?.id) {
-      await replyEphemeral(
-        interaction,
-        buildNoticePayload(
-          "Aguarde",
-          "Sua solicitacao automatica ja esta sendo processada. Tente novamente em instantes.",
-          "warning",
-        ),
-      );
-      return;
-    }
     await replyEphemeral(
       interaction,
       buildNoticePayload(result.title || "Nao foi possivel aplicar a whitelist", cityDbNoticeText(result)),
     );
-    void persistWhitelistFailure({
-      interaction,
-      settings,
-      request,
-      result,
-      operation: "APPROVE_WHITELIST",
-      correlationId,
-    });
     return;
   }
 
+  if (!isConfirmedCityPlayer(result) || !canGrantApprovedRoles(result, interaction.user.id, claim.existing)) {
+    await refuseTakenId(interaction, { code: "id_taken" });
+    return;
+  }
+
+  const request = await upsertAutoWhitelistRequest({
+    guildId,
+    userId: interaction.user.id,
+    identifierKind,
+    identifierValue,
+    playerName,
+    correlationId,
+  }).catch(() => null);
   if (!request?.id) {
     await replyEphemeral(
       interaction,
@@ -453,25 +422,7 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
     return;
   }
 
-  if (!isConfirmedCityPlayer(result)) {
-    await replyEphemeral(interaction, unverifiedPlayerNotice());
-    return;
-  }
-
-  if (!canGrantApprovedRoles(result, interaction.user.id, claim.existing)) {
-    if (request?.id) {
-      await whitelistDb.updateWhitelistRequest(request.id, {
-        status: "cancelled",
-        apply_error: "ID ja liberado por outro membro.",
-      }).catch(() => null);
-    }
-    await replyEphemeral(
-      interaction,
-      wasWhitelistAlreadyApplied(result) ? idAlreadyOnNotice() : idTakenNotice(),
-    );
-    return;
-  }
-
+  const memberHint = await prefetchGuildMember(interaction.guild, interaction.user.id);
   const notice = buildWhitelistApplyNotice({ result, approve: true, autoApproved: true });
   await replyEphemeral(interaction, notice);
   void persistWhitelistSuccess({
@@ -1044,18 +995,7 @@ async function applyWhitelistChange({
         request.identifier_value,
       );
       if (!claim.ok) {
-        await replyEphemeral(
-          interaction,
-          claim.code === "id_taken" ? idTakenNotice() : buildNoticePayload(claim.title, claim.message, "warning"),
-        );
-        void persistWhitelistFailure({
-          interaction,
-          settings,
-          request,
-          result: { ok: false, code: claim.code, message: claim.message },
-          operation,
-          correlationId,
-        });
+        await refuseTakenId(interaction, claim);
         return;
       }
     }
@@ -1114,20 +1054,7 @@ async function applyWhitelistChange({
         request.identifier_value,
       );
       if (!latest.ok || !canGrantApprovedRoles(result, request.user_id, latest.existing)) {
-        await replyEphemeral(
-          interaction,
-          latest.code === "id_taken" || wasWhitelistAlreadyApplied(result)
-            ? idTakenNotice()
-            : buildNoticePayload(latest.title || "ID ja utilizado", latest.message || "Esse ID nao pode ser usado nesta conta.", "warning"),
-        );
-        void persistWhitelistFailure({
-          interaction,
-          settings,
-          request,
-          result: { ok: false, code: latest.code || "id_taken", message: latest.message || "ID ja utilizado." },
-          operation,
-          correlationId,
-        });
+        await refuseTakenId(interaction, latest.ok ? { code: "id_taken" } : latest);
         return;
       }
     }
