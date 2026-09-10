@@ -218,7 +218,7 @@ async function withCityDatabase(target, fn, options = {}) {
 
 function isUnusableCityHost(value) {
   const host = String(value || "").trim().toLowerCase();
-  return (
+  if (
     !host ||
     host === "localhost" ||
     host === "127.0.0.1" ||
@@ -228,7 +228,15 @@ function isUnusableCityHost(value) {
     host.startsWith("10.") ||
     host.startsWith("192.168.") ||
     host.startsWith("169.254.")
-  );
+  ) {
+    return true;
+  }
+  const private172 = host.match(/^172\.(\d+)\./);
+  if (private172) {
+    const second = Number(private172[1]);
+    return second >= 16 && second <= 31;
+  }
+  return false;
 }
 
 function settingsToLauncherCityDb(settings, guildId) {
@@ -247,9 +255,7 @@ function settingsToLauncherCityDb(settings, guildId) {
 }
 
 function settingsToTarget(settings, guildId) {
-  const host = !isUnusableCityHost(settings?.db_host)
-    ? settings.db_host
-    : settings?.agent_public_ip;
+  const host = settings?.db_host;
   if (!host || !settings?.db_name || !settings?.db_user) {
     throw new Error("Conexao do banco da cidade incompleta.");
   }
@@ -342,10 +348,26 @@ async function executeWhitelistOperation(settings, operation, identifierValue, o
     }
   }
 
+  if (cityTarget) {
+    logCityDb("warn", "whitelist_direct_only", {
+      guildId: settings.guild_id,
+      operation,
+      lastDirectCode: lastDirect?.code || null,
+    });
+    if (lastDirect) {
+      return lastDirect.ok ? normalizeWhitelistResult(lastDirect) : decorateCityFailure(lastDirect);
+    }
+    return decorateCityFailure({
+      ok: false,
+      code: "offline",
+      message: "O banco da cidade nao esta online no IP salvo. O launcher nao e mais usado depois da primeira conexao.",
+    });
+  }
+
   if (launcherCityDb) {
     const hint = await readLauncherHint(settings.guild_id);
     if (hint?.online) {
-      logCityDb("info", "whitelist_launcher_assist", {
+      logCityDb("info", "whitelist_launcher_first_setup", {
         guildId: settings.guild_id,
         operation,
       });
@@ -353,21 +375,15 @@ async function executeWhitelistOperation(settings, operation, identifierValue, o
     }
   }
 
-  logCityDb("warn", "whitelist_offline", {
+  logCityDb("warn", "whitelist_missing_host", {
     guildId: settings.guild_id,
     operation,
-    hasDirectTarget: Boolean(cityTarget),
-    lastDirectCode: lastDirect?.code || null,
   });
-  if (lastDirect) {
-    return lastDirect.ok ? normalizeWhitelistResult(lastDirect) : decorateCityFailure(lastDirect);
-  }
   return decorateCityFailure({
     ok: false,
     code: "offline",
-    message: cityTarget
-      ? "O banco da cidade nao esta online agora."
-      : "Conexao do banco da cidade incompleta. Configure o IP publico, o usuario e a senha no painel.",
+    message:
+      "Informe o IP publico da VPS no painel. O launcher so e necessario na primeira configuracao; se o IP foi apagado, a conexao precisa ser feita de novo.",
   });
 }
 
