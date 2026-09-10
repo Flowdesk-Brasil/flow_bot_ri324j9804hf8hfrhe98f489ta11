@@ -129,7 +129,7 @@ function explainCityDbFailure(error) {
       code: "invalid_credentials",
       title: "O banco recusou o usuario",
       message: "Usuario ou senha nao conferem com o MySQL da sua VPS.",
-      hint: "Use o mesmo usuario e senha do HeidiSQL. A Flowdesk so envia o que voce salvou no painel.",
+      hint: "Se o HeidiSQL na VPS entra e o bot nao, o usuario so existe em localhost. Rode o SQL do painel de novo — ele agora libera o host %.",
       retryable: false,
       evictPool: false,
     };
