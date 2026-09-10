@@ -7,11 +7,41 @@ const {
   classifyDbError,
   logCityDb,
 } = require("./cityDbRuntime");
+const { explainCityDbFailure } = require("./cityDbErrors");
 
 const IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const PORT_PROBE_MS = 300;
 const PORT_CACHE_MS = 120_000;
 const portProbeCache = new Map();
+
+function decorateCityFailure(result) {
+  const issue = explainCityDbFailure({
+    code: result?.code,
+    message: result?.message || result?.title || "O banco da cidade nao esta online.",
+  });
+  return {
+    ok: false,
+    ...result,
+    code: result?.code || issue.code,
+    title: result?.title || issue.title,
+    message: result?.message && !/catch|undefined/i.test(String(result.message))
+      ? `${result.message}${result.hint ? "" : ` ${issue.hint}`}`
+      : `${issue.message} ${issue.hint}`.trim(),
+    hint: result?.hint || issue.hint,
+  };
+}
+
+async function readLauncherHint(guildId) {
+  try {
+    const db = require("./whitelistDbService");
+    if (typeof db.getLauncherConnectivityHint !== "function") {
+      return { online: false, reason: "missing" };
+    }
+    return await db.getLauncherConnectivityHint(guildId);
+  } catch {
+    return { online: false, reason: "unknown" };
+  }
+}
 
 function isSafeSqlIdentifier(value) {
   return IDENTIFIER_RE.test(String(value || ""));
@@ -295,7 +325,7 @@ async function executeWhitelistOperation(settings, operation, identifierValue, o
         return normalizeWhitelistResult(direct);
       }
       if (direct && !isRetryableLauncherCode(direct.code)) {
-        return direct;
+        return decorateCityFailure(direct);
       }
     } catch (error) {
       const sanitized = sanitizeCityDbError(error);
@@ -307,14 +337,13 @@ async function executeWhitelistOperation(settings, operation, identifierValue, o
         message: sanitized.message,
       });
       if (!isRetryableLauncherCode(sanitized.code)) {
-        return lastDirect;
+        return decorateCityFailure(lastDirect);
       }
     }
   }
 
   if (launcherCityDb) {
-    const db = require("./whitelistDbService");
-    const hint = await db.getLauncherConnectivityHint(settings.guild_id).catch(() => ({ online: false }));
+    const hint = await readLauncherHint(settings.guild_id);
     if (hint?.online) {
       logCityDb("info", "whitelist_launcher_assist", {
         guildId: settings.guild_id,
@@ -331,15 +360,15 @@ async function executeWhitelistOperation(settings, operation, identifierValue, o
     lastDirectCode: lastDirect?.code || null,
   });
   if (lastDirect) {
-    return lastDirect.ok ? normalizeWhitelistResult(lastDirect) : lastDirect;
+    return lastDirect.ok ? normalizeWhitelistResult(lastDirect) : decorateCityFailure(lastDirect);
   }
-  return {
+  return decorateCityFailure({
     ok: false,
     code: "offline",
     message: cityTarget
-      ? "Nao foi possivel conectar ao banco da cidade agora. A integracao continua salva e o sistema reconecta automaticamente."
+      ? "O banco da cidade nao esta online agora."
       : "Conexao do banco da cidade incompleta. Configure o IP publico, o usuario e a senha no painel.",
-  };
+  });
 }
 
 function inferWhitelistChanged(result) {
@@ -400,12 +429,12 @@ function pickBestWhitelistResult(results) {
     list.find((item) => item.code && item.code !== "port_closed") ||
     list.find((item) => item.ok === false) ||
     null;
-  if (failure) return failure;
-  return {
+  if (failure) return decorateCityFailure(failure);
+  return decorateCityFailure({
     ok: false,
     code: "offline",
-    message: "Nao foi possivel conectar ao banco da cidade agora.",
-  };
+    message: "O banco da cidade nao esta online agora.",
+  });
 }
 
 async function raceCityOperations(
@@ -520,14 +549,14 @@ async function runViaLauncher(settings, operation, identifierValue, mapping, cit
     );
 
     if (finished.status !== "done") {
-      const hint = await db.getLauncherConnectivityHint(settings.guild_id);
-      last = {
+      const hint = await readLauncherHint(settings.guild_id);
+      last = decorateCityFailure({
         ok: false,
         code: finished.status === "timeout" ? "vps_timeout" : "offline",
         message:
           finished.error_message ||
           buildLauncherWaitMessage(hint),
-      };
+      });
       if (finished.status === "timeout") {
         await db.requeueStaleAgentJobs(settings.guild_id, fast ? 15000 : 45000);
       }
@@ -683,7 +712,13 @@ function mappingFingerprint(mapping) {
 
 function sanitizeCityDbError(error) {
   const classified = classifyDbError(error);
-  return { code: classified.code, message: classified.message };
+  const issue = explainCityDbFailure(error);
+  return {
+    code: classified.code || issue.code,
+    title: issue.title,
+    message: classified.message || `${issue.message} ${issue.hint}`.trim(),
+    hint: issue.hint,
+  };
 }
 
 module.exports = {

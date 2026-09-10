@@ -278,8 +278,10 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
     await replyEphemeral(
       interaction,
       buildNoticePayload(
-        "Banco nao sincronizado",
-        `${result.message || "Nao foi possivel consultar o banco da cidade agora."} Tente novamente em instantes.`,
+        result.title || "Banco da cidade offline",
+        `${result.message || "O MySQL da sua VPS nao esta acessivel agora."}${
+          result.hint ? ` ${result.hint}` : " Isso nao e um erro da Flowdesk — ligue o banco da cidade e tente de novo."
+        }`,
       ),
     );
     void persistWhitelistFailure({
@@ -846,15 +848,24 @@ async function applyWhitelistChange({
 
     if (!result.ok) {
       const missingPlayer = result.code === "player_not_found" || isCityPlayerMissing(result);
+      const offline = ["offline", "timeout", "vps_timeout", "circuit_open", "pool_exhausted"].includes(
+        String(result.code || ""),
+      );
       await replyEphemeral(
         interaction,
         buildNoticePayload(
-          missingPlayer ? "ID nao encontrado" : "Banco nao sincronizado",
+          missingPlayer
+            ? "ID nao encontrado"
+            : result.title || (offline ? "Banco da cidade offline" : "Banco da cidade indisponivel"),
           missingPlayer
             ? "Esse ID nao existe no banco da cidade. A whitelist so e liberada para um ID cadastrado."
-              : autoApproved
-                ? `${result.message || "O banco da cidade ainda esta sincronizando."} O pedido continua aberto e o sistema tenta de novo sozinho.`
-                : `${result.message || "Nao foi possivel aplicar a whitelist no banco da cidade."} O pedido permanece aberto e o sistema tenta de novo sozinho.`,
+            : `${result.message || "O MySQL da sua VPS nao esta acessivel agora."}${
+                result.hint ? `\n${result.hint}` : " Isso nao e um erro da Flowdesk — ligue o banco da cidade e tente de novo."
+              }${
+                autoApproved
+                  ? " O pedido continua aberto e o sistema tenta de novo sozinho."
+                  : " O pedido permanece aberto e o sistema tenta de novo sozinho."
+              }`,
         ),
       );
       void persistWhitelistFailure({
@@ -926,14 +937,15 @@ async function persistWhitelistFailure({
     sendWhitelistLog({
       guild: interaction.guild,
       settings,
-      title: "Falha ao sincronizar whitelist",
+      title: result.title || "Banco da cidade offline",
       color: 0xe74c3c,
       lines: [
         `**Pedido:** \`${request.id}\``,
         `**Membro:** <@${request.user_id}>`,
-        `**Erro:** ${clampText(result.message || "Falha no banco da cidade.", 180)}`,
+        `**Erro:** ${clampText(result.message || "O banco da cidade nao esta online.", 180)}`,
+        result.hint ? `**Obs:** ${clampText(result.hint, 180)}` : "",
         `**Correlation:** \`${correlationId}\``,
-      ],
+      ].filter(Boolean),
     }),
   ]).catch(() => null);
 }

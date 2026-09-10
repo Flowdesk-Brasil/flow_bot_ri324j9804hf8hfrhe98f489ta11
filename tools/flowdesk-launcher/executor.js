@@ -178,7 +178,11 @@ async function withCityDatabase(target, fn) {
         return result.rows || [];
       });
     } finally {
-      await Promise.resolve(client.end?.()).catch(() => null);
+      try {
+        await client.end();
+      } catch {
+        /* ignore */
+      }
     }
   }
 
@@ -222,10 +226,10 @@ function sanitizeError(error) {
       message: `Usuario ou senha do banco local invalidos (${account}). O launcher tenta de novo com as credenciais salvas na primeira conexao.`,
     };
   }
-  if (lowered.includes("econnrefused") || lowered.includes("enotfound") || lowered.includes("ehostunreach")) {
+  if (lowered.includes("econnrefused") || lowered.includes("enotfound") || lowered.includes("ehostunreach") || lowered.includes("reading 'catch'") || lowered.includes("cannot read properties of undefined")) {
     return {
       code: "offline",
-      message: "MySQL fechado nesta VPS. O launcher vai abrir o script de portas. Confira se o servico MySQL esta iniciado.",
+      message: "O banco da cidade nao esta online nesta VPS. Ligue o MySQL/MariaDB e tente de novo. Isso nao e um erro da Flowdesk.",
     };
   }
   if (lowered.includes("not allowed to connect") || lowered.includes("host is blocked")) {

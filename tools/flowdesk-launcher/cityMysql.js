@@ -1,8 +1,8 @@
 function settleMaybePromise(value) {
-  if (value == null || typeof value.then !== "function") {
-    return Promise.resolve();
-  }
-  return value.catch(() => null);
+  return Promise.resolve(value).then(
+    () => undefined,
+    () => undefined,
+  );
 }
 
 const mysql = require("mysql2/promise");

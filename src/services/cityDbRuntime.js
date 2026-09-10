@@ -170,76 +170,18 @@ function getBreaker(poolKey) {
 function classifyDbError(error) {
   const errno = String(error?.code || error?.errno || "").toUpperCase();
   const sqlState = String(error?.sqlState || "").toUpperCase();
-  const message = redactSecrets(error?.message || "Falha no banco da cidade.");
-  const lowered = message.toLowerCase();
-
-  if (errno === "CIRCUIT_OPEN" || error?.code === "circuit_open") {
-    return {
-      code: "circuit_open",
-      message: "Banco da cidade temporariamente indisponivel. Tente novamente em instantes.",
-      retryable: true,
-      evictPool: false,
-    };
-  }
-  if (/reading ['"]catch['"]/i.test(message)) {
-    return {
-      code: "offline",
-      message: "Falha ao finalizar a conexao com o banco. O sistema reconecta automaticamente.",
-      retryable: true,
-      evictPool: true,
-    };
-  }
-  if (errno === "ER_CON_COUNT_ERROR" || lowered.includes("too many connections")) {
-    return {
-      code: "pool_exhausted",
-      message: "O banco da cidade atingiu o limite de conexoes. Tente novamente em instantes.",
-      retryable: true,
-      evictPool: false,
-    };
-  }
-  if (lowered.includes("timeout") || errno === "ETIMEDOUT") {
-    return {
-      code: "timeout",
-      message: "Banco da cidade nao respondeu a tempo.",
-      retryable: true,
-      evictPool: true,
-    };
-  }
-  if (
-    lowered.includes("access denied") ||
-    lowered.includes("password") ||
-    errno === "ER_ACCESS_DENIED_ERROR" ||
-    errno === "28000"
-  ) {
-    return {
-      code: "invalid_credentials",
-      message: "Credencial do banco invalida.",
-      retryable: false,
-      evictPool: false,
-    };
-  }
-  if (
+  const { explainCityDbFailure } = require("./cityDbErrors");
+  const issue = explainCityDbFailure(error);
+  const retryableByNetwork =
     RETRYABLE_ERRNO.has(errno) ||
     RETRYABLE_SQL_STATE.has(sqlState) ||
-    lowered.includes("econnrefused") ||
-    lowered.includes("enotfound") ||
-    lowered.includes("connection lost") ||
-    lowered.includes("server has gone away") ||
-    lowered.includes("cannot enqueue")
-  ) {
-    return {
-      code: "offline",
-      message:
-        "Conexao com o banco da cidade foi interrompida. O sistema tentara reconectar automaticamente.",
-      retryable: true,
-      evictPool: true,
-    };
-  }
+    issue.retryable === true;
   return {
-    code: "db_error",
-    message: "Falha ao sincronizar a whitelist com o banco da cidade.",
-    retryable: false,
-    evictPool: false,
+    code: issue.code,
+    title: issue.title,
+    message: `${issue.message} ${issue.hint}`.trim(),
+    retryable: retryableByNetwork,
+    evictPool: issue.evictPool === true || retryableByNetwork,
   };
 }
 

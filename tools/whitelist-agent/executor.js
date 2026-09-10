@@ -1,5 +1,5 @@
 const { Client } = require("pg");
-const { connectCityMysql } = require("../flowdesk-launcher/cityMysql");
+const { connectCityMysql, releaseCityMysql } = require("../flowdesk-launcher/cityMysql");
 
 const IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const CONNECT_TIMEOUT_MS = 8000;
@@ -173,7 +173,11 @@ async function withCityDatabase(target, fn) {
         return result.rows || [];
       });
     } finally {
-      await Promise.resolve(client.end?.()).catch(() => null);
+      try {
+        await client.end();
+      } catch {
+        /* ignore */
+      }
     }
   }
 
@@ -184,14 +188,16 @@ async function withCityDatabase(target, fn) {
       return Array.isArray(rows) ? rows : [];
     });
   } finally {
-    await Promise.resolve(connection.end?.()).catch(() => null);
+    await releaseCityMysql(connection);
   }
 }
 
 function sanitizeError(error) {
   const message = String(error?.message || "Falha no banco local.");
   const lowered = message.toLowerCase();
-  if (lowered.includes("timeout")) return { code: "timeout", message: "Banco local nao respondeu a tempo." };
+  if (lowered.includes("timeout") || lowered.includes("etimedout")) {
+    return { code: "timeout", message: "O MySQL desta VPS nao respondeu. Confira se o servico esta ligado. Isso nao e um erro da Flowdesk." };
+  }
   if (lowered.includes("unknown database")) {
     return { code: "unknown_database", message: "O nome do banco nao existe neste MySQL." };
   }
@@ -202,10 +208,21 @@ function sanitizeError(error) {
         "MariaDB recusou o usuario. Rode o SQL do painel (usuariodeteste / 12345) na aba Consulta do HeidiSQL, como root.",
     };
   }
-  if (lowered.includes("econnrefused") || lowered.includes("enotfound")) {
-    return { code: "offline", message: "Nao foi possivel conectar em localhost / 127.0.0.1." };
+  if (
+    lowered.includes("econnrefused") ||
+    lowered.includes("enotfound") ||
+    lowered.includes("reading 'catch'") ||
+    lowered.includes("cannot read properties of undefined")
+  ) {
+    return {
+      code: "offline",
+      message: "O banco da cidade nao esta online nesta VPS. Ligue o MySQL/MariaDB em localhost e tente de novo. Isso nao e um erro da Flowdesk.",
+    };
   }
-  return { code: "db_error", message: "Falha ao executar a operacao no banco local." };
+  return {
+    code: "db_error",
+    message: "O banco da cidade recusou a operacao. Confira usuario, senha e se o MySQL esta ligado.",
+  };
 }
 
 async function inspectSchema(target) {

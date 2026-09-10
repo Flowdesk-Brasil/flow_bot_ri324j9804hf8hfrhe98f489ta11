@@ -1,10 +1,8 @@
 async function settleMaybePromise(value) {
   try {
-    if (value != null && typeof value.then === "function") {
-      await value;
-    }
+    await value;
   } catch {
-    /* ignore close/release/rollback failures */
+    /* ignore close/release/rollback failures — never call .catch on a maybe-undefined value */
   }
 }
 

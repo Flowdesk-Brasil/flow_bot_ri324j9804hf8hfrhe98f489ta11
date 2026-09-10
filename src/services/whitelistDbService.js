@@ -237,25 +237,29 @@ async function findPendingAgentJob(guildId, operation, identifierValue) {
 }
 
 async function getLauncherConnectivityHint(guildId) {
-  const result = await supabase
-    .from("launcher_devices")
-    .select("connection_status, last_seen_at, last_error")
-    .eq("guild_id", guildId)
-    .order("last_seen_at", { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  const row = unwrap(result, "getLauncherConnectivityHint");
-  if (!row) {
-    return { online: false, reason: "missing" };
+  try {
+    const result = await supabase
+      .from("launcher_devices")
+      .select("connection_status, last_seen_at, last_error")
+      .eq("guild_id", guildId)
+      .order("last_seen_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    const row = unwrap(result, "getLauncherConnectivityHint");
+    if (!row) {
+      return { online: false, reason: "missing" };
+    }
+    const lastSeen = Date.parse(String(row.last_seen_at || ""));
+    const fresh = Number.isFinite(lastSeen) && Date.now() - lastSeen < 45_000;
+    const online = row.connection_status === "online" && fresh;
+    return {
+      online,
+      reason: row.connection_status || "unknown",
+      lastError: row.last_error || null,
+    };
+  } catch {
+    return { online: false, reason: "unknown" };
   }
-  const lastSeen = Date.parse(String(row.last_seen_at || ""));
-  const fresh = Number.isFinite(lastSeen) && Date.now() - lastSeen < 45_000;
-  const online = row.connection_status === "online" && fresh;
-  return {
-    online,
-    reason: row.connection_status || "unknown",
-    lastError: row.last_error || null,
-  };
 }
 
 async function waitForAgentJob(jobId, timeoutMs = 15000, pollMs = 50, options = {}) {
