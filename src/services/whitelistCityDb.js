@@ -380,20 +380,8 @@ async function executeWhitelistOperation(settings, operation, identifierValue, o
     }
   }
 
-  if (cityTarget) {
-    logCityDb("warn", "whitelist_direct_only", {
-      guildId: settings.guild_id,
-      operation,
-      lastDirectCode: lastDirect?.code || null,
-    });
-    if (lastDirect) {
-      return lastDirect.ok ? normalizeWhitelistResult(lastDirect) : decorateCityFailure(lastDirect);
-    }
-    return decorateCityFailure({
-      ok: false,
-      code: "offline",
-      message: "O banco da cidade nao esta online no IP salvo. O launcher nao e mais usado depois da primeira conexao.",
-    });
+  if (cityTarget && lastDirect && !isRetryableLauncherCode(lastDirect.code)) {
+    return decorateCityFailure(lastDirect);
   }
 
   if (launcherCityDb) {
@@ -407,15 +395,21 @@ async function executeWhitelistOperation(settings, operation, identifierValue, o
     }
   }
 
-  logCityDb("warn", "whitelist_missing_host", {
+  logCityDb("warn", "whitelist_unreachable", {
     guildId: settings.guild_id,
     operation,
+    lastDirectCode: lastDirect?.code || null,
   });
+  if (lastDirect) {
+    return decorateCityFailure(lastDirect);
+  }
   return decorateCityFailure({
     ok: false,
-    code: "offline",
+    code: "timeout",
+    title: "O MySQL do XAMPP so aceita conexao local",
     message:
-      "Informe o IP publico da VPS no painel. O launcher so e necessario na primeira configuracao; se o IP foi apagado, a conexao precisa ser feita de novo.",
+      "O servico esta ligado na VPS, mas a porta 3306 nao responde pela internet. O HeidiSQL na propria maquina nao prova o acesso remoto.",
+    hint: "No XAMPP: Config > my.ini, bind-address=0.0.0.0, reinicie o MySQL e libere 3306 no firewall. Ou abra o launcher nesta conexao.",
   });
 }
 

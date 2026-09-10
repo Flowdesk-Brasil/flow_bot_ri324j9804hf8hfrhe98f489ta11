@@ -199,7 +199,7 @@ function explainCityDbFailure(error) {
       code: "timeout",
       title: "O banco da cidade nao respondeu",
       message: "O MySQL/MariaDB da sua VPS nao respondeu a tempo.",
-      hint: `${OWNER_HINT} Confira se o servico esta rodando e se a porta nao esta filtrada.`,
+      hint: "O HeidiSQL na VPS nao prova acesso remoto. No XAMPP, my.ini: bind-address=0.0.0.0, reinicie o MySQL e libere 3306 no firewall. Ou abra o launcher so nesta conexao.",
       retryable: true,
       evictPool: true,
     };
