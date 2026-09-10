@@ -10,9 +10,11 @@ const {
 const { explainCityDbFailure } = require("./cityDbErrors");
 
 const IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const PORT_PROBE_MS = 300;
+const PORT_PROBE_MS = 250;
 const PORT_CACHE_MS = 120_000;
+const HINT_CACHE_MS = 2_500;
 const portProbeCache = new Map();
+const launcherHintCache = new Map();
 
 function decorateCityFailure(result) {
   const { uniqueNotice } = require("./cityDbErrors");
@@ -64,12 +66,19 @@ function identifierCandidates(value) {
 }
 
 async function readLauncherHint(guildId) {
+  const cacheKey = String(guildId || "");
+  const cached = launcherHintCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < HINT_CACHE_MS) {
+    return cached.value;
+  }
   try {
     const db = require("./whitelistDbService");
     if (typeof db.getLauncherConnectivityHint !== "function") {
       return { online: false, reason: "missing" };
     }
-    return await db.getLauncherConnectivityHint(guildId);
+    const value = await db.getLauncherConnectivityHint(guildId);
+    launcherHintCache.set(cacheKey, { at: Date.now(), value });
+    return value;
   } catch {
     return { online: false, reason: "unknown" };
   }
@@ -337,56 +346,78 @@ async function executeWhitelistOperation(settings, operation, identifierValue, o
           password: cityTarget.password,
         }
       : null);
-  const launcherOpts = options.interactive ? { priority: "interactive" } : {};
+  const interactive = Boolean(options.interactive);
+  const launcherOpts = {
+    priority: interactive ? "interactive" : "background",
+  };
 
-  if (launcherCityDb) {
-    const hint = await readLauncherHint(settings.guild_id);
-    if (hint?.online) {
-      logCityDb("info", "whitelist_launcher_local", {
-        guildId: settings.guild_id,
-        operation,
-      });
-      try {
-        const viaLauncher = await runViaLauncher(
-          settings,
-          operation,
-          identifierValue,
-          mapping,
-          launcherCityDb,
-          launcherOpts,
-        );
-        if (viaLauncher?.ok || !isRetryableLauncherCode(viaLauncher?.code)) {
-          return viaLauncher?.ok ? normalizeWhitelistResult(viaLauncher) : decorateCityFailure(viaLauncher);
+  const hintPromise = launcherCityDb ? readLauncherHint(settings.guild_id) : Promise.resolve({ online: false });
+  const useDirect = Boolean(cityTarget);
+  const directTask = useDirect
+    ? (async () => {
+        const portOpen = await probeCityPort(cityTarget.host, cityTarget.port);
+        if (!portOpen) {
+          return { ok: false, code: "port_closed", message: "Porta do banco fechada." };
         }
-      } catch (error) {
+        try {
+          return await runDirectWhitelistOperation(settings, mapping, operation, identifierValue, {
+            interactive,
+          });
+        } catch (error) {
+          const sanitized = decorateCityFailure(sanitizeCityDbError(error));
+          if (sanitized.code === "offline" || sanitized.code === "timeout") {
+            rememberPortState(cityTarget.host, cityTarget.port, false);
+          }
+          return sanitized;
+        }
+      })()
+    : null;
+
+  const hint = await hintPromise;
+  const useLauncher = Boolean(launcherCityDb && (hint?.online || !cityTarget));
+
+  if (useLauncher && hint?.online) {
+    logCityDb("info", "whitelist_launcher_local", {
+      guildId: settings.guild_id,
+      operation,
+    });
+  }
+
+  const launcherTask = useLauncher
+    ? runViaLauncher(settings, operation, identifierValue, mapping, launcherCityDb, {
+        ...launcherOpts,
+        brief: interactive && !hint?.online,
+      }).catch((error) => {
         logCityDb("warn", "whitelist_launcher_error", {
           guildId: settings.guild_id,
           operation,
           message: error instanceof Error ? error.message : String(error),
         });
-      }
-    }
-  }
+        return decorateCityFailure({
+          ok: false,
+          code: "offline",
+          message: error instanceof Error ? error.message : String(error),
+        });
+      })
+    : null;
 
-  if (cityTarget) {
-    try {
-      const direct = await runDirectWhitelistOperation(settings, mapping, operation, identifierValue, {
-        interactive: Boolean(options.interactive),
-      });
-      if (direct?.ok) {
-        return normalizeWhitelistResult(direct);
-      }
-      if (direct?.code === "player_not_found" || direct?.code === "multiple_players") {
-        return normalizeWhitelistResult(direct);
-      }
-      if (direct && !isRetryableLauncherCode(direct.code)) {
-        return decorateCityFailure(direct);
-      }
-    } catch (error) {
-      const sanitized = sanitizeCityDbError(error);
-      if (!isRetryableLauncherCode(sanitized.code)) {
-        return decorateCityFailure(sanitized);
-      }
+  if (launcherTask && directTask) {
+    return raceFirstDecisiveResult([directTask, launcherTask]);
+  }
+  if (launcherTask) {
+    const viaLauncher = await launcherTask;
+    if (viaLauncher?.ok || isDecisiveCityResult(viaLauncher)) {
+      return viaLauncher?.ok ? normalizeWhitelistResult(viaLauncher) : decorateCityFailure(viaLauncher);
+    }
+    return decorateCityFailure(viaLauncher || { ok: false, code: "city_deferred" });
+  }
+  if (directTask) {
+    const direct = await directTask;
+    if (direct?.ok || isDecisiveCityResult(direct)) {
+      return direct?.ok ? normalizeWhitelistResult(direct) : decorateCityFailure(direct);
+    }
+    if (direct && !isRetryableLauncherCode(direct.code)) {
+      return decorateCityFailure(direct);
     }
   }
 
@@ -473,56 +504,50 @@ function pickBestWhitelistResult(results) {
   });
 }
 
-async function raceCityOperations(
-  settings,
-  mapping,
-  operation,
-  identifierValue,
-  cityTarget,
-  launcherCityDb,
-  launcherOpts,
-) {
-  const interactive = launcherOpts?.priority === "interactive";
-  const launcherTask = runViaLauncher(
-    settings,
-    operation,
-    identifierValue,
-    mapping,
-    launcherCityDb,
-    launcherOpts,
+function isDecisiveCityResult(result) {
+  if (!result || typeof result !== "object") return false;
+  if (result.ok === true) return true;
+  const code = String(result.code || "");
+  return (
+    code === "player_not_found" ||
+    code === "multiple_players" ||
+    (result.ok === false && code !== "" && !isRetryableLauncherCode(code) && code !== "port_closed")
   );
+}
 
-  const directTask = (async () => {
-    const portOpen = await probeCityPort(cityTarget.host, cityTarget.port);
-    if (!portOpen) {
-      return { ok: false, code: "port_closed", message: "Porta do banco fechada." };
+async function raceFirstDecisiveResult(tasks) {
+  return new Promise((resolve) => {
+    const collected = [];
+    let pending = tasks.length;
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    for (const task of tasks) {
+      Promise.resolve(task)
+        .then((value) => {
+          const normalized = value?.ok ? normalizeWhitelistResult(value) : decorateCityFailure(value || {});
+          collected.push(normalized);
+          if (isDecisiveCityResult(normalized)) {
+            finish(normalized);
+            return;
+          }
+          pending -= 1;
+          if (pending <= 0) {
+            finish(pickBestWhitelistResult(collected));
+          }
+        })
+        .catch((error) => {
+          collected.push(decorateCityFailure(sanitizeCityDbError(error)));
+          pending -= 1;
+          if (pending <= 0) {
+            finish(pickBestWhitelistResult(collected));
+          }
+        });
     }
-    try {
-      return await runDirectWhitelistOperation(settings, mapping, operation, identifierValue, {
-        interactive: Boolean(interactive),
-      });
-    } catch (error) {
-      const sanitized = sanitizeCityDbError(error);
-      if (sanitized.code !== "offline" && sanitized.code !== "timeout") {
-        return { ok: false, ...sanitized };
-      }
-      rememberPortState(cityTarget.host, cityTarget.port, false);
-      return { ok: false, ...sanitized };
-    }
-  })();
-
-  if (interactive) {
-    const direct = await directTask;
-    if (direct?.ok === true) {
-      return normalizeWhitelistResult(direct);
-    }
-    const launcher = await launcherTask;
-    return pickBestWhitelistResult([direct, launcher]);
-  }
-
-  const settled = await Promise.allSettled([directTask, launcherTask]);
-  const values = settled.map((entry) => (entry.status === "fulfilled" ? entry.value : entry.reason));
-  return pickBestWhitelistResult(values);
+  });
 }
 
 function buildLauncherWaitMessage(hint) {
@@ -538,28 +563,32 @@ function buildLauncherWaitMessage(hint) {
 async function runViaLauncher(settings, operation, identifierValue, mapping, cityDb, options = {}) {
   const db = require("./whitelistDbService");
   const fast = options.priority === "interactive";
-  const attempts = fast ? 3 : 3;
-  const timeouts = fast ? [8000, 12000, 16000] : [9000, 14000, 18000];
-  const pollMs = fast ? 20 : 50;
-  const waitOpts = fast
-    ? { extendIfClaimed: true, extendMs: 14000, maxTotalMs: 28000 }
-    : { extendIfClaimed: true, extendMs: 10000, maxTotalMs: 24000 };
+  const brief = options.brief === true;
+  const attempts = brief ? 1 : fast ? 1 : 2;
+  const timeouts = brief ? [2200] : fast ? [5500] : [8000, 12000];
+  const pollMs = fast || brief ? 15 : 40;
+  const waitOpts = brief
+    ? { extendIfClaimed: true, extendMs: 1500, maxTotalMs: 3200 }
+    : fast
+      ? { extendIfClaimed: true, extendMs: 3500, maxTotalMs: 8000 }
+      : { extendIfClaimed: true, extendMs: 8000, maxTotalMs: 18000 };
   let last = {
     ok: false,
     code: "offline",
     message: "Nao foi possivel enfileirar o SQL no launcher da VPS.",
   };
 
-  await db.requeueStaleAgentJobs(settings.guild_id, fast ? 25000 : 90000);
+  if (!fast && !brief) {
+    await db.requeueStaleAgentJobs(settings.guild_id, 60000);
+  }
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    await db.requeueStaleAgentJobs(settings.guild_id, fast ? 20000 : 60000);
-
     let jobId = null;
-    const pending = await db.findPendingAgentJob(settings.guild_id, operation, identifierValue);
-    if (pending?.id) {
-      jobId = pending.id;
-    } else {
+    if (!fast) {
+      const pending = await db.findPendingAgentJob(settings.guild_id, operation, identifierValue);
+      if (pending?.id) jobId = pending.id;
+    }
+    if (!jobId) {
       const queued = await db.enqueueAgentJob({
         guild_id: settings.guild_id,
         operation,
@@ -573,7 +602,7 @@ async function runViaLauncher(settings, operation, identifierValue, mapping, cit
     }
 
     if (!jobId) {
-      await sleep(fast ? 200 * attempt : 400 * attempt);
+      await sleep(fast ? 80 * attempt : 250 * attempt);
       continue;
     }
 
@@ -585,19 +614,17 @@ async function runViaLauncher(settings, operation, identifierValue, mapping, cit
     );
 
     if (finished.status !== "done") {
-      const hint = await readLauncherHint(settings.guild_id);
       last = decorateCityFailure({
         ok: false,
         code: finished.status === "timeout" ? "vps_timeout" : "offline",
-        message:
-          finished.error_message ||
-          buildLauncherWaitMessage(hint),
+        message: finished.error_message || buildLauncherWaitMessage(await readLauncherHint(settings.guild_id)),
       });
-      if (finished.status === "timeout") {
-        await db.requeueStaleAgentJobs(settings.guild_id, fast ? 15000 : 45000);
+      if (finished.status === "timeout" && !fast && !brief) {
+        await db.requeueStaleAgentJobs(settings.guild_id, 45000);
+        await sleep(400 * attempt);
+        continue;
       }
-      await sleep(fast ? 350 * attempt : 600 * attempt);
-      continue;
+      return last;
     }
     const result = finished.result && typeof finished.result === "object" ? finished.result : {};
     if (result.ok === false) {
@@ -609,8 +636,8 @@ async function runViaLauncher(settings, operation, identifierValue, mapping, cit
         previousValue: result.previousValue,
         nextValue: result.nextValue,
       };
-      if (!isRetryableLauncherCode(last.code)) return last;
-      await sleep(fast ? 200 * attempt : 400 * attempt);
+      if (!isRetryableLauncherCode(last.code) || fast || brief) return last;
+      await sleep(200 * attempt);
       continue;
     }
     return normalizeWhitelistResult({

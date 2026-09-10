@@ -3,17 +3,18 @@ const mysql = require("mysql2/promise");
 const { Pool: PgPool } = require("pg");
 const { settleMaybePromise } = require("../utils/settleMaybePromise");
 
-const CONNECT_TIMEOUT_MS = 12_000;
+const CONNECT_TIMEOUT_MS = 4_500;
 const QUERY_TIMEOUT_MS = 6_000;
-const INTERACTIVE_QUERY_TIMEOUT_MS = 4_500;
+const INTERACTIVE_QUERY_TIMEOUT_MS = 2_200;
+const INTERACTIVE_BUDGET_MS = 3_800;
 const POOL_CONNECTION_LIMIT = 8;
 const POOL_MAX_IDLE = 6;
 const POOL_IDLE_TIMEOUT_MS = 120_000;
 const POOL_QUEUE_LIMIT = 32;
 const MAX_RETRIES = 4;
-const INTERACTIVE_MAX_RETRIES = 2;
-const RETRY_BASE_MS = 90;
-const RETRY_MAX_MS = 900;
+const INTERACTIVE_MAX_RETRIES = 1;
+const RETRY_BASE_MS = 60;
+const RETRY_MAX_MS = 400;
 const CIRCUIT_FAILURE_THRESHOLD = 8;
 const CIRCUIT_OPEN_MS = 12_000;
 const MAX_CONCURRENT_OPS = 10;
@@ -393,7 +394,7 @@ async function runOnce(target, poolKey, fn, options) {
   return value;
 }
 
-async function executeWithCityDb(target, fn, options = {}) {
+async function executeWithCityDbInner(target, fn, options = {}) {
   const poolKey = buildPoolKey(target);
   const breaker = getBreaker(poolKey);
   if (breaker.isOpen()) {
@@ -447,6 +448,27 @@ async function executeWithCityDb(target, fn, options = {}) {
     throw lastError || new Error("Falha ao acessar o banco da cidade.");
   } finally {
     semaphore.release();
+  }
+}
+
+async function executeWithCityDb(target, fn, options = {}) {
+  if (options.interactive !== true) {
+    return executeWithCityDbInner(target, fn, options);
+  }
+  let timer = null;
+  try {
+    return await Promise.race([
+      executeWithCityDbInner(target, fn, options),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const error = new Error("O banco da cidade nao respondeu a tempo.");
+          error.code = "timeout";
+          reject(error);
+        }, INTERACTIVE_BUDGET_MS);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 

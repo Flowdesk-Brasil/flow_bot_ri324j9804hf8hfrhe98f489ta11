@@ -241,6 +241,24 @@ async function lookupCityPlayer(settings, identifierValue, options = {}) {
   }
 }
 
+async function applyCityWhitelist(settings, identifierValue, operation = "APPROVE_WHITELIST") {
+  try {
+    return normalizeWhitelistResult(
+      await executeWhitelistOperation(settings, operation, identifierValue, { interactive: true }),
+    );
+  } catch (error) {
+    return { ok: false, ...sanitizeCityDbError(error) };
+  }
+}
+
+async function prefetchGuildMember(guild, userId) {
+  if (!guild || !userId) return null;
+  return (
+    guild.members.cache.get(userId) ||
+    (await guild.members.fetch({ user: userId, force: false }).catch(() => null))
+  );
+}
+
 async function upsertAutoWhitelistRequest({
   guildId,
   userId,
@@ -284,44 +302,38 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
       if (!interaction.deferred && !interaction.replied) {
         void settleMaybePromise(interaction.deferReply({ flags: MessageFlags.Ephemeral }));
       }
-    }, 1800);
-  }
-
-  let lookup;
-  let result;
-  try {
-    lookup = await lookupCityPlayer(settings, identifierValue, { interactive: true });
-    if (isCityPlayerMissing(lookup) || lookup.code === "player_not_found") {
-      result = lookup;
-    } else if (!lookup.ok) {
-      result = lookup;
-    } else {
-      try {
-        result = normalizeWhitelistResult(
-          await executeWhitelistOperation(settings, "APPROVE_WHITELIST", identifierValue, {
-            interactive: true,
-          }),
-        );
-      } catch (error) {
-        result = { ok: false, ...sanitizeCityDbError(error) };
-      }
-      if (!result.ok && isOptionalCityFailure(result) && isConfirmedCityPlayer(lookup)) {
-        result = deferredCityResult(lookup.playerKey);
-      } else if (result.ok && !isConfirmedCityPlayer(result) && isConfirmedCityPlayer(lookup)) {
-        result = { ...result, playerKey: lookup.playerKey };
-      }
-    }
-  } finally {
-    if (deferTimer) clearTimeout(deferTimer);
+    }, 2200);
   }
 
   const guildId = interaction.guildId;
   const correlationId = randomUUID();
 
+  let result;
+  let memberHint = null;
+  let request = null;
+  try {
+    const settled = await Promise.all([
+      applyCityWhitelist(settings, identifierValue, "APPROVE_WHITELIST"),
+      prefetchGuildMember(interaction.guild, interaction.user.id),
+      upsertAutoWhitelistRequest({
+        guildId,
+        userId: interaction.user.id,
+        identifierKind,
+        identifierValue,
+        playerName,
+        correlationId,
+      }).catch(() => null),
+    ]);
+    result = settled[0];
+    memberHint = settled[1];
+    request = settled[2];
+  } finally {
+    if (deferTimer) clearTimeout(deferTimer);
+  }
+
   if (isCityPlayerMissing(result) || result.code === "player_not_found") {
-    const openRequest = await whitelistDb.findOpenRequest(guildId, interaction.user.id);
-    if (openRequest) {
-      await whitelistDb.updateWhitelistRequest(openRequest.id, {
+    if (request?.id) {
+      await whitelistDb.updateWhitelistRequest(request.id, {
         status: "cancelled",
         apply_error: "ID nao encontrado.",
       }).catch(() => null);
@@ -338,17 +350,7 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
   }
 
   if (!result.ok) {
-    let failedRequest;
-    try {
-      failedRequest = await upsertAutoWhitelistRequest({
-        guildId,
-        userId: interaction.user.id,
-        identifierKind,
-        identifierValue,
-        playerName,
-        correlationId,
-      });
-    } catch {
+    if (!request?.id) {
       await replyEphemeral(
         interaction,
         buildNoticePayload(
@@ -366,7 +368,7 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
     void persistWhitelistFailure({
       interaction,
       settings,
-      request: failedRequest,
+      request,
       result,
       operation: "APPROVE_WHITELIST",
       correlationId,
@@ -374,17 +376,7 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
     return;
   }
 
-  let request;
-  try {
-    request = await upsertAutoWhitelistRequest({
-      guildId,
-      userId: interaction.user.id,
-      identifierKind,
-      identifierValue,
-      playerName,
-      correlationId,
-    });
-  } catch {
+  if (!request?.id) {
     await replyEphemeral(
       interaction,
       buildNoticePayload(
@@ -401,32 +393,34 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
     return;
   }
 
-  await persistWhitelistSuccess({
-    interaction,
-    settings,
-    request,
-    result,
-    approve: true,
-    operation: "APPROVE_WHITELIST",
-    autoApproved: true,
-    correlationId,
-    cityPending: result.deferred === true || result.code === "city_deferred",
-    playerName,
-  });
-
-  await replyEphemeral(
-    interaction,
-    buildWhitelistApplyNotice({ result, approve: true, autoApproved: true }),
-  );
+  const notice = buildWhitelistApplyNotice({ result, approve: true, autoApproved: true });
+  await Promise.all([
+    replyEphemeral(interaction, notice),
+    persistWhitelistSuccess({
+      interaction,
+      settings,
+      request,
+      result,
+      approve: true,
+      operation: "APPROVE_WHITELIST",
+      autoApproved: true,
+      correlationId,
+      cityPending: result.deferred === true || result.code === "city_deferred",
+      playerName,
+      member: memberHint,
+    }),
+  ]);
 }
 
-async function applyApprovedNickname(guild, userId, settings, identifierValue, playerName) {
+async function applyApprovedNickname(guild, userId, settings, identifierValue, playerName, memberHint = null) {
   if (!guild || !userId) return { ok: false, reason: "missing" };
-  let member = guild.members.cache.get(userId) || null;
-  try {
-    member = await guild.members.fetch({ user: userId, force: true });
-  } catch {
-    if (!member) return { ok: false, reason: "member" };
+  let member = memberHint || guild.members.cache.get(userId) || null;
+  if (!member) {
+    try {
+      member = await guild.members.fetch({ user: userId, force: false });
+    } catch {
+      return { ok: false, reason: "member" };
+    }
   }
 
   const parsedName = sanitizePlayerName(playerName);
@@ -545,20 +539,18 @@ async function resolveTextChannel(guild, channelId) {
   return channel;
 }
 
-async function assignRoles(guild, userId, addIds, removeIds) {
+async function assignRoles(guild, userId, addIds, removeIds, memberHint = null) {
   const member =
-    (await guild.members.fetch({ user: userId, force: true }).catch(() => null)) ||
+    memberHint ||
     guild.members.cache.get(userId) ||
-    null;
+    (await guild.members.fetch({ user: userId, force: false }).catch(() => null));
   if (!member) return;
   const toAdd = (Array.isArray(addIds) ? addIds : []).filter(Boolean);
   const toRemove = (Array.isArray(removeIds) ? removeIds : []).filter(Boolean);
-  for (const roleId of toAdd) {
-    await member.roles.add(roleId).catch(() => null);
-  }
-  for (const roleId of toRemove) {
-    await member.roles.remove(roleId).catch(() => null);
-  }
+  await Promise.all([
+    ...toAdd.map((roleId) => member.roles.add(roleId).catch(() => null)),
+    ...toRemove.map((roleId) => member.roles.remove(roleId).catch(() => null)),
+  ]);
 }
 
 function buildReviewPayload({ request, member, identifierKind, identifierValue, status }) {
@@ -963,39 +955,12 @@ async function applyWhitelistChange({
   const cityOperation = cityOperationFor(operation);
 
   try {
-    let result;
-    if (approve) {
-      const lookup = await lookupCityPlayer(settings, request.identifier_value, { interactive: true });
-      if (isCityPlayerMissing(lookup) || lookup.code === "player_not_found") {
-        result = lookup;
-      } else if (!lookup.ok) {
-        result = lookup;
-      } else {
-        try {
-          result = normalizeWhitelistResult(
-            await executeWhitelistOperation(settings, cityOperation, request.identifier_value),
-          );
-        } catch (error) {
-          result = { ok: false, ...sanitizeCityDbError(error) };
-        }
-        if (!result.ok && isOptionalCityFailure(result) && isConfirmedCityPlayer(lookup)) {
-          result = deferredCityResult(lookup.playerKey);
-        } else if (result.ok && !isConfirmedCityPlayer(result) && isConfirmedCityPlayer(lookup)) {
-          result = { ...result, playerKey: lookup.playerKey };
-        }
-      }
-    } else {
-      try {
-        result = normalizeWhitelistResult(
-          await executeWhitelistOperation(settings, cityOperation, request.identifier_value),
-        );
-      } catch (error) {
-        result = { ok: false, ...sanitizeCityDbError(error) };
-      }
-      if (!result.ok && isOptionalCityFailure(result)) {
-        result = deferredCityResult(request.identifier_value);
-      }
+    const memberPromise = prefetchGuildMember(interaction.guild, request.user_id);
+    let result = await applyCityWhitelist(settings, request.identifier_value, cityOperation);
+    if (!approve && !result.ok && isOptionalCityFailure(result)) {
+      result = deferredCityResult(request.identifier_value);
     }
+    const memberHint = await memberPromise;
 
     if (approve && !isConfirmedCityPlayer(result)) {
       const missingPlayer = result.code === "player_not_found" || isCityPlayerMissing(result);
@@ -1038,22 +1003,21 @@ async function applyWhitelistChange({
       return;
     }
 
-    await persistWhitelistSuccess({
-      interaction,
-      settings,
-      request,
-      result,
-      approve,
-      operation,
-      autoApproved,
-      correlationId,
-      cityPending: result.deferred === true || result.code === "city_deferred",
-    });
-
-    await replyEphemeral(
-      interaction,
-      buildWhitelistApplyNotice({ result, approve, autoApproved }),
-    );
+    await Promise.all([
+      replyEphemeral(interaction, buildWhitelistApplyNotice({ result, approve, autoApproved })),
+      persistWhitelistSuccess({
+        interaction,
+        settings,
+        request,
+        result,
+        approve,
+        operation,
+        autoApproved,
+        correlationId,
+        cityPending: result.deferred === true || result.code === "city_deferred",
+        member: memberHint,
+      }),
+    ]);
   } finally {
     applyingLocks.delete(lockKey);
   }
@@ -1121,6 +1085,7 @@ async function persistWhitelistSuccess({
   correlationId,
   cityPending = false,
   playerName = "",
+  member = null,
 }) {
   const resolvedName = String(playerName || request.player_name || "").trim();
   const nextRequest = await whitelistDb.updateWhitelistRequest(request.id, {
@@ -1139,6 +1104,7 @@ async function persistWhitelistSuccess({
     request.user_id,
     approve ? settings.approved_role_ids : settings.denied_role_ids,
     approve ? settings.denied_role_ids : settings.approved_role_ids,
+    member,
   );
   if (approve) {
     await applyApprovedNickname(
@@ -1147,6 +1113,7 @@ async function persistWhitelistSuccess({
       settings,
       request.identifier_value,
       resolvedName,
+      member,
     );
   }
   await Promise.all([

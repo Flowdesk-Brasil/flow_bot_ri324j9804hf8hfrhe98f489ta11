@@ -727,7 +727,7 @@ async function runSync() {
           void runHeal({ elevate: false });
         }
     }
-    backoffMs = results.length ? 80 : 180;
+    backoffMs = 80;
     if (runtime.heal?.ok === false) {
       runtime.message = runtime.heal.message || "Corrigindo o MySQL local...";
       emitState();
