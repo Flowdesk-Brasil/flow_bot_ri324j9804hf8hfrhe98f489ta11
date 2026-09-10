@@ -1,5 +1,6 @@
 const { Client } = require("pg");
 const { connectCityMysql, releaseCityMysql } = require("./cityMysql");
+const { healCityMysql } = require("./cityHeal");
 
 const IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const CONNECT_TIMEOUT_MS = 8000;
@@ -159,7 +160,14 @@ function safeDatabaseName(value) {
   return String(value || "").replace(/[`\\]/g, "");
 }
 
-async function withCityDatabase(target, fn) {
+function looksRecoverableDbError(error) {
+  const text = `${error?.code || ""} ${error?.message || ""}`.toLowerCase();
+  return /econnrefused|etimedout|enotfound|ehostunreach|offline|timeout|nao foi possivel abrir|nao esta online|unknown database|access denied|er_access_denied|econnreset|protocol_connection_lost|pool/.test(
+    text,
+  );
+}
+
+async function withCityDatabaseOnce(target, fn) {
   if (target.engine === "postgres") {
     const client = new Client({
       host: target.host,
@@ -194,6 +202,16 @@ async function withCityDatabase(target, fn) {
     });
   } finally {
     await releaseCityMysql(connection);
+  }
+}
+
+async function withCityDatabase(target, fn) {
+  try {
+    return await withCityDatabaseOnce(target, fn);
+  } catch (error) {
+    if (!looksRecoverableDbError(error)) throw error;
+    await healCityMysql(target);
+    return withCityDatabaseOnce(target, fn);
   }
 }
 

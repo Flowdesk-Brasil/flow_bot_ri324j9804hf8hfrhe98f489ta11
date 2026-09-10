@@ -299,7 +299,7 @@ async function waitForAgentJob(jobId, timeoutMs = 15000, pollMs = 50, options = 
         id: jobId,
         status: "timeout",
         result: null,
-        error_message: "O launcher na VPS nao respondeu a tempo. Na primeira configuracao, abra o app. Depois a whitelist usa o banco direto.",
+        error_message: "O launcher na VPS nao respondeu a tempo. Ele precisa ficar aberto; depois de instalar, sobe com o Windows e corrige o MySQL sozinho.",
       });
     };
 

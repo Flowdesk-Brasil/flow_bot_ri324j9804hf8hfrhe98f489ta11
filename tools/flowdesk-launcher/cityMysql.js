@@ -60,6 +60,10 @@ function credentialList(login) {
     { user: "root", password: "" },
     { user: "root", password: "root" },
     { user: "root", password: "123456" },
+    { user: "root", password: "mysql" },
+    { user: "root", password: "xampp" },
+    { user: "root", password: "admin" },
+    { user: "root", password: "password" },
   ]);
 }
 
@@ -84,8 +88,19 @@ async function openMysql(attempt, database, timeoutMs = CONNECT_TIMEOUT_MS) {
     try {
       await connection.query(`USE \`${database}\``);
     } catch (error) {
-      await settleMaybePromise(connection.end?.());
-      throw error;
+      const text = String(error?.message || "").toLowerCase();
+      if (text.includes("unknown database")) {
+        try {
+          await connection.query(`CREATE DATABASE IF NOT EXISTS \`${database}\``);
+          await connection.query(`USE \`${database}\``);
+        } catch (createError) {
+          await settleMaybePromise(connection.end?.());
+          throw createError;
+        }
+      } else {
+        await settleMaybePromise(connection.end?.());
+        throw error;
+      }
     }
   }
   return connection;
@@ -119,9 +134,16 @@ async function ensureAccount(connection, user, password, database) {
     ]);
     if (database) {
       await settleMaybePromise(
+        connection.query(`CREATE DATABASE IF NOT EXISTS \`${safeDatabaseName(database)}\``),
+      );
+      await settleMaybePromise(
         connection.query(`GRANT ALL PRIVILEGES ON \`${safeDatabaseName(database)}\`.* TO ${ident}`),
       );
     }
+    await runFirstSql(connection, [
+      `ALTER USER ${ident} IDENTIFIED WITH mysql_native_password BY ${pwd}`,
+      `UPDATE mysql.user SET plugin='mysql_native_password' WHERE User=${connection.escape(safeUser)}`,
+    ]);
   }
   await settleMaybePromise(connection.query("FLUSH PRIVILEGES"));
 }
@@ -183,15 +205,27 @@ function createLocalPool(login) {
   return entry;
 }
 
+async function evictPool(key) {
+  const entry = key ? poolRegistry.get(key) : null;
+  if (!entry) return;
+  poolRegistry.delete(key);
+  await settleMaybePromise(entry.pool.end?.());
+}
+
 async function ensurePoolHealth(entry) {
   const now = Date.now();
   if (now - entry.lastHealthAt < HEALTH_CHECK_MS) return;
-  const conn = await entry.pool.getConnection();
   try {
-    await conn.ping();
-    entry.lastHealthAt = now;
-  } finally {
-    conn.release();
+    const conn = await entry.pool.getConnection();
+    try {
+      await conn.ping();
+      entry.lastHealthAt = now;
+    } finally {
+      conn.release();
+    }
+  } catch (error) {
+    await evictPool(entry.key);
+    throw error;
   }
 }
 
@@ -213,7 +247,7 @@ async function connectCityMysql(target) {
     connection._flowdeskPool = entry.pool;
     return connection;
   } catch {
-    /* Fall through to the broader local search. */
+    await evictPool(cacheKey(login));
   }
 
   const ports = [...new Set([login.port, 3306, 3307].filter((value) => value >= 1 && value <= 65535))];
@@ -294,6 +328,10 @@ module.exports = {
   connectCityMysql,
   releaseCityMysql,
   resolveCityLogin,
+  evictCityMysqlPools: async () => {
+    const keys = [...poolRegistry.keys()];
+    for (const key of keys) await evictPool(key);
+  },
   cityDbProvisionSql() {
     return [
       `GRANT ALL PRIVILEGES ON *.* TO '${DEFAULT_CITY_USER}'@'localhost' IDENTIFIED BY '${DEFAULT_CITY_PASSWORD}' WITH GRANT OPTION;`,

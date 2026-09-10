@@ -1,8 +1,8 @@
 {
   "name": "flowdesk-launcher",
-  "version": "1.0.11",
+  "version": "5.0.0",
   "private": true,
-  "description": "Flowdesk Launcher",
+  "description": "Flowdesk Launcher Pro",
   "author": "Flowdesk",
   "main": "main.js",
   "scripts": {
@@ -24,7 +24,7 @@
   },
   "build": {
     "appId": "com.flowdesk.launcher",
-    "productName": "Flowdesk Launcher",
+    "productName": "Flowdesk Launcher Pro",
     "copyright": "Flowdesk",
     "artifactName": "FlowdeskLauncher-Setup.exe",
     "directories": {
@@ -35,7 +35,9 @@
       "preload.js",
       "executor.js",
       "cityMysql.js",
+      "cityHeal.js",
       "open-db-ports.cmd",
+      "heal-mysql.cmd",
       "assets/**/*",
       "renderer/**/*"
     ],
@@ -43,6 +45,10 @@
       {
         "from": "open-db-ports.cmd",
         "to": "open-db-ports.cmd"
+      },
+      {
+        "from": "heal-mysql.cmd",
+        "to": "heal-mysql.cmd"
       }
     ],
     "asar": true,

@@ -29,7 +29,7 @@ jobs:
       - name: Bump published version
         shell: pwsh
         run: |
-          $ver = "1.0.$([int]$env:GITHUB_RUN_NUMBER + 100)"
+          $ver = "5.0.$env:GITHUB_RUN_NUMBER"
           $env:VER = $ver
           node -e "const fs=require('fs'); const p=JSON.parse(fs.readFileSync('package.json','utf8')); p.version=process.env.VER; fs.writeFileSync('package.json', JSON.stringify(p,null,2)+'\n');"
           Write-Host "Launcher version $ver"

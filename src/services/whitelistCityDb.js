@@ -394,8 +394,8 @@ async function executeWhitelistOperation(settings, operation, identifierValue, o
     ok: false,
     code: "city_deferred",
     title: "Sync do jogo pendente",
-    message: "A Flowdesk nao depende do MySQL da cidade. A whitelist do Discord segue; o jogo sincroniza pelo launcher na VPS.",
-    hint: "Nao precisa abrir porta 3306. O launcher na VPS fala com o XAMPP em localhost.",
+    message: "A whitelist do Discord segue. A sync do jogo espera o launcher na VPS, que sobe com o Windows e liga o MySQL local.",
+    hint: "Deixe o launcher na bandeja. Ele fala com o XAMPP em localhost e nao precisa abrir a porta 3306.",
   };
 }
 
@@ -520,11 +520,11 @@ async function raceCityOperations(
 function buildLauncherWaitMessage(hint) {
   if (!hint?.online) {
     if (hint?.reason === "missing") {
-      return "O launcher nao esta vinculado. Na primeira configuracao, abra o app na VPS. Depois a whitelist usa o banco direto.";
+      return "O launcher nao esta vinculado. Instale o Setup na VPS; ele abre com o Windows e fica no ar sozinho.";
     }
-    return "O launcher na VPS esta offline. Se a conexao ja foi salva, a whitelist continua pelo banco direto.";
+    return "O launcher na VPS esta offline. Ele precisa ficar aberto; depois de instalar, sobe com o Windows e corrige o MySQL.";
   }
-  return "O launcher recebeu a tarefa mas ainda esta sincronizando. Se a conexao ja foi salva, o backend tenta o banco direto.";
+  return "O launcher recebeu a tarefa e esta sincronizando o MySQL local.";
 }
 
 async function runViaLauncher(settings, operation, identifierValue, mapping, cityDb, options = {}) {

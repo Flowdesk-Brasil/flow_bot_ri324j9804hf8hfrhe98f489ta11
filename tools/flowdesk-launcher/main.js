@@ -13,6 +13,7 @@ const os = require("os");
 const path = require("path");
 const { exec } = require("child_process");
 const { executeJob, sanitizeError } = require("./executor");
+const { healCityMysql } = require("./cityHeal");
 
 const PROTOCOL = "flowdesk-launcher";
 const PRODUCTION_API_BASES = ["https://www.flwdesk.com", "https://account.flwdesk.com"];
@@ -40,6 +41,7 @@ const runtime = {
   lastError: null,
   publicIp: null,
   update: { status: "idle", version: null },
+  heal: { ok: null, mysql: "unknown", message: "Procurando o MySQL local..." },
 };
 
 function userDataFile(name) {
@@ -93,6 +95,8 @@ function publicState() {
     lastError: runtime.lastError,
     publicIp: runtime.publicIp,
     update: runtime.update,
+    heal: runtime.heal,
+    version: app.getVersion(),
   };
 }
 
@@ -132,8 +136,44 @@ function applyAppBranding() {
   }
 }
 
+function startedHidden() {
+  return (
+    process.argv.includes("--hidden") ||
+    process.argv.includes("--hidden-start") ||
+    Boolean(app.getLoginItemSettings?.().wasOpenedAtLogin)
+  );
+}
+
+function ensureAutoStart() {
+  if (!app.isPackaged) return;
+  try {
+    app.setLoginItemSettings({
+      openAtLogin: true,
+      openAsHidden: true,
+      path: process.execPath,
+      args: ["--hidden"],
+    });
+  } catch (error) {
+    logLine(`Falha ao registrar inicio automatico: ${sanitizeError(error).message}`);
+  }
+}
+
+function showMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.setSkipTaskbar(false);
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+function hideMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.hide();
+  mainWindow.setSkipTaskbar(true);
+}
+
 function createWindow() {
   const icon = loadAppIcon();
+  const hidden = startedHidden();
   mainWindow = new BrowserWindow({
     width: 460,
     height: 760,
@@ -143,9 +183,11 @@ function createWindow() {
     transparent: false,
     backgroundColor: "#050505",
     resizable: false,
+    show: !hidden,
+    skipTaskbar: hidden,
     autoHideMenuBar: true,
     icon: icon.isEmpty() ? undefined : icon,
-    title: "Flowdesk Launcher",
+    title: "Flowdesk Launcher Pro",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -157,7 +199,7 @@ function createWindow() {
   mainWindow.on("close", (event) => {
     if (!app.isQuiting) {
       event.preventDefault();
-      mainWindow.hide();
+      hideMainWindow();
     }
   });
 }
@@ -166,10 +208,11 @@ function createTray() {
   const image = loadAppIcon(32);
   if (image.isEmpty()) return;
   tray = new Tray(image);
-  tray.setToolTip("Flowdesk Launcher");
+  tray.setToolTip(`Flowdesk Launcher Pro v${app.getVersion()}`);
   tray.setContextMenu(
     Menu.buildFromTemplate([
-      { label: "Abrir", click: () => mainWindow?.show() },
+      { label: "Abrir", click: () => showMainWindow() },
+      { label: "Corrigir MySQL", click: () => void runHeal({ elevate: true, force: true }) },
       { type: "separator" },
       {
         label: "Sair",
@@ -180,7 +223,7 @@ function createTray() {
       },
     ]),
   );
-  tray.on("click", () => mainWindow?.show());
+  tray.on("click", () => showMainWindow());
 }
 
 function apiBases() {
@@ -386,10 +429,11 @@ async function restoreSession() {
   markOnline("Conectado ao painel.");
   startHeartbeatLoop();
   startSyncLoop();
+  startWatchdog();
   void observePublicIp().then((ip) => {
     if (ip) markOnline(`VPS vinculada. IP publico ${ip}.`);
   });
-  void prepareFirewall();
+  void runHeal({ elevate: true });
 }
 
 async function startLogin() {
@@ -472,7 +516,8 @@ async function bindServer(guildId) {
   );
   startHeartbeatLoop();
   startSyncLoop();
-  void prepareFirewall();
+  startWatchdog();
+  void runHeal({ elevate: true });
   return { ok: true };
 }
 
@@ -522,7 +567,12 @@ function looksLikeIpv4(value) {
   return /^(?:\d{1,3}\.){3}\d{1,3}$/.test(String(value || "").trim());
 }
 
+let lastPublicIpAt = 0;
+
 async function observePublicIp() {
+  if (runtime.publicIp && Date.now() - lastPublicIpAt < 20_000) {
+    return runtime.publicIp;
+  }
   const endpoints = [
     {
       url: "https://api.ipify.org?format=json",
@@ -536,20 +586,24 @@ async function observePublicIp() {
     },
     { url: "https://ifconfig.me/ip", parse: (text) => text },
     { url: "https://icanhazip.com", parse: (text) => text },
+    { url: "https://api.seeip.org", parse: (text) => text },
   ];
-  for (const endpoint of endpoints) {
-    try {
-      const response = await fetch(endpoint.url, { signal: AbortSignal.timeout(4000) });
-      const ip = String(endpoint.parse((await response.text()).trim()) || "").trim();
-      if (looksLikeIpv4(ip) && !ip.startsWith("127.")) {
-        runtime.publicIp = ip;
-        return ip;
-      }
-    } catch {
-      /* try the next public-IP service */
+  const attempts = endpoints.map(async (endpoint) => {
+    const response = await fetch(endpoint.url, { signal: AbortSignal.timeout(3500) });
+    const ip = String(endpoint.parse((await response.text()).trim()) || "").trim();
+    if (!looksLikeIpv4(ip) || ip.startsWith("127.")) {
+      throw new Error("ip invalido");
     }
+    return ip;
+  });
+  try {
+    const ip = await Promise.any(attempts);
+    runtime.publicIp = ip;
+    lastPublicIpAt = Date.now();
+    return ip;
+  } catch {
+    return String(runtime.publicIp || "");
   }
-  return String(runtime.publicIp || "");
 }
 
 async function runHeartbeat() {
@@ -618,9 +672,13 @@ async function runSync() {
     }
     const results = [];
     for (const job of synced.jobs || []) {
+      const target = dbTarget(job.payload || {});
       try {
-        const target = dbTarget(job.payload || {});
-        const result = await executeJob(target, String(job.operation || ""), job.payload || {});
+        let result = await executeJob(target, String(job.operation || ""), job.payload || {});
+        if (result.ok === false && /offline|timeout|access denied|unknown database/i.test(String(result.message || result.code || ""))) {
+          await runHeal({ elevate: true });
+          result = await executeJob(target, String(job.operation || ""), job.payload || {});
+        }
         if (result.ok !== false) rememberCityDb(target);
         results.push({
           id: job.id,
@@ -629,15 +687,24 @@ async function runSync() {
           errorMessage: result.ok === false ? result.message : null,
         });
       } catch (error) {
-        const sanitized = sanitizeError(error);
-        results.push({
-          id: job.id,
-          ok: false,
-          result: sanitized,
-          errorMessage: sanitized.message,
-        });
-        if (sanitized.code === "timeout" || sanitized.code === "offline") {
-          void prepareFirewall();
+        await runHeal({ elevate: true });
+        try {
+          const retry = await executeJob(target, String(job.operation || ""), job.payload || {});
+          if (retry.ok !== false) rememberCityDb(target);
+          results.push({
+            id: job.id,
+            ok: retry.ok !== false,
+            result: retry,
+            errorMessage: retry.ok === false ? retry.message : null,
+          });
+        } catch (retryError) {
+          const sanitized = sanitizeError(retryError);
+          results.push({
+            id: job.id,
+            ok: false,
+            result: sanitized,
+            errorMessage: sanitized.message,
+          });
         }
       }
     }
@@ -656,16 +723,21 @@ async function runSync() {
             lastHealthAt = Date.now();
           }
         }
-      } catch {
-        /* keep polling; the next whitelist job still retries */
-      }
+        } catch {
+          void runHeal({ elevate: false });
+        }
     }
-    backoffMs = results.length ? 80 : 120;
-    markOnline(
-      runtime.publicIp
-        ? `VPS no ar. IP ${runtime.publicIp}. MySQL pronto neste computador.`
-        : "VPS no ar. MySQL pronto neste computador.",
-    );
+    backoffMs = results.length ? 80 : 180;
+    if (runtime.heal?.ok === false) {
+      runtime.message = runtime.heal.message || "Corrigindo o MySQL local...";
+      emitState();
+    } else {
+      markOnline(
+        runtime.publicIp
+          ? `VPS no ar. IP ${runtime.publicIp}. MySQL local pronto.`
+          : "VPS no ar. MySQL local pronto neste computador.",
+      );
+    }
   } catch (error) {
     backoffMs = Math.min(Math.max(Math.round(backoffMs * 1.6), 500), 15000);
     const message = sanitizeError(error).message;
@@ -687,13 +759,31 @@ function startHeartbeatLoop() {
   }, 5000);
 }
 
+let lastSyncTick = 0;
+let watchdogTimer = null;
+
 function startSyncLoop() {
   clearTimeout(syncTimer);
   const tick = async () => {
+    lastSyncTick = Date.now();
     await runSync();
+    lastSyncTick = Date.now();
     syncTimer = setTimeout(tick, backoffMs);
   };
   void tick();
+}
+
+function startWatchdog() {
+  clearInterval(watchdogTimer);
+  watchdogTimer = setInterval(() => {
+    if (runtime.view !== "home") return;
+    if (Date.now() - lastSyncTick > 25_000) {
+      logLine("Watchdog: sync parou. Reiniciando loops.");
+      startHeartbeatLoop();
+      startSyncLoop();
+      void runHeal({ elevate: true });
+    }
+  }, 8000);
 }
 
 function loadAutoUpdater() {
@@ -759,55 +849,143 @@ function installReadyUpdate() {
 }
 
 let lastHealthAt = 0;
-let lastFirewallAt = 0;
+let lastElevateAt = 0;
+let lastHealAt = 0;
+let healTimer = null;
+let healInFlight = false;
+const ELEVATE_COOLDOWN_MS = 4 * 60 * 60 * 1000;
+const HEAL_LOOP_MS = 15_000;
 
-function writeFallbackPortsCmd(dest) {
+function writeFallbackHealCmd(dest) {
   const script = [
     "@echo off",
     "net session >nul 2>&1",
-    "if not %errorLevel%==0 (powershell -NoProfile -Command \"Start-Process -FilePath '%~f0' -Verb RunAs\" & exit /b)",
+    "if not %errorLevel%==0 (powershell -NoProfile -Command \"Start-Process -FilePath '%~f0' -Verb RunAs -WindowStyle Hidden\" & exit /b)",
     "netsh advfirewall firewall add rule name=\"Flowdesk City MySQL\" dir=in action=allow protocol=TCP localport=3306 enable=yes profile=any",
     "netsh advfirewall firewall add rule name=\"Flowdesk City MariaDB\" dir=in action=allow protocol=TCP localport=3307 enable=yes profile=any",
     "netsh advfirewall firewall add rule name=\"Flowdesk City Postgres\" dir=in action=allow protocol=TCP localport=5432 enable=yes profile=any",
-    "for %%S in (MySQL MySQL80 MySQL57 MariaDB) do sc start %%S >nul 2>&1",
+    "for %%S in (MySQL MySQL80 MySQL57 MariaDB) do (sc config %%S start= auto >nul 2>&1 & sc start %%S >nul 2>&1)",
+    "if exist C:\\xampp\\mysql_start.bat start \"\" /b cmd /c C:\\xampp\\mysql_start.bat",
     "exit /b 0",
     "",
   ].join("\r\n");
   fs.writeFileSync(dest, script, "utf8");
 }
 
-function prepareFirewall() {
+function requestElevatedHeal() {
   if (process.platform !== "win32") return { ok: true };
-  if (Date.now() - lastFirewallAt < 60_000) {
-    return { ok: true, message: runtime.message };
-  }
-  lastFirewallAt = Date.now();
-  const dest = userDataFile("open-db-ports.cmd");
-  const packaged = path.join(process.resourcesPath || "", "open-db-ports.cmd");
-  const local = path.join(__dirname, "open-db-ports.cmd");
-  const source = fs.existsSync(packaged) ? packaged : fs.existsSync(local) ? local : "";
+  const dest = userDataFile("heal-mysql.cmd");
+  const packaged = path.join(process.resourcesPath || "", "heal-mysql.cmd");
+  const local = path.join(__dirname, "heal-mysql.cmd");
+  const fallback = path.join(__dirname, "open-db-ports.cmd");
+  const source = fs.existsSync(packaged)
+    ? packaged
+    : fs.existsSync(local)
+      ? local
+      : fs.existsSync(fallback)
+        ? fallback
+        : "";
   try {
     if (source) fs.copyFileSync(source, dest);
-    else writeFallbackPortsCmd(dest);
+    else writeFallbackHealCmd(dest);
   } catch {
-    writeFallbackPortsCmd(dest);
+    writeFallbackHealCmd(dest);
   }
   const escaped = dest.replace(/'/g, "''");
   exec(
-    `powershell -NoProfile -Command "Start-Process -FilePath '${escaped}' -Verb RunAs"`,
+    `powershell -NoProfile -Command "Start-Process -FilePath '${escaped}' -Verb RunAs -WindowStyle Hidden"`,
   );
-  runtime.message = runtime.publicIp
-    ? `IP ${runtime.publicIp} publicado. Abrindo o script de portas do MySQL.`
-    : "Abrindo o script de portas do MySQL nesta VPS.";
+  lastElevateAt = Date.now();
+  const vault = readVault();
+  writeVault({ ...vault, lastElevateAt });
+  runtime.heal = {
+    ...(runtime.heal || {}),
+    mysql: "starting",
+    message: "Corrigindo MySQL, firewall e inicio automatico do servico.",
+  };
+  runtime.message = "Corrigindo o MySQL desta VPS. Aceite a permissao do Windows se aparecer.";
   emitState();
   return { ok: true, message: runtime.message };
+}
+
+async function runHeal(options = {}) {
+  if (healInFlight && !options.force) return runtime.heal;
+  healInFlight = true;
+  lastHealAt = Date.now();
+  try {
+    runtime.heal = {
+      ok: runtime.heal?.ok ?? null,
+      mysql: "starting",
+      message: "Procurando e ligando o MySQL local...",
+    };
+    emitState();
+    const healed = await healCityMysql(dbTarget({}));
+    runtime.heal = healed;
+    if (healed.ok) {
+      lastHealthAt = Date.now();
+      if (runtime.view === "home") {
+        runtime.message = runtime.publicIp
+          ? `VPS no ar. IP ${runtime.publicIp}. MySQL local pronto.`
+          : "VPS no ar. MySQL local pronto neste computador.";
+      }
+      emitState();
+      return healed;
+    }
+    const vault = readVault();
+    const lastKnownElevate = Number(vault.lastElevateAt || lastElevateAt || 0);
+    const canElevate =
+      options.elevate &&
+      (options.force || Date.now() - lastKnownElevate > ELEVATE_COOLDOWN_MS);
+    if (canElevate) {
+      requestElevatedHeal();
+      await new Promise((resolve) => setTimeout(resolve, 3500));
+      const retry = await healCityMysql(dbTarget({}));
+      runtime.heal = retry;
+      if (retry.ok && runtime.view === "home") {
+        runtime.message = "MySQL corrigido. A Flowdesk ja consegue sincronizar por este launcher.";
+      } else if (runtime.view === "home") {
+        runtime.message = retry.message || healed.message;
+        runtime.lastError = retry.message || healed.message;
+      }
+      emitState();
+      return retry;
+    }
+    if (runtime.view === "home") {
+      runtime.message = healed.message;
+      runtime.lastError = healed.message;
+    }
+    emitState();
+    return healed;
+  } catch (error) {
+    const message = sanitizeError(error).message;
+    runtime.heal = { ok: false, mysql: "down", message };
+    logLine(`Heal MySQL: ${message}`);
+    emitState();
+    return runtime.heal;
+  } finally {
+    healInFlight = false;
+  }
+}
+
+function prepareFirewall() {
+  return runHeal({ elevate: true, force: true });
+}
+
+function startHealLoop() {
+  clearInterval(healTimer);
+  void runHeal({ elevate: true });
+  healTimer = setInterval(() => {
+    if (Date.now() - lastHealAt < HEAL_LOOP_MS - 250) return;
+    const mysqlDown = runtime.heal?.ok !== true;
+    void runHeal({ elevate: mysqlDown });
+  }, HEAL_LOOP_MS);
 }
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
-  app.on("second-instance", () => mainWindow?.show());
+  app.on("second-instance", () => showMainWindow());
   if (process.defaultApp) {
     if (process.argv.length >= 2) {
       app.setAsDefaultProtocolClient(PROTOCOL, process.execPath, [path.resolve(process.argv[1])]);
@@ -816,10 +994,20 @@ if (!gotLock) {
     app.setAsDefaultProtocolClient(PROTOCOL);
   }
 
+  process.on("uncaughtException", (error) => {
+    logLine(`uncaughtException: ${sanitizeError(error).message}`);
+    void runHeal({ elevate: false });
+  });
+  process.on("unhandledRejection", (reason) => {
+    logLine(`unhandledRejection: ${sanitizeError(reason).message}`);
+  });
+
   app.whenReady().then(async () => {
     applyAppBranding();
+    ensureAutoStart();
     createWindow();
     createTray();
+    startHealLoop();
     await restoreSession();
     void startAutoUpdate();
   });
@@ -850,8 +1038,5 @@ ipcMain.handle("launcher:logout", async () => {
 });
 ipcMain.handle("launcher:firewall", () => prepareFirewall());
 ipcMain.handle("launcher:install-update", () => installReadyUpdate());
-ipcMain.on("launcher:minimize", () => mainWindow?.hide());
-ipcMain.on("launcher:close", () => {
-  app.isQuiting = true;
-  app.quit();
-});
+ipcMain.on("launcher:minimize", () => hideMainWindow());
+ipcMain.on("launcher:close", () => hideMainWindow());
