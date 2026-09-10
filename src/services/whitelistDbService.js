@@ -178,12 +178,20 @@ async function enqueueAgentJob(record) {
 }
 
 async function listApplyFailedRequests(limit = 15) {
+  const pending = await supabase
+    .from(REQUESTS_TABLE)
+    .select("*")
+    .eq("status", "approved")
+    .eq("apply_error", "pending_city_sync")
+    .order("updated_at", { ascending: false })
+    .limit(limit);
   const result = await supabase
     .from(REQUESTS_TABLE)
     .select("*")
     .eq("status", "apply_failed")
     .order("updated_at", { ascending: false })
     .limit(limit);
+  const pendingRows = pending.error ? [] : unwrap(pending, "listPendingCitySync") || [];
   if (result.error && String(result.error.message || "").toLowerCase().includes("updated_at")) {
     const fallback = await supabase
       .from(REQUESTS_TABLE)
@@ -191,9 +199,9 @@ async function listApplyFailedRequests(limit = 15) {
       .eq("status", "apply_failed")
       .order("id", { ascending: false })
       .limit(limit);
-    return unwrap(fallback, "listApplyFailedRequests") || [];
+    return [...pendingRows, ...(unwrap(fallback, "listApplyFailedRequests") || [])];
   }
-  return unwrap(result, "listApplyFailedRequests") || [];
+  return [...pendingRows, ...(unwrap(result, "listApplyFailedRequests") || [])];
 }
 
 async function getAgentJob(jobId) {

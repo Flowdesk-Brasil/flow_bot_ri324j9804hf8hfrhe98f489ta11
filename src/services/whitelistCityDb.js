@@ -338,27 +338,44 @@ async function executeWhitelistOperation(settings, operation, identifierValue, o
         }
       : null);
   const launcherOpts = options.interactive ? { priority: "interactive" } : {};
-  let lastDirect = null;
+
+  if (launcherCityDb) {
+    const hint = await readLauncherHint(settings.guild_id);
+    if (hint?.online) {
+      logCityDb("info", "whitelist_launcher_local", {
+        guildId: settings.guild_id,
+        operation,
+      });
+      try {
+        const viaLauncher = await runViaLauncher(
+          settings,
+          operation,
+          identifierValue,
+          mapping,
+          launcherCityDb,
+          launcherOpts,
+        );
+        if (viaLauncher?.ok || !isRetryableLauncherCode(viaLauncher?.code)) {
+          return viaLauncher?.ok ? normalizeWhitelistResult(viaLauncher) : decorateCityFailure(viaLauncher);
+        }
+      } catch (error) {
+        logCityDb("warn", "whitelist_launcher_error", {
+          guildId: settings.guild_id,
+          operation,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
 
   if (cityTarget) {
     try {
       const direct = await runDirectWhitelistOperation(settings, mapping, operation, identifierValue, {
         interactive: Boolean(options.interactive),
       });
-      lastDirect = direct;
       if (direct?.ok) {
-        logCityDb("info", "whitelist_direct_ok", {
-          guildId: settings.guild_id,
-          operation,
-          code: direct.code || "ok",
-        });
         return normalizeWhitelistResult(direct);
       }
-      logCityDb("warn", "whitelist_direct_rejected", {
-        guildId: settings.guild_id,
-        operation,
-        code: direct?.code || "unknown",
-      });
       if (direct?.code === "player_not_found" || direct?.code === "multiple_players") {
         return normalizeWhitelistResult(direct);
       }
@@ -367,50 +384,19 @@ async function executeWhitelistOperation(settings, operation, identifierValue, o
       }
     } catch (error) {
       const sanitized = sanitizeCityDbError(error);
-      lastDirect = { ok: false, ...sanitized };
-      logCityDb("error", "whitelist_direct_error", {
-        guildId: settings.guild_id,
-        operation,
-        code: sanitized.code,
-        message: sanitized.message,
-      });
       if (!isRetryableLauncherCode(sanitized.code)) {
-        return decorateCityFailure(lastDirect);
+        return decorateCityFailure(sanitized);
       }
     }
   }
 
-  if (cityTarget && lastDirect && !isRetryableLauncherCode(lastDirect.code)) {
-    return decorateCityFailure(lastDirect);
-  }
-
-  if (launcherCityDb) {
-    const hint = await readLauncherHint(settings.guild_id);
-    if (hint?.online) {
-      logCityDb("info", "whitelist_launcher_first_setup", {
-        guildId: settings.guild_id,
-        operation,
-      });
-      return runViaLauncher(settings, operation, identifierValue, mapping, launcherCityDb, launcherOpts);
-    }
-  }
-
-  logCityDb("warn", "whitelist_unreachable", {
-    guildId: settings.guild_id,
-    operation,
-    lastDirectCode: lastDirect?.code || null,
-  });
-  if (lastDirect) {
-    return decorateCityFailure(lastDirect);
-  }
-  return decorateCityFailure({
+  return {
     ok: false,
-    code: "timeout",
-    title: "O MySQL do XAMPP so aceita conexao local",
-    message:
-      "O servico esta ligado na VPS, mas a porta 3306 nao responde pela internet. O HeidiSQL na propria maquina nao prova o acesso remoto.",
-    hint: "No XAMPP: Config > my.ini, bind-address=0.0.0.0, reinicie o MySQL e libere 3306 no firewall. Ou abra o launcher nesta conexao.",
-  });
+    code: "city_deferred",
+    title: "Sync do jogo pendente",
+    message: "A Flowdesk nao depende do MySQL da cidade. A whitelist do Discord segue; o jogo sincroniza pelo launcher na VPS.",
+    hint: "Nao precisa abrir porta 3306. O launcher na VPS fala com o XAMPP em localhost.",
+  };
 }
 
 function inferWhitelistChanged(result) {

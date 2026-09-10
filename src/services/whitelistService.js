@@ -44,6 +44,29 @@ function clampText(value, maxLength) {
   return String(value || "").slice(0, maxLength);
 }
 
+function isOptionalCityFailure(result) {
+  return [
+    "offline",
+    "timeout",
+    "vps_timeout",
+    "circuit_open",
+    "pool_exhausted",
+    "city_deferred",
+    "ip_not_allowed",
+  ].includes(String(result?.code || ""));
+}
+
+function deferredCityResult(identifierValue) {
+  return {
+    ok: true,
+    deferred: true,
+    skipped: true,
+    code: "city_deferred",
+    playerKey: identifierValue || "",
+    message: "Whitelist liberada no Discord. A sync do jogo acontece pelo launcher na VPS, sem abrir o MySQL na internet.",
+  };
+}
+
 function cityDbNoticeText(result, extra = "") {
   const message = String(result?.message || "O MySQL da sua VPS nao esta acessivel agora.").trim();
   const hint = String(result?.hint || "").trim();
@@ -128,6 +151,14 @@ function buildWhitelistApplyNotice({ result, approve, autoApproved }) {
       alreadyApplied
         ? "O registro da cidade ja estava desligado. Nada foi alterado."
         : `Seu ID estava ligado (${before}) e foi desligado (${after}) no banco da cidade. O Discord foi sincronizado.`,
+      "ok",
+    );
+  }
+
+  if (normalized.deferred || normalized.code === "city_deferred") {
+    return buildNoticePayload(
+      "Whitelist liberada",
+      "Cargos e nickname foram aplicados no Discord. A Flowdesk nao depende do MySQL da cidade; a sync do jogo entra quando o launcher na VPS estiver no ar.",
       "ok",
     );
   }
@@ -260,10 +291,14 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
     return;
   }
 
+  if (!result.ok && isOptionalCityFailure(result)) {
+    result = deferredCityResult(identifierValue);
+  }
+
   if (!result.ok) {
-    let request;
+    let failedRequest;
     try {
-      request = await upsertAutoWhitelistRequest({
+      failedRequest = await upsertAutoWhitelistRequest({
         guildId,
         userId: interaction.user.id,
         identifierKind,
@@ -284,15 +319,12 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
     }
     await replyEphemeral(
       interaction,
-      buildNoticePayload(
-        result.title || "Banco da cidade offline",
-        cityDbNoticeText(result),
-      ),
+      buildNoticePayload(result.title || "Nao foi possivel aplicar a whitelist", cityDbNoticeText(result)),
     );
     void persistWhitelistFailure({
       interaction,
       settings,
-      request,
+      request: failedRequest,
       result,
       operation: "APPROVE_WHITELIST",
       correlationId,
@@ -331,6 +363,7 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
     operation: "APPROVE_WHITELIST",
     autoApproved: true,
     correlationId,
+    cityPending: result.deferred === true || result.code === "city_deferred",
   });
 
   await replyEphemeral(
@@ -851,25 +884,19 @@ async function applyWhitelistChange({
       result = { ok: false, ...sanitizeCityDbError(error) };
     }
 
+    if (!result.ok && isOptionalCityFailure(result)) {
+      result = deferredCityResult(request.identifier_value);
+    }
+
     if (!result.ok) {
       const missingPlayer = result.code === "player_not_found" || isCityPlayerMissing(result);
-      const offline = ["offline", "timeout", "vps_timeout", "circuit_open", "pool_exhausted"].includes(
-        String(result.code || ""),
-      );
       await replyEphemeral(
         interaction,
         buildNoticePayload(
-          missingPlayer
-            ? "ID nao encontrado"
-            : result.title || (offline ? "Banco da cidade offline" : "Banco da cidade indisponivel"),
+          missingPlayer ? "ID nao encontrado" : result.title || "Nao foi possivel aplicar a whitelist",
           missingPlayer
             ? "Esse ID nao existe no banco da cidade. A whitelist so e liberada para um ID cadastrado."
-            : cityDbNoticeText(
-                result,
-                autoApproved
-                  ? " O pedido continua aberto e o sistema tenta de novo sozinho."
-                  : " O pedido permanece aberto e o sistema tenta de novo sozinho.",
-              ),
+            : cityDbNoticeText(result),
         ),
       );
       void persistWhitelistFailure({
@@ -892,6 +919,7 @@ async function applyWhitelistChange({
       operation,
       autoApproved,
       correlationId,
+      cityPending: result.deferred === true || result.code === "city_deferred",
     });
 
     await replyEphemeral(
@@ -963,13 +991,14 @@ async function persistWhitelistSuccess({
   operation,
   autoApproved,
   correlationId,
+  cityPending = false,
 }) {
   const nextRequest = await whitelistDb.updateWhitelistRequest(request.id, {
     status: approve ? "approved" : "denied",
     reviewed_by_user_id: interaction.user.id,
     reviewed_at: new Date().toISOString(),
     applied_at: new Date().toISOString(),
-    apply_error: null,
+    apply_error: cityPending ? "pending_city_sync" : null,
     player_key: result.playerKey || null,
     previous_whitelist_value: result.previousValue ?? null,
     next_whitelist_value: result.nextValue ?? null,
@@ -1010,11 +1039,13 @@ async function persistWhitelistSuccess({
     sendWhitelistLog({
       guild: interaction.guild,
       settings,
-      title: autoApproved
-        ? "Whitelist automatica sincronizada"
-        : approve
-          ? "Whitelist aprovada"
-          : "Whitelist removida",
+      title: cityPending
+        ? "Whitelist liberada no Discord"
+        : autoApproved
+          ? "Whitelist automatica sincronizada"
+          : approve
+            ? "Whitelist aprovada"
+            : "Whitelist removida",
       color: approve ? 0x2ecc71 : 0xe74c3c,
       lines: [
         `**Pedido:** \`${request.id}\``,
