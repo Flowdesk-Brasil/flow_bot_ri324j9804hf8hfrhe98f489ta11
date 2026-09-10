@@ -56,14 +56,36 @@ function isOptionalCityFailure(result) {
   ].includes(String(result?.code || ""));
 }
 
-function deferredCityResult(identifierValue) {
+function isConfirmedCityPlayer(result) {
+  if (!result || result.ok !== true) return false;
+  if (result.deferred === true || result.code === "city_deferred") return false;
+  if (result.code === "player_not_found" || result.code === "multiple_players") return false;
+  return Boolean(String(result.playerKey || "").trim());
+}
+
+function missingPlayerNotice() {
+  return buildNoticePayload(
+    "ID nao encontrado",
+    "Esse ID nao existe. Confira o numero e tente de novo.",
+  );
+}
+
+function unverifiedPlayerNotice() {
+  return buildNoticePayload(
+    "ID nao confirmado",
+    "Nao deu para confirmar esse ID agora. Tente novamente em alguns segundos.",
+    "warning",
+  );
+}
+
+function deferredCityResult(playerKey) {
   return {
     ok: true,
     deferred: true,
     skipped: true,
     code: "city_deferred",
-    playerKey: identifierValue || "",
-    message: "Whitelist liberada no Discord. A sync do jogo acontece pelo launcher na VPS, sem abrir o MySQL na internet.",
+    playerKey: String(playerKey || "").trim(),
+    message: "Jogador confirmado. Cargos e apelido aplicados no Discord.",
   };
 }
 
@@ -142,15 +164,13 @@ function buildWhitelistApplyNotice({ result, approve, autoApproved }) {
   const normalized = normalizeWhitelistResult(result);
   const freshlyApplied = inferWhitelistChanged(normalized);
   const alreadyApplied = wasWhitelistAlreadyApplied(normalized);
-  const before = normalized.previousValue ?? "0";
-  const after = normalized.nextValue ?? normalized.currentValue ?? "1";
 
   if (!approve) {
     return buildNoticePayload(
       alreadyApplied ? "Whitelist ja estava removida" : "Whitelist removida",
       alreadyApplied
-        ? "O registro da cidade ja estava desligado. Nada foi alterado."
-        : `Seu ID estava ligado (${before}) e foi desligado (${after}) no banco da cidade. O Discord foi sincronizado.`,
+        ? "Sua whitelist ja estava removida. Nada mudou no Discord."
+        : "Sua whitelist foi removida. Cargos e apelido foram atualizados no Discord.",
       "ok",
     );
   }
@@ -158,7 +178,7 @@ function buildWhitelistApplyNotice({ result, approve, autoApproved }) {
   if (normalized.deferred || normalized.code === "city_deferred") {
     return buildNoticePayload(
       "Whitelist liberada",
-      "Cargos e nickname foram aplicados no Discord. A Flowdesk nao depende do MySQL da cidade; a sync do jogo entra quando o launcher na VPS estiver no ar.",
+      "Voce foi liberado. Cargos e apelido ja foram aplicados no Discord.",
       "ok",
     );
   }
@@ -167,22 +187,22 @@ function buildWhitelistApplyNotice({ result, approve, autoApproved }) {
     if (freshlyApplied) {
       return buildNoticePayload(
         "Whitelist liberada",
-        `Seu ID estava desligado (${before}) e foi liberado (${after}) no banco da cidade. Cargos e nickname foram aplicados no Discord.`,
+        "Voce foi liberado. Cargos e apelido ja foram aplicados no Discord.",
         "ok",
       );
     }
     return buildNoticePayload(
       "Whitelist ja liberada",
-      `Este ID ja estava liberado no banco da cidade (${after}). Cargos e nickname foram sincronizados no Discord.`,
+      "Voce ja estava liberado. Cargos e apelido foram confirmados no Discord.",
       "ok",
     );
   }
 
   return buildNoticePayload(
-    alreadyApplied ? "Whitelist ja estava liberada" : "Whitelist sincronizada",
+    alreadyApplied ? "Whitelist ja estava liberada" : "Whitelist liberada",
     alreadyApplied
-      ? `O registro da cidade ja estava liberado (${after}). O Discord foi sincronizado.`
-      : `O banco da cidade foi atualizado (${before} -> ${after}) e o Discord foi sincronizado.`,
+      ? "Este jogador ja estava liberado. Cargos e apelido foram confirmados no Discord."
+      : "Jogador liberado. Cargos e apelido ja foram aplicados no Discord.",
     "ok",
   );
 }
@@ -203,9 +223,22 @@ async function assertManualWhitelistClaim(guildId, userId, identifierValue) {
 function isCityPlayerMissing(result) {
   if (!result) return true;
   if (result.code === "player_not_found") return true;
+  if (result.code === "multiple_players") return false;
   if (result.ok !== true) return false;
-  const playerKey = String(result.playerKey ?? "").trim();
-  return !playerKey;
+  if (result.deferred === true || result.code === "city_deferred") return true;
+  return !String(result.playerKey ?? "").trim();
+}
+
+async function lookupCityPlayer(settings, identifierValue, options = {}) {
+  try {
+    return normalizeWhitelistResult(
+      await executeWhitelistOperation(settings, "GET_PLAYER", identifierValue, {
+        interactive: options.interactive !== false,
+      }),
+    );
+  } catch (error) {
+    return { ok: false, ...sanitizeCityDbError(error) };
+  }
 }
 
 async function upsertAutoWhitelistRequest({
@@ -245,27 +278,39 @@ async function upsertAutoWhitelistRequest({
 }
 
 async function handleAutomaticWhitelistSubmit(interaction, settings, identifierKind, identifierValue, playerName) {
-  const operationPromise = executeWhitelistOperation(
-    settings,
-    "APPROVE_WHITELIST",
-    identifierValue,
-    { interactive: true },
-  );
-
   let deferTimer = null;
   if (!interaction.deferred && !interaction.replied) {
     deferTimer = setTimeout(() => {
       if (!interaction.deferred && !interaction.replied) {
         void settleMaybePromise(interaction.deferReply({ flags: MessageFlags.Ephemeral }));
       }
-    }, 2500);
+    }, 1800);
   }
 
+  let lookup;
   let result;
   try {
-    result = normalizeWhitelistResult(await operationPromise);
-  } catch (error) {
-    result = { ok: false, ...sanitizeCityDbError(error) };
+    lookup = await lookupCityPlayer(settings, identifierValue, { interactive: true });
+    if (isCityPlayerMissing(lookup) || lookup.code === "player_not_found") {
+      result = lookup;
+    } else if (!lookup.ok) {
+      result = lookup;
+    } else {
+      try {
+        result = normalizeWhitelistResult(
+          await executeWhitelistOperation(settings, "APPROVE_WHITELIST", identifierValue, {
+            interactive: true,
+          }),
+        );
+      } catch (error) {
+        result = { ok: false, ...sanitizeCityDbError(error) };
+      }
+      if (!result.ok && isOptionalCityFailure(result) && isConfirmedCityPlayer(lookup)) {
+        result = deferredCityResult(lookup.playerKey);
+      } else if (result.ok && !isConfirmedCityPlayer(result) && isConfirmedCityPlayer(lookup)) {
+        result = { ...result, playerKey: lookup.playerKey };
+      }
+    }
   } finally {
     if (deferTimer) clearTimeout(deferTimer);
   }
@@ -273,26 +318,23 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
   const guildId = interaction.guildId;
   const correlationId = randomUUID();
 
-  if (isCityPlayerMissing(result)) {
+  if (isCityPlayerMissing(result) || result.code === "player_not_found") {
     const openRequest = await whitelistDb.findOpenRequest(guildId, interaction.user.id);
     if (openRequest) {
       await whitelistDb.updateWhitelistRequest(openRequest.id, {
         status: "cancelled",
-        apply_error: "ID nao encontrado no banco da cidade.",
+        apply_error: "ID nao encontrado.",
       }).catch(() => null);
     }
-    await replyEphemeral(
-      interaction,
-      buildNoticePayload(
-        "ID nao encontrado",
-        "Esse ID nao existe no banco da cidade. Confira o numero e tente novamente.",
-      ),
-    );
+    await replyEphemeral(interaction, missingPlayerNotice());
     return;
   }
 
-  if (!result.ok && isOptionalCityFailure(result)) {
-    result = deferredCityResult(identifierValue);
+  if (!isConfirmedCityPlayer(result) && !result.ok) {
+    if (isOptionalCityFailure(result)) {
+      await replyEphemeral(interaction, unverifiedPlayerNotice());
+      return;
+    }
   }
 
   if (!result.ok) {
@@ -354,6 +396,11 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
     return;
   }
 
+  if (!isConfirmedCityPlayer(result)) {
+    await replyEphemeral(interaction, unverifiedPlayerNotice());
+    return;
+  }
+
   await persistWhitelistSuccess({
     interaction,
     settings,
@@ -364,6 +411,7 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
     autoApproved: true,
     correlationId,
     cityPending: result.deferred === true || result.code === "city_deferred",
+    playerName,
   });
 
   await replyEphemeral(
@@ -373,20 +421,62 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
 }
 
 async function applyApprovedNickname(guild, userId, settings, identifierValue, playerName) {
-  const member =
-    guild.members.cache.get(userId) || (await guild.members.fetch(userId).catch(() => null));
-  if (!member) return;
+  if (!guild || !userId) return { ok: false, reason: "missing" };
+  let member = guild.members.cache.get(userId) || null;
+  try {
+    member = await guild.members.fetch({ user: userId, force: true });
+  } catch {
+    if (!member) return { ok: false, reason: "member" };
+  }
+
   const parsedName = sanitizePlayerName(playerName);
+  const fallbackName = sanitizePlayerName(member.user?.globalName || member.user?.username || "");
   const displayName = parsedName.ok
     ? parsedName.value
-    : member.displayName || member.user?.globalName || member.user?.username || "Jogador";
+    : fallbackName.ok
+      ? fallbackName.value
+      : "Jogador";
   const nextNick = applyNicknameFormat(
     resolveNicknameFormat(settings),
     displayName,
     identifierValue,
   );
-  if (!nextNick || member.nickname === nextNick || member.displayName === nextNick) return;
-  await settleMaybePromise(member.setNickname(nextNick));
+  if (!nextNick) return { ok: false, reason: "empty" };
+  if (member.nickname === nextNick) return { ok: true, skipped: true, nick: nextNick };
+
+  if (member.id === guild.ownerId) {
+    return { ok: false, reason: "owner" };
+  }
+  const me = guild.members.me || (await guild.members.fetchMe().catch(() => null));
+  if (me && !me.permissions.has(PermissionFlagsBits.ManageNicknames)) {
+    console.error("[whitelist-nickname] Bot sem permissao de Gerenciar Apelidos.");
+    return { ok: false, reason: "permission" };
+  }
+  if (
+    me?.roles?.highest &&
+    member.roles?.highest &&
+    member.roles.highest.position >= me.roles.highest.position
+  ) {
+    console.error("[whitelist-nickname] Cargo do bot precisa ficar acima do membro.");
+    return { ok: false, reason: "hierarchy" };
+  }
+
+  try {
+    await member.setNickname(nextNick, "Flowdesk whitelist");
+    return { ok: true, nick: nextNick };
+  } catch (error) {
+    const shorter = nextNick.slice(0, 24).trim();
+    if (shorter && shorter !== nextNick) {
+      try {
+        await member.setNickname(shorter, "Flowdesk whitelist");
+        return { ok: true, nick: shorter };
+      } catch {
+        /* fall through */
+      }
+    }
+    console.error("[whitelist-nickname]", error?.message || error);
+    return { ok: false, reason: "discord", message: error?.message };
+  }
 }
 
 function buildNoticePayload(title, message, tone = "error") {
@@ -457,7 +547,9 @@ async function resolveTextChannel(guild, channelId) {
 
 async function assignRoles(guild, userId, addIds, removeIds) {
   const member =
-    guild.members.cache.get(userId) || (await guild.members.fetch(userId).catch(() => null));
+    (await guild.members.fetch({ user: userId, force: true }).catch(() => null)) ||
+    guild.members.cache.get(userId) ||
+    null;
   if (!member) return;
   const toAdd = (Array.isArray(addIds) ? addIds : []).filter(Boolean);
   const toRemove = (Array.isArray(removeIds) ? removeIds : []).filter(Boolean);
@@ -872,32 +964,68 @@ async function applyWhitelistChange({
 
   try {
     let result;
-    try {
-      result = normalizeWhitelistResult(
-        await executeWhitelistOperation(
-          settings,
-          cityOperation,
-          request.identifier_value,
-        ),
-      );
-    } catch (error) {
-      result = { ok: false, ...sanitizeCityDbError(error) };
+    if (approve) {
+      const lookup = await lookupCityPlayer(settings, request.identifier_value, { interactive: true });
+      if (isCityPlayerMissing(lookup) || lookup.code === "player_not_found") {
+        result = lookup;
+      } else if (!lookup.ok) {
+        result = lookup;
+      } else {
+        try {
+          result = normalizeWhitelistResult(
+            await executeWhitelistOperation(settings, cityOperation, request.identifier_value),
+          );
+        } catch (error) {
+          result = { ok: false, ...sanitizeCityDbError(error) };
+        }
+        if (!result.ok && isOptionalCityFailure(result) && isConfirmedCityPlayer(lookup)) {
+          result = deferredCityResult(lookup.playerKey);
+        } else if (result.ok && !isConfirmedCityPlayer(result) && isConfirmedCityPlayer(lookup)) {
+          result = { ...result, playerKey: lookup.playerKey };
+        }
+      }
+    } else {
+      try {
+        result = normalizeWhitelistResult(
+          await executeWhitelistOperation(settings, cityOperation, request.identifier_value),
+        );
+      } catch (error) {
+        result = { ok: false, ...sanitizeCityDbError(error) };
+      }
+      if (!result.ok && isOptionalCityFailure(result)) {
+        result = deferredCityResult(request.identifier_value);
+      }
     }
 
-    if (!result.ok && isOptionalCityFailure(result)) {
-      result = deferredCityResult(request.identifier_value);
+    if (approve && !isConfirmedCityPlayer(result)) {
+      const missingPlayer = result.code === "player_not_found" || isCityPlayerMissing(result);
+      await replyEphemeral(
+        interaction,
+        missingPlayer ? missingPlayerNotice() : unverifiedPlayerNotice(),
+      );
+      void persistWhitelistFailure({
+        interaction,
+        settings,
+        request,
+        result: missingPlayer
+          ? { ...result, code: "player_not_found", message: "ID nao encontrado." }
+          : result,
+        operation,
+        correlationId,
+      });
+      return;
     }
 
     if (!result.ok) {
       const missingPlayer = result.code === "player_not_found" || isCityPlayerMissing(result);
       await replyEphemeral(
         interaction,
-        buildNoticePayload(
-          missingPlayer ? "ID nao encontrado" : result.title || "Nao foi possivel aplicar a whitelist",
-          missingPlayer
-            ? "Esse ID nao existe no banco da cidade. A whitelist so e liberada para um ID cadastrado."
-            : cityDbNoticeText(result),
-        ),
+        missingPlayer
+          ? missingPlayerNotice()
+          : buildNoticePayload(
+              result.title || "Nao foi possivel aplicar a whitelist",
+              cityDbNoticeText(result),
+            ),
       );
       void persistWhitelistFailure({
         interaction,
@@ -992,7 +1120,9 @@ async function persistWhitelistSuccess({
   autoApproved,
   correlationId,
   cityPending = false,
+  playerName = "",
 }) {
+  const resolvedName = String(playerName || request.player_name || "").trim();
   const nextRequest = await whitelistDb.updateWhitelistRequest(request.id, {
     status: approve ? "approved" : "denied",
     reviewed_by_user_id: interaction.user.id,
@@ -1002,8 +1132,23 @@ async function persistWhitelistSuccess({
     player_key: result.playerKey || null,
     previous_whitelist_value: result.previousValue ?? null,
     next_whitelist_value: result.nextValue ?? null,
-    ...(request.player_name ? { player_name: request.player_name } : {}),
+    ...(resolvedName ? { player_name: resolvedName } : {}),
   });
+  await assignRoles(
+    interaction.guild,
+    request.user_id,
+    approve ? settings.approved_role_ids : settings.denied_role_ids,
+    approve ? settings.denied_role_ids : settings.approved_role_ids,
+  );
+  if (approve) {
+    await applyApprovedNickname(
+      interaction.guild,
+      request.user_id,
+      settings,
+      request.identifier_value,
+      resolvedName,
+    );
+  }
   await Promise.all([
     whitelistDb.insertWhitelistAudit({
       guild_id: request.guild_id,
@@ -1020,21 +1165,6 @@ async function persistWhitelistSuccess({
       correlation_id: correlationId,
       mapping_fingerprint: mappingFingerprint(settings.mapping),
     }),
-    assignRoles(
-      interaction.guild,
-      request.user_id,
-      approve ? settings.approved_role_ids : settings.denied_role_ids,
-      approve ? settings.denied_role_ids : settings.approved_role_ids,
-    ),
-    approve
-      ? applyApprovedNickname(
-          interaction.guild,
-          request.user_id,
-          settings,
-          request.identifier_value,
-          request.player_name,
-        )
-      : Promise.resolve(),
     refreshReviewMessage(interaction.guild, nextRequest, settings),
     sendWhitelistLog({
       guild: interaction.guild,
@@ -1050,7 +1180,7 @@ async function persistWhitelistSuccess({
       lines: [
         `**Pedido:** \`${request.id}\``,
         `**Membro:** <@${request.user_id}>`,
-        request.player_name ? `**Nome:** \`${clampText(request.player_name, 40)}\`` : "",
+        resolvedName ? `**Nome:** \`${clampText(resolvedName, 40)}\`` : "",
         `**Identificador:** \`${request.identifier_value}\``,
         `**Jogador:** \`${result.playerKey || "-"}\``,
         `**Antes:** \`${result.previousValue ?? "null"}\``,
@@ -1218,7 +1348,7 @@ async function retryFailedWhitelistApplies(client) {
         "APPROVE_WHITELIST",
         request.identifier_value,
       );
-      if (!result.ok) continue;
+      if (!result.ok || !isConfirmedCityPlayer(result)) continue;
       const guild = await client.guilds.fetch(request.guild_id).catch(() => null);
       if (!guild) continue;
       await whitelistDb.updateWhitelistRequest(request.id, {

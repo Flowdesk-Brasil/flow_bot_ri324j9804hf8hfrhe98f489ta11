@@ -426,13 +426,21 @@ function inferWhitelistChanged(result) {
 
 function normalizeWhitelistResult(result) {
   if (!result || typeof result !== "object") return result;
+  const code = String(result.code || "");
+  if (result.ok === false || result.deferred === true || code === "city_deferred" || code === "player_not_found") {
+    return {
+      ...result,
+      changed: false,
+      code: code || result.code || "error",
+    };
+  }
   const changed = inferWhitelistChanged(result);
-  const alreadyApplied = result.skipped === true || result.code === "already_applied";
+  const alreadyApplied = result.skipped === true || code === "already_applied";
   return {
     ...result,
     changed,
     skipped: changed ? false : alreadyApplied,
-    code: changed ? "applied" : alreadyApplied ? "already_applied" : result.code || "ok",
+    code: changed ? "applied" : alreadyApplied ? "already_applied" : code || "ok",
   };
 }
 
