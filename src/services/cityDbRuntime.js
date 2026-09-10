@@ -3,20 +3,21 @@ const mysql = require("mysql2/promise");
 const { Pool: PgPool } = require("pg");
 const { settleMaybePromise } = require("../utils/settleMaybePromise");
 
-const CONNECT_TIMEOUT_MS = 10_000;
-const QUERY_TIMEOUT_MS = 8_000;
-const INTERACTIVE_QUERY_TIMEOUT_MS = 12_000;
-const POOL_CONNECTION_LIMIT = 6;
-const POOL_MAX_IDLE = 4;
-const POOL_IDLE_TIMEOUT_MS = 90_000;
-const POOL_QUEUE_LIMIT = 16;
-const MAX_RETRIES = 5;
-const RETRY_BASE_MS = 180;
-const RETRY_MAX_MS = 2500;
-const CIRCUIT_FAILURE_THRESHOLD = 6;
-const CIRCUIT_OPEN_MS = 20_000;
-const MAX_CONCURRENT_OPS = 6;
-const HEALTH_CHECK_INTERVAL_MS = 45_000;
+const CONNECT_TIMEOUT_MS = 12_000;
+const QUERY_TIMEOUT_MS = 6_000;
+const INTERACTIVE_QUERY_TIMEOUT_MS = 4_500;
+const POOL_CONNECTION_LIMIT = 8;
+const POOL_MAX_IDLE = 6;
+const POOL_IDLE_TIMEOUT_MS = 120_000;
+const POOL_QUEUE_LIMIT = 32;
+const MAX_RETRIES = 4;
+const INTERACTIVE_MAX_RETRIES = 2;
+const RETRY_BASE_MS = 90;
+const RETRY_MAX_MS = 900;
+const CIRCUIT_FAILURE_THRESHOLD = 8;
+const CIRCUIT_OPEN_MS = 12_000;
+const MAX_CONCURRENT_OPS = 10;
+const HEALTH_CHECK_INTERVAL_MS = 60_000;
 
 const poolRegistry = new Map();
 const breakerRegistry = new Map();
@@ -168,9 +169,9 @@ function getBreaker(poolKey) {
 }
 
 function classifyDbError(error) {
-  const errno = String(error?.code || error?.errno || "").toUpperCase();
-  const sqlState = String(error?.sqlState || "").toUpperCase();
-  const { explainCityDbFailure } = require("./cityDbErrors");
+  const errno = String(error?.code || error?.errno || error?.cause?.code || "").toUpperCase();
+  const sqlState = String(error?.sqlState || error?.cause?.sqlState || "").toUpperCase();
+  const { explainCityDbFailure, uniqueNotice } = require("./cityDbErrors");
   const issue = explainCityDbFailure(error);
   const retryableByNetwork =
     RETRYABLE_ERRNO.has(errno) ||
@@ -179,10 +180,24 @@ function classifyDbError(error) {
   return {
     code: issue.code,
     title: issue.title,
-    message: `${issue.message} ${issue.hint}`.trim(),
+    message: issue.message,
+    hint: issue.hint,
+    publicMessage: uniqueNotice(issue.message, issue.hint),
     retryable: retryableByNetwork,
-    evictPool: issue.evictPool === true || retryableByNetwork,
+    evictPool: issue.evictPool === true,
   };
+}
+
+function wrapClassifiedError(classified, original) {
+  const error = new Error(classified.publicMessage || classified.message);
+  error.code = classified.code;
+  error.title = classified.title;
+  error.hint = classified.hint;
+  error.cause = original;
+  error.errno = original?.errno || original?.cause?.errno;
+  error.sqlState = original?.sqlState || original?.cause?.sqlState;
+  error.sqlMessage = original?.sqlMessage || original?.cause?.sqlMessage;
+  return error;
 }
 
 function toPg(sql) {
@@ -202,9 +217,9 @@ function createMysqlPool(target) {
   const pool = mysql.createPool({
     host: target.host,
     port: target.port,
-    database: target.database,
+    database: target.database || undefined,
     user: target.user,
-    password: target.password,
+    password: target.password || "",
     ssl: target.ssl ? { rejectUnauthorized: false } : undefined,
     waitForConnections: true,
     connectionLimit: POOL_CONNECTION_LIMIT,
@@ -213,9 +228,10 @@ function createMysqlPool(target) {
     queueLimit: POOL_QUEUE_LIMIT,
     connectTimeout: CONNECT_TIMEOUT_MS,
     enableKeepAlive: true,
-    keepAliveInitialDelay: 10_000,
+    keepAliveInitialDelay: 5_000,
+    insecureAuth: true,
     charset: "utf8mb4",
-    timezone: "Z",
+    dateStrings: true,
   });
   pool.on("connection", (connection) => {
     connection.on("error", () => {
@@ -296,7 +312,7 @@ async function runMysqlTransaction(pool, fn, queryTimeoutMs) {
   const connection = await pool.getConnection();
   const query = async (sql, params = []) => {
     const [rows] = await runQueryWithTimeout(
-      () => connection.execute(sql, params),
+      () => connection.query(sql, params),
       queryTimeoutMs,
     );
     return Array.isArray(rows) ? rows : [];
@@ -339,7 +355,9 @@ async function runPgTransaction(pool, fn, queryTimeoutMs) {
 async function runOnce(target, poolKey, fn, options) {
   const queryTimeoutMs = options.interactive ? INTERACTIVE_QUERY_TIMEOUT_MS : QUERY_TIMEOUT_MS;
   const entry = await getPoolEntry(target);
-  await ensureHealthy(entry, poolKey);
+  if (!options.interactive) {
+    await ensureHealthy(entry, poolKey);
+  }
 
   const metrics = getMetrics(poolKey);
   const started = Date.now();
@@ -362,7 +380,7 @@ async function runOnce(target, poolKey, fn, options) {
 
   const query = async (sql, params = []) => {
     const [rows] = await runQueryWithTimeout(
-      () => entry.pool.execute(sql, params),
+      () => entry.pool.query(sql, params),
       queryTimeoutMs,
     );
     return Array.isArray(rows) ? rows : [];
@@ -388,7 +406,8 @@ async function executeWithCityDb(target, fn, options = {}) {
   await semaphore.acquire();
   try {
     let lastError = null;
-    for (let attempt = 1; attempt <= MAX_RETRIES; attempt += 1) {
+    const maxRetries = options.interactive ? INTERACTIVE_MAX_RETRIES : MAX_RETRIES;
+    for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
       try {
         const value = await runOnce(target, poolKey, fn, options);
         breaker.recordSuccess();
@@ -398,12 +417,18 @@ async function executeWithCityDb(target, fn, options = {}) {
         lastError = error;
         getMetrics(poolKey).failures += 1;
         getMetrics(poolKey).lastErrorCode = classified.code;
+        logCityDb("warn", "query_fail", {
+          poolKey: poolKey.slice(0, 12),
+          attempt,
+          code: classified.code,
+          sqlMessage: redactSecrets(error?.sqlMessage || error?.cause?.sqlMessage || error?.message),
+        });
 
-        if (!classified.retryable || attempt >= MAX_RETRIES) {
-          breaker.recordFailure();
-          const finalError = new Error(classified.message);
-          finalError.code = classified.code;
-          throw finalError;
+        if (!classified.retryable || attempt >= maxRetries) {
+          if (classified.retryable || classified.evictPool) {
+            breaker.recordFailure();
+          }
+          throw wrapClassifiedError(classified, error);
         }
 
         getMetrics(poolKey).retries += 1;

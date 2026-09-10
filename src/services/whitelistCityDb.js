@@ -15,20 +15,52 @@ const PORT_CACHE_MS = 120_000;
 const portProbeCache = new Map();
 
 function decorateCityFailure(result) {
+  const { uniqueNotice } = require("./cityDbErrors");
   const issue = explainCityDbFailure({
     code: result?.code,
     message: result?.message || result?.title || "O banco da cidade nao esta online.",
+    hint: result?.hint,
+    cause: result?.cause,
+    sqlMessage: result?.sqlMessage,
   });
+  const rawMessage =
+    result?.message && !/catch|undefined/i.test(String(result.message))
+      ? result.message
+      : issue.message;
+  const hint = result?.hint || issue.hint;
   return {
     ok: false,
     ...result,
     code: result?.code || issue.code,
     title: result?.title || issue.title,
-    message: result?.message && !/catch|undefined/i.test(String(result.message))
-      ? `${result.message}${result.hint ? "" : ` ${issue.hint}`}`
-      : `${issue.message} ${issue.hint}`.trim(),
-    hint: result?.hint || issue.hint,
+    message: uniqueNotice(rawMessage, ""),
+    hint,
   };
+}
+
+function identifierCandidates(value) {
+  const raw = String(value ?? "").trim();
+  const out = [];
+  const add = (item) => {
+    if (item === 0 || item) {
+      const key = typeof item === "number" ? `n:${item}` : `s:${item}`;
+      if (!out.some((entry) => entry.key === key)) {
+        out.push({ key, value: item });
+      }
+    }
+  };
+  add(raw);
+  const stripped = raw.replace(/^(license2?:|steam:|discord:|fivem:|live:|xbl:|char\d+:)/i, "");
+  add(stripped);
+  if (/^\d{1,18}$/.test(stripped)) {
+    add(Number(stripped));
+    add(String(Number(stripped)));
+  }
+  if (/^[a-f0-9]{32,80}$/i.test(stripped)) {
+    add(`license:${stripped}`);
+    add(`license2:${stripped}`);
+  }
+  return out.map((entry) => entry.value);
 }
 
 async function readLauncherHint(guildId) {
@@ -639,7 +671,11 @@ async function runDirectWhitelistOperation(
     target,
     async (query, withTransaction) => {
       const readAndMaybeWrite = async (runQuery) => {
-        const rows = await runQuery(selectSql, [identifierValue]);
+        let rows = [];
+        for (const candidate of identifierCandidates(identifierValue)) {
+          rows = await runQuery(selectSql, [candidate]);
+          if (rows.length) break;
+        }
         if (rows.length > 1) {
           return { ok: false, code: "multiple_players", message: "Mais de um jogador encontrado." };
         }
@@ -652,7 +688,8 @@ async function runDirectWhitelistOperation(
         }
 
         const current = rows[0].whitelist_value;
-        const playerKey = String(rows[0].player_key ?? "");
+        const playerKeyRaw = rows[0].player_key;
+        const playerKey = String(playerKeyRaw ?? "");
         const state = classifyState(mapping, current);
 
         if (
@@ -684,7 +721,7 @@ async function runDirectWhitelistOperation(
         }
 
         const desired = coerceValue(mapping.valueType, approve ? mapping.valueOn : mapping.valueOff);
-        await runQuery(updateSql, [desired, playerKey]);
+        await runQuery(updateSql, [desired, playerKeyRaw ?? playerKey]);
         const nextState = classifyState(mapping, desired);
         return normalizeWhitelistResult({
           ok: true,
@@ -731,9 +768,9 @@ function sanitizeCityDbError(error) {
   const issue = explainCityDbFailure(error);
   return {
     code: classified.code || issue.code,
-    title: issue.title,
-    message: classified.message || `${issue.message} ${issue.hint}`.trim(),
-    hint: issue.hint,
+    title: classified.title || issue.title,
+    message: classified.message || issue.message,
+    hint: classified.hint || issue.hint,
   };
 }
 

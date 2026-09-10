@@ -28,6 +28,7 @@ const {
   sanitizePlayerName,
 } = require("../utils/whitelistNickname");
 const { settleMaybePromise } = require("../utils/settleMaybePromise");
+const { uniqueNotice } = require("./cityDbErrors");
 
 const WHITELIST_REVIEW_PREFIX = "whitelist:";
 const COMPONENT_TYPE = { ACTION_ROW: 1, BUTTON: 2, TEXT_DISPLAY: 10, CONTAINER: 17 };
@@ -41,6 +42,12 @@ const POOL_HEALTH_INTERVAL_MS = 45_000;
 
 function clampText(value, maxLength) {
   return String(value || "").slice(0, maxLength);
+}
+
+function cityDbNoticeText(result, extra = "") {
+  const message = String(result?.message || "O MySQL da sua VPS nao esta acessivel agora.").trim();
+  const hint = String(result?.hint || "").trim();
+  return `${uniqueNotice(message, hint)}${extra}`.trim();
 }
 
 function sanitizeIdentifier(value) {
@@ -279,9 +286,7 @@ async function handleAutomaticWhitelistSubmit(interaction, settings, identifierK
       interaction,
       buildNoticePayload(
         result.title || "Banco da cidade offline",
-        `${result.message || "O MySQL da sua VPS nao esta acessivel agora."}${
-          result.hint ? ` ${result.hint}` : " Isso nao e um erro da Flowdesk — ligue o banco da cidade e tente de novo."
-        }`,
+        cityDbNoticeText(result),
       ),
     );
     void persistWhitelistFailure({
@@ -859,13 +864,12 @@ async function applyWhitelistChange({
             : result.title || (offline ? "Banco da cidade offline" : "Banco da cidade indisponivel"),
           missingPlayer
             ? "Esse ID nao existe no banco da cidade. A whitelist so e liberada para um ID cadastrado."
-            : `${result.message || "O MySQL da sua VPS nao esta acessivel agora."}${
-                result.hint ? `\n${result.hint}` : " Isso nao e um erro da Flowdesk — ligue o banco da cidade e tente de novo."
-              }${
+            : cityDbNoticeText(
+                result,
                 autoApproved
                   ? " O pedido continua aberto e o sistema tenta de novo sozinho."
-                  : " O pedido permanece aberto e o sistema tenta de novo sozinho."
-              }`,
+                  : " O pedido permanece aberto e o sistema tenta de novo sozinho.",
+              ),
         ),
       );
       void persistWhitelistFailure({
