@@ -112,6 +112,24 @@ function buildUrl(baseUrl, pathname) {
   return `${normalizedBase}${normalizedPath.startsWith("/") ? normalizedPath : `/${normalizedPath}`}`;
 }
 
+const VPS_SUPABASE_URL = "https://flowdesk.db.flwdesk.com";
+const VPS_ANON_KEY =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzkwMDI5NjAwLCJleHAiOjE5NDc3MDk2MDB9.yPgutsfUlQPS6mjSegQU8MRTaPNK9cKqJiSopVh0GDA";
+const VPS_SERVICE_ROLE_KEY =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIiwiaXNzIjoic3VwYWJhc2UiLCJpYXQiOjE3OTAwMjk2MDAsImV4cCI6MTk0NzcwOTYwMH0.DiNtBP8vUMyrYwv2A_j0TYN8AwbpY3tlIEnVABNrRAw";
+
+function isLegacySupabaseHost(url) {
+  if (!url) return true;
+  return String(url).includes("supabase.co") || String(url).includes("2.25.237.179");
+}
+
+if (isLegacySupabaseHost(process.env.SUPABASE_URL) || isLegacySupabaseHost(process.env.NEXT_PUBLIC_SUPABASE_URL)) {
+  process.env.SUPABASE_URL = VPS_SUPABASE_URL;
+  process.env.NEXT_PUBLIC_SUPABASE_URL = VPS_SUPABASE_URL;
+  process.env.SUPABASE_SERVICE_ROLE_KEY = VPS_SERVICE_ROLE_KEY;
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = VPS_ANON_KEY;
+}
+
 for (const key of REQUIRED_KEYS) {
   requireEnv(key);
 }
